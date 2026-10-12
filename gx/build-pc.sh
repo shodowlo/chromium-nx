@@ -17,7 +17,7 @@ CC=aarch64-linux-gnu-gcc
 CROSS_LIB=/usr/aarch64-linux-gnu/lib
 QEMU=qemu-aarch64-static
 SYSROOT=$OUT/sysroot
-TESTS="hello threads dl timers"
+TESTS="hello threads dl timers signals spawn atomics lazy strain"
 NET_TESTS="net curl-http curl-https"
 ARM64_LD=/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1
 
@@ -37,7 +37,9 @@ for lib in ld-linux-aarch64.so.1 libc.so.6 libm.so.6; do
 	cp -L "$CROSS_LIB/$lib" "$SYSROOT/lib/$lib" || exit 1
 done
 for t in $TESTS net; do
-	$CC -O2 -g -Wall -pthread "$SRC/tests/$t.c" -ldl -o "$SYSROOT/bin/$t" || exit 1
+	# atomics is built for a processor newer than the one it is run on.
+	[ $t = atomics ] && arch="-march=armv8.1-a -mno-outline-atomics" || arch=
+	$CC -O2 -g -Wall -pthread $arch "$SRC/tests/$t.c" -ldl -o "$SYSROOT/bin/$t" || exit 1
 done
 
 # libgxvideo for the guest, loaded ahead of a browser: its H.264 decoder
@@ -45,6 +47,14 @@ done
 printf 'GX_THUNK(gx_video_%s)\n' available open send receive copy flush close >"$OUT/video.list"
 $CC -O2 -g -Wall -shared -fPIC -Wl,-soname,libgxvideo.so -DGX_LIST="\"$OUT/video.list\"" \
 	"$SRC/guest/hostlib.c" "$SRC/guest/video.c" -o "$SYSROOT/lib/libgxvideo.so" || exit 1
+
+# libgxfork for the guest, loaded ahead of programs that run others: a fork()
+# that gx can carry out (guest/fork.c).
+$CC -O2 -g -Wall -shared -fPIC -Wl,-soname,libgxfork.so "$SRC/guest/fork.c" -ldl \
+	-o "$SYSROOT/lib/libgxfork.so" || exit 1
+
+# xrun for the guest: an X display (Xwayland) for a program that wants one.
+$CC -O2 -g -Wall "$SRC/guest/xrun.c" -o "$SYSROOT/bin/xrun" || exit 1
 
 # libEGL and libGLESv2 for the guest: thunks to the host's, one per function
 # the Khronos headers declare.
@@ -115,6 +125,16 @@ for t in $TESTS; do
 		run $t "Example Domain" -n "$SYSROOT" /bin/curl -sS -m 60 http://example.com/ ;;
 	curl-https)
 		run $t "Example Domain" -n "$SYSROOT" /bin/curl -sS -m 60 https://example.com/ ;;
+	spawn)
+		run $t "^PASS$" -e LD_PRELOAD=/lib/libgxfork.so "$SYSROOT" /bin/spawn ;;
+	atomics)
+		# On the processor of a Switch, which has none of these instructions.
+		QEMU_CPU=cortex-a57 run $t "^PASS$" "$SYSROOT" /bin/atomics ;;
+	lazy)
+		# With memory that is there when first used, as on the console.
+		GX_LAZY=1 run $t "^PASS$" "$SYSROOT" /bin/lazy ;;
+	strain)
+		GX_LAZY=1 GX_POOL=16 run $t "^PASS$" "$SYSROOT" /bin/strain ;;
 	*)
 		run $t "^PASS$" "$SYSROOT" "/bin/$t" ;;
 	esac

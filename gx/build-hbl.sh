@@ -1,7 +1,8 @@
 #!/bin/bash
 # Builds a Homebrew Loader whose programs get a 39-bit address space (512 GB)
 # instead of the stock 36 bits (64 GB), which Chromium's allocators do not fit
-# in: it replaces atmosphere/hbl.nsp on the SD card. Keep the original.
+# in, and 64 MB of their own for the kernel's records of their memory (see
+# below): it replaces atmosphere/hbl.nsp on the SD card. Keep the original.
 #
 #   docker exec lkl-gx-nx bash /project/gx/build-hbl.sh
 set -eu
@@ -24,7 +25,13 @@ import re
 s = open("hbl.json").read()
 t = re.sub(r'("type": "handle_table_size",\s*"value": )512', r'\g<1>1023', s)
 assert t != s and '"address_space_type": 3,' in t
-open("hbl.json", "w").write(t)
+# Memory of the process's own for the kernel's records of it (its page tables,
+# and one record per piece of memory mapped alike): without it they come out
+# of a store all programs share, which a large guest empties at some 9000
+# pieces, far fewer than a Linux program of a few gigabytes has.
+u = t.replace('"address_space_type": 3,', '"address_space_type": 3,\n    "system_resource_size": "0x4000000",', 1)
+assert u != t
+open("hbl.json", "w").write(u)
 PY
 make clean >/dev/null
 make >/dev/null 2>&1 || { make; exit 1; }

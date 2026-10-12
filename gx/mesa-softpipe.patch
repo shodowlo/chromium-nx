@@ -1,0 +1,50 @@
+--- a/src/gallium/drivers/softpipe/sp_context.c	2025-05-28 15:20:23.000000000 +0000
++++ b/src/gallium/drivers/softpipe/sp_context.c	2026-10-12 17:23:03.003665997 +0000
+@@ -243,9 +243,12 @@
+    /* Allocate texture caches */
+    for (sh = 0; sh < ARRAY_SIZE(softpipe->tex_cache); sh++) {
+       for (i = 0; i < ARRAY_SIZE(softpipe->tex_cache[0]); i++) {
+-         softpipe->tex_cache[sh][i] = sp_create_tex_tile_cache(&softpipe->pipe);
+-         if (!softpipe->tex_cache[sh][i])
+-            goto fail;
++         /* gx: made when a texture is first put there (sp_state_sampler.c).
++          * One for every texture every kind of shader could have, 768 of
++          * them, was 200 MB a context, most of it never used again but all
++          * of it written to once: a program with a context a window ran a
++          * console out of memory. */
++         softpipe->tex_cache[sh][i] = NULL;
+       }
+    }
+ 
+--- a/src/gallium/drivers/softpipe/sp_tex_tile_cache.c	2025-05-28 15:20:23.000000000 +0000
++++ b/src/gallium/drivers/softpipe/sp_tex_tile_cache.c	2026-10-12 17:23:03.005154324 +0000
+@@ -126,6 +126,8 @@
+    struct pipe_resource *texture = view ? view->texture : NULL;
+    uint i;
+ 
++   if (!tc)
++      return;   /* gx: nothing was ever put there */
+    assert(!tc->transfer);
+ 
+    if (!sp_tex_tile_is_compat_view(tc, view)) {
+@@ -167,6 +169,8 @@
+ {
+    int pos;
+ 
++   if (!tc)
++      return;   /* gx: nothing was ever put there */
+    if (tc->texture) {
+       /* caching a texture, mark all entries as empty */
+       for (pos = 0; pos < ARRAY_SIZE(tc->entries); pos++) {
+--- a/src/gallium/drivers/softpipe/sp_state_sampler.c	2025-05-28 15:20:23.000000000 +0000
++++ b/src/gallium/drivers/softpipe/sp_state_sampler.c	2026-10-12 17:23:03.005722097 +0000
+@@ -125,6 +125,9 @@
+       } else {
+          pipe_sampler_view_reference(pview, views[i]);
+       }
++      /* gx: see softpipe_create_context(). */
++      if (views[i] && !softpipe->tex_cache[shader][start + i])
++         softpipe->tex_cache[shader][start + i] = sp_create_tex_tile_cache(pipe);
+       sp_tex_tile_cache_set_sampler_view(softpipe->tex_cache[shader][start + i],
+                                          views[i]);
+       /*

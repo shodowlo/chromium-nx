@@ -19,12 +19,14 @@ SRC=$(cd "$(dirname "$0")" && pwd)
 LINUX=${LINUX:-/work/linux-nx}
 LKL=$LINUX/tools/lkl
 OUT=${OUT:-/work/gx-nx}
-DIST=$SRC/dist-nx
+# DIST=<directory> puts the SD card's contents elsewhere (the Steam client's
+# images are over 4 GB).
+DIST=${DIST:-$SRC/dist-nx}
 PC_OUT=${PC_OUT:-/work/gx-out}
 PC_SYSROOT=$PC_OUT/sysroot
 CROSS=aarch64-none-elf-
 # UNIX: AF_UNIX sockets and socketpair(), as in build-lkl.sh.
-OPTIONS="UNIX TIMERFD SIGNALFD FILE_LOCKING INOTIFY_USER ADVISE_SYSCALLS"
+OPTIONS="UNIX TIMERFD SIGNALFD FILE_LOCKING INOTIFY_USER ADVISE_SYSCALLS SYSVIPC"
 # And without these, as in build-lkl.sh: threads of the kernel nothing here
 # uses, out of the 96 an application may have.
 WITHOUT="XFS_FS BTRFS_FS BLK_DEV_NVME NVME_CORE IPV6"
@@ -34,6 +36,12 @@ mkdir -p "$OUT/obj" "$OUT/lkl"
 echo "== kernel"
 if [ ! -d "$LINUX" ]; then
 	git clone -q file:///work/linux "$LINUX"
+fi
+# gx's own changes to the kernel (what they are for is said in the patch).
+if ! git -C "$LINUX" apply -R --check /project/gx/lkl-gx.patch 2>/dev/null; then
+	git -C "$LINUX" checkout arch/lkl/kernel/syscalls.c arch/lkl/kernel/threads.c
+	git -C "$LINUX" apply /project/gx/lkl-gx.patch
+	rm -f "$LKL/lib/lkl.o"
 fi
 for opt in $OPTIONS; do
 	grep -q "^CONFIG_$opt=y" "$LINUX/arch/lkl/configs/defconfig" ||
@@ -112,6 +120,12 @@ for f in "$SRC"/tramp.S "$SRC"/nx/exception.S "$SRC"/gmem.c "$SRC"/gelf.c "$SRC"
 	${CROSS}gcc $CFLAGS -c "$f" -o "$o"
 	objs="$objs $o"
 done
+# What handles a fault does without the vector registers (nx/plain.c): the
+# memory routines for the whole host, and the guest's memory.
+PLAIN="-mgeneral-regs-only -fno-builtin -fno-tree-loop-distribute-patterns"
+${CROSS}gcc $CFLAGS $PLAIN -c "$SRC/nx/plain.c" -o "$OUT/obj/plain.o"
+${CROSS}gcc $CFLAGS -mgeneral-regs-only -fno-tree-loop-distribute-patterns -c "$SRC/gmem.c" -o "$OUT/obj/gmem.o"
+objs="$OUT/obj/plain.o $objs"
 # Mesa is C++ inside.
 ${CROSS}g++ -specs=$DEVKITPRO/libnx/switch.specs -g $ARCH -Wl,-Map,"$OUT/gx.map" \
 	$objs "$OUT/lkl-nro.o" -L$PORTLIBS/lib -L$DEVKITPRO/libnx/lib \
@@ -198,6 +212,14 @@ if [ -e "$PC_OUT/chromium-full-switch.ext4" ] && [ -e "$PC_OUT/chromium-full.cmd
 	F="-w -b -c3 @chromium-full.ext4 =profile.ext4 $(cat "$PC_OUT/chromium-full.cmd")"
 	echo "[Chromium, the whole browser (GPU)] $F --use-gl=angle --use-angle=gles-egl --ignore-gpu-blocklist --disable-gpu-sandbox --in-process-gpu https://www.google.com/" >>"$APP/programs.txt"
 	echo "[Chromium, the whole browser (no GPU)] $F --disable-gpu https://www.google.com/" >>"$APP/programs.txt"
+fi
+# The Steam client and what to try before it, if build-steam.sh made them: the
+# root with an X server, the client's home (under 4 GB, for a card in FAT32;
+# the console writes to it), gx's tests as an image, and their lines in the
+# menu after the browser's.
+if [ -e "$PC_OUT/steam-root.ext4" ] && [ -e "$PC_OUT/steam-home.ext4" ] && [ -e "$PC_OUT/steam.cmd" ]; then
+	cp "$PC_OUT/steam-root.ext4" "$PC_OUT/steam-home.ext4" "$PC_OUT/tests.ext4" "$APP/"
+	cat "$PC_OUT/steam.cmd" >>"$APP/programs.txt"
 fi
 ls -la "$APP"
 echo "copy the contents of gx/dist-nx to the root of the SD card"

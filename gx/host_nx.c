@@ -30,6 +30,10 @@
  *   - a data page becomes code again only by unmapping and remapping it,
  *     which keeps its contents but leaves a short window without the page.
  */
+/* What handles a fault does without the vector registers (nx/plain.c), and
+ * most of this file may be reached from there. */
+#pragma GCC target("general-regs-only")
+
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <malloc.h>
@@ -70,13 +74,20 @@
  * a busy site went through 192 MB and the kernel panicked. With a profile
  * on a disk of its own and the page cache dropped when little is free
  * (gsys.c), 400 of 512 MB stayed free while a browser played videos. */
-#define KERNEL_ARGS "mem=384M loglevel=4"
+#define KERNEL_MB 384
 /* Left to malloc for stacks (a megabyte a thread, eighty threads), libnx, the
  * GPU driver and the video decoder, whose pictures are here too: with 256 MB a
  * third 1080p video in a row left no stack for a new thread. Less when the
  * homebrew runs as an applet and the whole heap is a few hundred megabytes. */
 #define HEAP_KEPT (384UL << 20)
 #define HEAP_KEPT_SMALL (48UL << 20)
+/* How many pieces of memory mapped alike before more is refused (see
+ * host_commit()): what the kernel's shared store was seen to bear, unless the
+ * process has a store of its own (a loader made by build-hbl.sh gives it
+ * one: host_reserve() finds out). */
+static unsigned long kernel_blocks_max = 8500;
+static int lazy_pages_asked;   /* -L<n> */
+static size_t heap_kept = HEAP_KEPT;  /* -m<n> in the menu's line: megabytes left to the host */
 #define POOL_WORTH_IT (192UL << 20)
 /* Host functions called for the guest (the GL driver) run on these too. */
 #define MAIN_STACK (4UL << 20)
@@ -85,6 +96,46 @@
 #define GUEST_PRIO 0x3B
 
 static Mutex print_lock, mem_lock, screen_lock;
+
+/* The lock on the guest's memory, taken and left. A thread that takes it
+ * while it has it would be let through by the C library's lock and leave it
+ * open under itself: said of, should it happen again (it did when faults
+ * were handled on the guest's stack, see fault_stack()). */
+static void *mem_owner;
+
+void host_log(const char *fmt, ...);
+
+/* A second door behind a lock of the C library's, which must find it open:
+ * whoever has the lock is alone. Said of when it is not so, and waited at. */
+static void gate_in(void **owner, const char *what)
+{
+	static int said;
+	void *none = NULL, *self = armGetTls();
+
+	while (!__atomic_compare_exchange_n(owner, &none, self, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+		if (said < 8 && ++said)
+			host_log("gx: the lock on %s was had by two threads (%p, and %p already there)\n",
+				 what, self, none);
+		none = NULL;
+		svcSleepThread(0);
+	}
+}
+
+static void mem_take(void)
+{
+	static int said;
+
+	if (mem_owner == armGetTls() && said < 4 && ++said)
+		host_log("gx: the lock on the guest's memory is taken twice by one thread\n");
+	mutexLock(&mem_lock);
+	gate_in(&mem_owner, "the guest's memory");
+}
+
+static void mem_leave(void)
+{
+	__atomic_store_n(&mem_owner, NULL, __ATOMIC_SEQ_CST);
+	mutexUnlock(&mem_lock);
+}
 static FILE *log_file;
 static volatile int finished;
 static volatile int console_on = 1;   /* changed under screen_lock */
@@ -238,6 +289,15 @@ static int set_page(size_t p, uint32_t src, uint8_t flags)
 }
 static uint8_t *pool, *pool_used;
 static size_t pool_pages, pool_hint, pool_free;
+/* The arena page each pool page is behind, plus one: the table above read the
+ * other way, kept to tell when the two no longer agree (see unmap_pages()). */
+static uint32_t *pool_owner;
+static unsigned long table_slips;   /* times they did not */
+/* What last happened to each pool page and when, by the count of such events:
+ * said of a page that turns out not to be ours (host_commit()). */
+enum { POOL_NEVER, POOL_MAPPED, POOL_UNMAPPED, POOL_REFUSED };
+static uint8_t *pool_last;
+static uint32_t *pool_when, pool_events;
 static Handle self;
 
 /*
@@ -363,7 +423,7 @@ int host_reserved_hole(int index, void **addr, size_t *len)
 
 void *host_reserve(size_t *len)
 {
-	size_t size = 0, kept = HEAP_KEPT;
+	size_t size = 0, kept = heap_kept;
 	void *addr;
 
 	find_spans();
@@ -380,7 +440,22 @@ void *host_reserve(size_t *len)
 	arena = addr;
 	leaves = calloc(*len / GX_PAGE / LEAF_PAGES + 1, sizeof(*leaves));
 
-	/* The pool is all the heap but what the host keeps for itself. */
+	/* The pool is all the heap but what the host keeps for itself: the far
+	 * end of it, taken from under the C library, whose malloc() cannot
+	 * give two gigabytes in one piece (with what is kept asked for along
+	 * with it, the pool stopped at 1856 MB however much there was). */
+	{
+		extern char *fake_heap_end;
+		char *top = (char *)((u64)fake_heap_end & ~(u64)(GX_PAGE - 1)), *now = sbrk(0);
+
+		if (now != (char *)-1 && top > now && (size_t)(top - now) > kept + POOL_WORTH_IT) {
+			size = ((size_t)(top - now) - kept) & ~((2UL << 20) - 1);
+			pool = (uint8_t *)top - size;
+			fake_heap_end = (char *)pool;
+			host_log("gx: %lu MB of the heap not in use, %lu MB of them kept for the host\n",
+				 (unsigned long)((size_t)(top - now) >> 20), (unsigned long)(kept >> 20));
+		}
+	}
 	while (!pool) {
 		for (size = 3072UL << 20; size >= (32UL << 20); size -= 16UL << 20) {
 			void *probe = memalign(GX_PAGE, size + kept);
@@ -406,11 +481,56 @@ void *host_reserve(size_t *len)
 	}
 	pool_pages = pool_free = size / GX_PAGE;
 	pool_used = calloc(pool_pages, 1);
-	if (!pool_used)
+	pool_owner = calloc(pool_pages, sizeof(*pool_owner));
+	pool_last = calloc(pool_pages, 1);
+	pool_when = calloc(pool_pages, sizeof(*pool_when));
+	if (!pool_used || !pool_owner || !pool_last || !pool_when)
 		return NULL;
 	self = envGetOwnProcessHandle();
 	host_log("gx: %lu MB for the guest, %lu MB for shared memory\n",
 		 (unsigned long)(size >> 20), (unsigned long)(shared_budget >> 20));
+	{
+		/* Memory the process was given for the kernel's records of it:
+		 * with that, many more pieces can be mapped, and memory that is
+		 * committed when first used can come in small ones. */
+		u64 total = 0, used = 0;
+
+		svcGetInfo(&total, InfoType_SystemResourceSizeTotal, CUR_PROCESS_HANDLE, 0);
+		svcGetInfo(&used, InfoType_SystemResourceSizeUsed, CUR_PROCESS_HANDLE, 0);
+		if (total >= (16UL << 20)) {
+			/* A record is under 100 bytes; half the store is left to
+			 * the page tables. */
+			kernel_blocks_max = total / 2 / 100;
+			/* Pieces to spare: each is what was asked for and no
+			 * more, so it can be large, and a fault, which is where
+			 * the kernel may lose the guest's vector registers
+			 * (nx/exception.S), brings more with it. */
+			gmem_lazy_pages = lazy_pages_asked ? lazy_pages_asked : 64;
+			gmem_lazy_wanted_only = 1;
+			/* And few faults at all: what a program asks for is there
+			 * at once unless it is a thread's stack or very large.
+			 * A Steam client on a PC then has 50 MB more committed
+			 * and a fifth of the faults. */
+			gmem_eager_mapped = gmem_eager_protected = 32UL << 20;
+			/* (A lower limit does not spare memory where it is short:
+			 * the software GL driver takes 250 pieces of 812 KB for
+			 * every context, one for each texture a shader could have,
+			 * and writes a word every 16 KB of each: all of it is
+			 * touched, in six thousand faults when it is not there
+			 * at once. 200 MB a context, and a Steam client has a
+			 * context a window. That is Mesa's to cure.) */
+			host_log("gx: %lu MB of the process's own for the kernel's records (%lu KB used): "
+				 "up to %lu pieces of memory\n", (unsigned long)(total >> 20),
+				 (unsigned long)(used >> 10), kernel_blocks_max);
+		} else {
+			/* Few pieces to be had: larger ones, though not the megabyte
+			 * that had a Steam client commit half as much again as it
+			 * used and run out of memory before it ran out of pieces. */
+			gmem_lazy_pages = 64;
+			host_log("gx: the kernel's records of our memory are in its shared store: %lu pieces at most "
+				 "(a loader made by build-hbl.sh lifts that)\n", kernel_blocks_max);
+		}
+	}
 	return addr;
 }
 
@@ -423,13 +543,70 @@ static size_t page_of(void *addr) { return ((uint8_t *)addr - arena) / GX_PAGE; 
  * into thousands of runs the kernel keeps a record of each. */
 #define POOL_LARGE 64   /* pages: the unit data is committed by (gmem.c) */
 
+static size_t pool_take_any(size_t n, size_t *first);
+
+/* Free pool pages, n at most and in one piece: see pool_take_any(). What it
+ * finds is checked against the other record there is of the pool, the arena
+ * page each of its pages is behind: pages noted free have been found to be
+ * behind code that was still mapped, and handing those out again is the end
+ * of whoever has them. Such pages are noted as used again, and said of. */
 static size_t pool_take(size_t n, size_t *first)
+{
+	for (;;) {
+		size_t run = pool_take_any(n, first), bad = 0;
+
+		for (size_t i = 0; i < run; i++)
+			bad += pool_owner[*first + i] != 0;
+		if (!bad)
+			return run;
+		for (size_t i = 0; i < run; i++) {
+			size_t at = *first + i;
+
+			if (pool_owner[at]) {
+				if (table_slips++ < 24)
+					host_log("gx: memory table: pool page %#lx was noted free while behind arena page %#x "
+						 "(flags there %#x, pool page there %#x; last event %d, %u events ago)\n",
+						 (unsigned long)at, pool_owner[at] - 1, flags_at(pool_owner[at] - 1),
+						 src_at(pool_owner[at] - 1), pool_last[at], pool_events - pool_when[at]);
+				continue;   /* stays noted as used */
+			}
+			pool_used[at] = 0;
+			pool_free++;
+			if (at < pool_hint)
+				pool_hint = at;
+		}
+	}
+}
+
+/* The first page noted as used of the n from p on, or NULL. By hand, and
+ * against the C library's memchr() for a while: pages that were in use have
+ * been handed out as free, and one of the two it must be that said so. */
+static const uint8_t *pool_first_used(size_t p, size_t n)
+{
+	const uint8_t *before = NULL, *quick, *sure = NULL;
+
+	for (size_t i = 0; i < n && !before; i++)
+		if (pool_used[p + i])
+			before = &pool_used[p + i];
+	quick = memchr(&pool_used[p], 1, n);
+	for (size_t i = 0; i < n && !sure; i++)
+		if (pool_used[p + i])
+			sure = &pool_used[p + i];
+	if ((quick != sure || before != sure) && table_slips++ < 24)
+		host_log("gx: memory table: of %lu pool pages from %#lx, the first in use is %ld by a loop, "
+			 "%ld by memchr(), %ld by the loop again\n", (unsigned long)n, (unsigned long)p,
+			 before ? (long)(before - &pool_used[p]) : -1L, quick ? (long)(quick - &pool_used[p]) : -1L,
+			 sure ? (long)(sure - &pool_used[p]) : -1L);
+	return sure;
+}
+
+static size_t pool_take_any(size_t n, size_t *first)
 {
 	if (n >= POOL_LARGE && n <= pool_pages) {
 		/* All of it in one run, the highest there is; in pieces as for
 		 * small ones if the pool has no such run left. */
 		for (size_t p = (pool_pages - n) & ~(size_t)(POOL_LARGE - 1);; p -= POOL_LARGE) {
-			if (!pool_used[p] && !pool_used[p + n - 1] && !memchr(&pool_used[p], 1, n)) {
+			if (!pool_used[p] && !pool_used[p + n - 1] && !pool_first_used(p, n)) {
 				memset(&pool_used[p], 1, n);
 				pool_free -= n;
 				*first = p;
@@ -445,7 +622,7 @@ static size_t pool_take(size_t n, size_t *first)
 	while (pool_hint < pool_pages && pool_used[pool_hint])
 		pool_hint++;
 	for (size_t p = pool_hint; p + n <= pool_pages;) {
-		const uint8_t *used = memchr(&pool_used[p], 1, n);
+		const uint8_t *used = pool_first_used(p, n);
 
 		if (!used) {
 			memset(&pool_used[p], 1, n);
@@ -476,11 +653,25 @@ static size_t pool_take(size_t n, size_t *first)
 
 static void pool_give(size_t first, size_t n)
 {
+	for (size_t i = 0; i < n; i++)
+		if ((pool_owner[first + i] || !pool_used[first + i]) && table_slips++ < 24)
+			host_log("gx: memory table: pool page %#lx is given back while %s (arena page %#x, "
+				 "last event %d, %u events ago)\n", (unsigned long)(first + i),
+				 pool_owner[first + i] ? "behind a page" : "free already",
+				 pool_owner[first + i] - 1, pool_last[first + i], pool_events - pool_when[first + i]);
 	memset(&pool_used[first], 0, n);
 	pool_free += n;
 	if (first < pool_hint)
 		pool_hint = first;
 }
+
+static size_t pool_lost;   /* pages of the pool found not to be usable: see host_commit() */
+
+/* The kernel's records of this process, as last counted (report_kernel_use()).
+ * Past about ten thousand, the kernel stops serving the process: it cannot
+ * even be told so, the calls to the SD card being the first to fail. Refusing
+ * memory before that at least ends in a message. */
+static volatile unsigned long kernel_blocks;
 
 /* The pages from p on that share flags and are backed by consecutive pool
  * pages, n at most: what one call to the kernel can cover. */
@@ -496,6 +687,8 @@ static size_t run_of(size_t p, size_t n)
 
 static int unmap_pages(size_t p, size_t n)
 {
+	int failed = 0;
+
 	while (n) {
 		size_t run;
 		Result rc;
@@ -506,19 +699,81 @@ static int unmap_pages(size_t p, size_t n)
 			continue;
 		}
 		run = run_of(p, n);
+		/* The kernel takes our word for which pool pages are behind
+		 * these: with the wrong ones it frees pages still in use
+		 * elsewhere and keeps the right ones for good. */
+		for (size_t i = 0; i < run; i++) {
+			if (src_at(p + i) < pool_pages && pool_owner[src_at(p + i)] == p + i + 1)
+				continue;
+			if (table_slips++ < 16)
+				host_log("gx: memory table: arena page %#lx is noted on pool page %#x, "
+					 "which is noted behind %#x (unmap of %lu pages at %#lx, flags %#x)\n",
+					 (unsigned long)(p + i), src_at(p + i),
+					 src_at(p + i) < pool_pages ? pool_owner[src_at(p + i)] - 1 : 0,
+					 (unsigned long)run, (unsigned long)p, flags_at(p));
+			break;
+		}
 		rc = svcUnmapProcessCodeMemory(self, (u64)(arena + p * GX_PAGE),
 					       (u64)(pool + (u64)src_at(p) * GX_PAGE),
 					       run * GX_PAGE);
 		if (R_FAILED(rc)) {
-			host_log("gx: unmap of %p failed (%#x)\n", arena + p * GX_PAGE, rc);
-			return -1;
+			MemoryInfo there = { 0 }, behind = { 0 };
+			u32 page_info;
+
+			svcQueryMemory(&there, &page_info, (u64)(arena + p * GX_PAGE));
+			svcQueryMemory(&behind, &page_info, (u64)(pool + (u64)src_at(p) * GX_PAGE));
+			host_log("gx: unmap of %p (%lu pages, from the pool at %#lx) failed (%#x): flags %#x; for the "
+				 "kernel it is type %#x, permission %#x, and the pool page type %#x, permission %#x, "
+				 "attributes %#x; that pool page is noted behind arena page %#x, last event %d\n",
+				 arena + p * GX_PAGE, (unsigned long)run,
+				 (unsigned long)(pool + (u64)src_at(p) * GX_PAGE), rc, flags_at(p), there.type,
+				 there.perm, behind.type, behind.perm, behind.attr,
+				 pool_owner[src_at(p)] - 1, pool_last[src_at(p)]);
+			/* The rest of what was asked is still to go. */
+			p += run;
+			n -= run;
+			failed = -1;
+			continue;
 		}
-		pool_give(src_at(p), run);
+		/* The pool pages are ours to write to again, or they do not go
+		 * back to the pool. */
+		{
+			MemoryInfo info = { 0 };
+			u32 page_info;
+			u64 from = (u64)(pool + (u64)src_at(p) * GX_PAGE), to = from + run * GX_PAGE;
+			int ours = 1;
+
+			for (u64 at = from; at < to && ours; at = info.addr + info.size) {
+				if (R_FAILED(svcQueryMemory(&info, &page_info, at)) || !info.size)
+					break;
+				ours = info.perm == Perm_Rw;
+			}
+			pool_events++;
+			for (size_t i = 0; i < run; i++) {
+				pool_owner[src_at(p) + i] = 0;
+				pool_last[src_at(p) + i] = POOL_UNMAPPED;
+				pool_when[src_at(p) + i] = pool_events;
+			}
+			if (ours) {
+				pool_give(src_at(p), run);
+			} else {
+				pool_lost += run;
+				if (table_slips++ < 16)
+					host_log("gx: memory table: %lu pool pages at %#lx stay the kernel's after the unmap "
+						 "of arena page %#lx (%#lx+%#lx: type %#x, permission %#x, attributes %#x)\n",
+						 (unsigned long)run, (unsigned long)from, (unsigned long)p,
+						 (unsigned long)info.addr, (unsigned long)info.size, info.type,
+						 info.perm, info.attr);
+			}
+		}
 		set_flags(p, run, 0);
+		/* What mapping it added to the count of the kernel's records. */
+		if (kernel_blocks >= 2)
+			kernel_blocks -= 2;
 		p += run;
 		n -= run;
 	}
-	return 0;
+	return failed;
 }
 
 static int set_protection(size_t p, size_t n, int prot)
@@ -570,19 +825,13 @@ static int set_protection(size_t p, size_t n, int prot)
 	return 0;
 }
 
-/* The kernel's records of this process, as last counted (report_kernel_use()).
- * Past about ten thousand, the kernel stops serving the process: it cannot
- * even be told so, the calls to the SD card being the first to fail. Refusing
- * memory before that at least ends in a message. */
-static volatile unsigned long kernel_blocks;
-#define KERNEL_BLOCKS_MAX 8500
 
 int host_commit(void *addr, size_t len, int prot)
 {
 	size_t first = page_of(addr), n = len / GX_PAGE, done = 0;
 	int ret = 0;
 
-	if (kernel_blocks > KERNEL_BLOCKS_MAX) {
+	if (kernel_blocks > kernel_blocks_max) {
 		static int said;
 
 		if (!said++)
@@ -590,7 +839,7 @@ int host_commit(void *addr, size_t len, int prot)
 				 "for the guest\n", kernel_blocks);
 		return -1;
 	}
-	mutexLock(&mem_lock);
+	mem_take();
 	if (n > pool_free) {
 		host_log("gx: out of guest memory (%lu KB asked, %lu KB left)\n",
 			 (unsigned long)(len >> 10), (unsigned long)(pool_free * 4));
@@ -600,19 +849,105 @@ int host_commit(void *addr, size_t len, int prot)
 		size_t src = 0, run = pool_take(n - done, &src);
 		Result rc;
 
+		if (!run) {
+			ret = -1;
+			break;
+		}
+		/* What the pool hands out is to be memory of ours to write to.
+		 * A piece of it was once seen not to be, though free by our
+		 * books (the kernel still had it as the other end of a mapping,
+		 * and writing zeroes to it ended the program): such a piece is
+		 * left aside for good, said of in the log, and another taken. */
+		{
+			MemoryInfo info = { 0 };
+			u32 page_info;
+			u64 from = (u64)(pool + src * GX_PAGE), to = from + run * GX_PAGE;
+			int ours = 1;
+
+			for (u64 at = from; at < to && ours; at = info.addr + info.size) {
+				if (R_FAILED(svcQueryMemory(&info, &page_info, at)) || !info.size)
+					break;
+				ours = info.perm == Perm_Rw;
+			}
+			if (!ours) {
+				static int said;
+
+				pool_lost += run;
+				if (said < 16 && ++said)
+					host_log("gx: %lu pages of the pool at %#lx are not ours to write to (%#lx+%#lx: "
+						 "type %#x, permission %#x, attributes %#x): left aside, %lu so far\n",
+						 (unsigned long)run, (unsigned long)from, (unsigned long)info.addr,
+						 (unsigned long)info.size, info.type, info.perm, info.attr,
+						 (unsigned long)pool_lost);
+				if (said <= 16) {
+					size_t at = ((uint8_t *)info.addr - pool) / GX_PAGE;
+
+					if ((u64)info.addr < from)
+						at = src;
+					host_log("gx:   its first such page: last event %d, %u events ago, noted behind arena "
+						 "page %#x (flags there %#x, pool page there %#x); the one before it: "
+						 "event %d, %u ago, used %d\n",
+						 pool_last[at], pool_events - pool_when[at], pool_owner[at] - 1,
+						 pool_owner[at] ? flags_at(pool_owner[at] - 1) : 0,
+						 pool_owner[at] ? src_at(pool_owner[at] - 1) : 0,
+						 at ? pool_last[at - 1] : -1, at ? pool_events - pool_when[at - 1] : 0,
+						 at ? pool_used[at - 1] : -1);
+				}
+				continue;   /* still noted as used: never handed out again */
+			}
+		}
 		/* The pool is ordinary memory until it is mapped: zero it here. */
 		memset(pool + src * GX_PAGE, 0, run * GX_PAGE);
 		rc = svcMapProcessCodeMemory(self, (u64)addr + done * GX_PAGE,
 					     (u64)(pool + src * GX_PAGE), run * GX_PAGE);
 		if (R_FAILED(rc)) {
-			host_log("gx: map of %p failed (%#x)\n", (uint8_t *)addr + done * GX_PAGE, rc);
+			{
+				/* What the kernel has there, and behind it: the map of
+				 * a page that was not there should not be refused. */
+				MemoryInfo there = { 0 }, behind = { 0 };
+				u32 page_info;
+				static int said;
+
+				svcQueryMemory(&there, &page_info, (u64)addr + done * GX_PAGE);
+				svcQueryMemory(&behind, &page_info, (u64)(pool + src * GX_PAGE));
+				if (said < 12 && ++said)
+					host_log("gx: map of %p failed (%#x): %lu pages from the pool at %#lx; there the kernel "
+						 "has %#lx+%#lx type %#x permission %#x, flags noted %#x, pool page noted %#x; "
+						 "the pool page is type %#x permission %#x attributes %#x, noted behind %#x\n",
+						 (uint8_t *)addr + done * GX_PAGE, rc, (unsigned long)run,
+						 (unsigned long)(pool + src * GX_PAGE), (unsigned long)there.addr,
+						 (unsigned long)there.size, there.type, there.perm,
+						 flags_at(first + done), src_at(first + done), behind.type, behind.perm,
+						 behind.attr, pool_owner[src] - 1);
+			}
+			pool_events++;
+			for (size_t i = 0; i < run; i++) {
+				pool_last[src + i] = POOL_REFUSED;
+				pool_when[src + i] = pool_events;
+			}
 			pool_give(src, run);
 			ret = -1;
 			break;
 		}
 		for (size_t i = 0; i < run; i++) {
-			set_page(first + done + i, src + i, PG_MAPPED | P_FRESH);
+			if (flags_at(first + done + i) & PG_MAPPED && table_slips++ < 16)
+				host_log("gx: memory table: arena page %#lx was mapped anew while noted on pool page %#x\n",
+					 (unsigned long)(first + done + i), src_at(first + done + i));
+			if (set_page(first + done + i, src + i, PG_MAPPED | P_FRESH)) {
+				/* Nothing to note it in: not to be kept, then. */
+				host_log("gx: no memory for the table of the guest's pages\n");
+				svcUnmapProcessCodeMemory(self, (u64)addr + (done + i) * GX_PAGE,
+							  (u64)(pool + (src + i) * GX_PAGE), (run - i) * GX_PAGE);
+				pool_give(src + i, run - i);
+				run = i;
+				ret = -1;
+				break;
+			}
+			pool_owner[src + i] = first + done + i + 1;
+			pool_last[src + i] = POOL_MAPPED;
+			pool_when[src + i] = pool_events + 1;
 		}
+		pool_events++;
 		/* Two more records for the kernel, until they are next counted:
 		 * the guard at the top looks at this number. */
 		kernel_blocks += 2;
@@ -622,7 +957,7 @@ int host_commit(void *addr, size_t len, int prot)
 		ret = set_protection(first, n, prot);
 	if (ret)
 		unmap_pages(first, done);
-	mutexUnlock(&mem_lock);
+	mem_leave();
 	return ret;
 }
 
@@ -630,9 +965,9 @@ int host_protect(void *addr, size_t len, int prot)
 {
 	int ret;
 
-	mutexLock(&mem_lock);
+	mem_take();
 	ret = set_protection(page_of(addr), len / GX_PAGE, prot);
-	mutexUnlock(&mem_lock);
+	mem_leave();
 	return ret;
 }
 
@@ -640,9 +975,9 @@ int host_decommit(void *addr, size_t len)
 {
 	int ret;
 
-	mutexLock(&mem_lock);
+	mem_take();
 	ret = unmap_pages(page_of(addr), len / GX_PAGE);
-	mutexUnlock(&mem_lock);
+	mem_leave();
 	return ret;
 }
 
@@ -665,7 +1000,7 @@ int host_shared_new(size_t len)
 
 	if (!shared_budget)
 		return -1;
-	mutexLock(&mem_lock);
+	mem_take();
 	for (int i = 0; i < MAX_SHARED_HANDLES && slot < 0; i++)
 		if (!shared_handles[i])
 			slot = i;
@@ -678,7 +1013,7 @@ int host_shared_new(size_t len)
 			slot = -1;
 		}
 	}
-	mutexUnlock(&mem_lock);
+	mem_leave();
 	return slot;
 }
 
@@ -691,9 +1026,9 @@ int host_shared_map(int handle, void *addr, size_t len, int prot)
 	 * Under the lock like every change to the address space: the console
 	 * has been seen to fail to draw (twice, in runs that mapped shared
 	 * memory) and it only draws with this lock held. */
-	mutexLock(&mem_lock);
+	mem_take();
 	rc = svcMapSharedMemory(shared_handles[handle], addr, len, Perm_Rw);
-	mutexUnlock(&mem_lock);
+	mem_leave();
 
 	if (R_FAILED(rc))
 		host_log("gx: cannot map shared memory at %p (%#x)\n", addr, rc);
@@ -702,9 +1037,9 @@ int host_shared_map(int handle, void *addr, size_t len, int prot)
 
 void host_shared_unmap(int handle, void *addr, size_t len)
 {
-	mutexLock(&mem_lock);
+	mem_take();
 	svcUnmapSharedMemory(shared_handles[handle], addr, len);
-	mutexUnlock(&mem_lock);
+	mem_leave();
 }
 
 void host_shared_free(int handle)
@@ -717,7 +1052,9 @@ void host_shared_free(int handle)
  * there is, and its top goes back to the system for shared memory. Leaving
  * through the Homebrew Menu is no longer possible after that (it believes the
  * heap is whole), which is why gx always ends the process. */
-#define SHARED_BUDGET (384UL << 20)
+/* (576 MB since a Steam client: with 384 its browser was refused a piece once
+ * its windows were up, and stops itself when that happens.) */
+#define SHARED_BUDGET (576UL << 20)
 #define HEAP_WORTH_SHARING (1UL << 30)
 
 void __libnx_initheap(void)
@@ -805,7 +1142,7 @@ static void bury_threads(void)
 	}
 }
 
-static int next_core;
+static int next_core, one_core;
 
 /* Every thread of the process, by its handle: when everything stops, where
  * each of them is is all there is to go by (see report_stuck()). */
@@ -842,17 +1179,99 @@ static void forget_thread(Handle handle)
 			known[i].handle = 0;
 }
 
+/* Where each of our threads handles a fault (nx/exception.S): the far end of
+ * its own stack, which it does not otherwise get to. Not the stack it was on
+ * when the fault came: that may be the guest's, with pages that are not there
+ * yet, and a fault within the handling of a fault takes the same locks again. */
+#define FAULT_STACKS 128
+#define FAULT_STACK_ROOM (64UL << 10)
+struct {
+	u64 tls, top;
+} gx_fault_stacks[FAULT_STACKS];
+/* The same place, where the entry finds it without looking: in a slot of the
+ * thread's local storage, this far from its start (0: no such slot). The
+ * time the entry takes is time in which the kernel loses the guest's vector
+ * registers if it takes the processor away: see nx/exception.S. */
+u32 gx_fault_slot;
+/* Faults whose way in took long enough for that to have happened, and ways
+ * back that were begun again for it (nx/exception.S counts). */
+u64 gx_fault_away, gx_fault_again;
+/* And times the kernel wanted the processor meanwhile and was made to wait. */
+u64 gx_fault_pinned;
+
+static void fault_slot(u64 top)
+{
+	static s32 slot = -2;
+	u64 tls = (u64)armGetTls(), at = 0;
+
+	if (__atomic_load_n(&slot, __ATOMIC_SEQ_CST) == -2) {
+		s32 none = -2, got = threadTlsAlloc(NULL);
+
+		if (!__atomic_compare_exchange_n(&slot, &none, got, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) &&
+		    got >= 0)
+			threadTlsFree(got);
+	}
+	if (slot < 0)
+		return;
+	threadTlsSet(slot, (void *)top);
+	if (!top || gx_fault_slot)
+		return;
+	/* Where the C library keeps the slot, between what the kernel uses of
+	 * the local storage and what the library keeps of the thread: found by
+	 * what was just put there, which nothing else there can hold. */
+	for (u64 off = 0x108; off <= 0x1d8; off += 8)
+		if (*(u64 *)(tls + off) == top)
+			at = at ? ~0UL : off;
+	if (at && at != ~0UL)
+		__atomic_store_n(&gx_fault_slot, (u32)at, __ATOMIC_SEQ_CST);
+}
+
+static void fault_stack(int on)
+{
+	u64 tls = (u64)armGetTls();
+	Thread *self = threadGetSelf();
+
+	if (!on)
+		fault_slot(0);
+	for (int i = 0; i < FAULT_STACKS; i++) {
+		u64 none = 0;
+
+		if (!on) {
+			if (gx_fault_stacks[i].tls == tls)
+				__atomic_store_n(&gx_fault_stacks[i].tls, 0, __ATOMIC_SEQ_CST);
+			continue;
+		}
+		/* Claimed with a value no thread has, then filled in. */
+		if (!self || !self->stack_mirror || self->stack_sz < 4 * FAULT_STACK_ROOM ||
+		    !__atomic_compare_exchange_n(&gx_fault_stacks[i].tls, &none, ~0UL, 0, __ATOMIC_SEQ_CST,
+						 __ATOMIC_SEQ_CST))
+			continue;
+		gx_fault_stacks[i].top = (u64)self->stack_mirror + FAULT_STACK_ROOM;
+		/* Nothing kept there yet (nx/exception.S). */
+		memset((void *)(gx_fault_stacks[i].top - 1024), 0, 1024);
+		__atomic_store_n(&gx_fault_stacks[i].tls, tls, __ATOMIC_SEQ_CST);
+		fault_slot(gx_fault_stacks[i].top);
+		return;
+	}
+}
+
 static void thread_start(void *p)
 {
 	struct start *s = p;
 
+	fault_stack(1);
 	s->fn(s->arg);
+	fault_stack(0);
 }
 
 static int start_thread(void (*fn)(void *), void *arg, size_t stack)
 {
 	struct start *s = malloc(sizeof(*s));   /* lives as long as the thread */
-	int core = __atomic_fetch_add(&next_core, 1, __ATOMIC_RELAXED) % 3;
+	/* All on one processor with -C1: they then run one at a time, which
+	 * tells what goes wrong only when two run at once from what goes wrong
+	 * anyway. (How many the guest is told it has, -c, is another matter:
+	 * a browser told it has one does things differently.) */
+	int core = one_core ? 0 : __atomic_fetch_add(&next_core, 1, __ATOMIC_RELAXED) % 3;
 	Result rc;
 
 	if (!s)
@@ -866,7 +1285,7 @@ static int start_thread(void (*fn)(void *), void *arg, size_t stack)
 		 * tied to one core waits for the others tied to it, a time slice
 		 * at a time, while the other cores sit idle (Chromium ran at 28
 		 * frames a second with no thread above 40% of a processor). */
-		svcSetThreadCoreMask(s->thread.handle, core, 0x7);
+		svcSetThreadCoreMask(s->thread.handle, core, one_core ? 0x1 : 0x7);
 		know_thread(s->thread.handle, "ours");
 		rc = threadStart(&s->thread);
 		if (R_FAILED(rc))
@@ -889,6 +1308,7 @@ void host_thread_exit(void)
 {
 	struct start *s = (struct start *)threadGetSelf();
 
+	fault_stack(0);
 	mutexLock(&ended_lock);
 	s->next = ended;
 	ended = s;
@@ -926,7 +1346,7 @@ void host_exit(int code)
 		svcSleepThread(1000000000ULL);
 }
 
-struct host_lock { Mutex m; };
+struct host_lock { Mutex m; void *owner; };
 struct host_cond { CondVar c; };
 
 struct host_lock *host_lock_new(void)
@@ -934,11 +1354,21 @@ struct host_lock *host_lock_new(void)
 	struct host_lock *l = malloc(sizeof(*l));
 
 	mutexInit(&l->m);
+	l->owner = NULL;
 	return l;
 }
 
-void host_lock_acquire(struct host_lock *l) { mutexLock(&l->m); }
-void host_lock_release(struct host_lock *l) { mutexUnlock(&l->m); }
+void host_lock_acquire(struct host_lock *l)
+{
+	mutexLock(&l->m);
+	gate_in(&l->owner, "a part of gx");
+}
+
+void host_lock_release(struct host_lock *l)
+{
+	__atomic_store_n(&l->owner, NULL, __ATOMIC_SEQ_CST);
+	mutexUnlock(&l->m);
+}
 
 struct host_cond *host_cond_new(void)
 {
@@ -950,11 +1380,15 @@ struct host_cond *host_cond_new(void)
 
 int host_cond_wait(struct host_cond *c, struct host_lock *l, int64_t ns)
 {
-	if (ns < 0) {
+	int ret = 0;
+
+	__atomic_store_n(&l->owner, NULL, __ATOMIC_SEQ_CST);
+	if (ns < 0)
 		condvarWait(&c->c, &l->m);
-		return 0;
-	}
-	return R_FAILED(condvarWaitTimeout(&c->c, &l->m, ns));
+	else
+		ret = R_FAILED(condvarWaitTimeout(&c->c, &l->m, ns));
+	gate_in(&l->owner, "a part of gx");
+	return ret;
 }
 
 void host_cond_signal(struct host_cond *c) { condvarWakeOne(&c->c); }
@@ -962,6 +1396,12 @@ void host_cond_signal(struct host_cond *c) { condvarWakeOne(&c->c); }
 /* ---------- the rest of the host interface ---------- */
 
 void host_random(void *buf, size_t len) { randomGet(buf, len); }
+
+/* Not yet: the exception handler would have to take faults of the kernel's
+ * and stand on a stack of its own (see gmem_watch()). */
+int host_write_faults(void) { return 0; }
+int host_thread_stop(uint64_t thread) { (void)thread; return 0; }
+void host_threads_go(void) {}
 
 uint64_t host_now_ns(void) { return armTicksToNs(armGetSystemTick()); }
 
@@ -1450,12 +1890,193 @@ static void report_address(const char *label, uint64_t addr)
 /* Runs on the faulting thread, which never leaves: the screen and the log
  * stay readable until + is pressed. */
 /* Called by the exception entry (nx/exception.S) for memory that refused a
- * jump or an access, on the stack of the thread it happened to: returns
+ * jump or an access, or (exec is 2, addr where it is) for an instruction the
+ * processor does not have, on the stack of the thread it happened to: returns
  * whether the thread is to try again. */
-int gx_nx_fault(u64 addr, int exec)
+/* The last faults that came here and what was made of them, for the report
+ * of one that could not be turned around. */
+static struct fault_seen {
+	u64 addr, tp;
+	int kind, fixed;
+} faults_seen[16];
+static unsigned faults_count;
+
+/* Does the processor keep its vector registers for us? memchr() looks through
+ * memory that never changes: a wrong answer is the registers changing under
+ * it. Counted where faults are handled and where they are not. */
+static const uint8_t still[64] = { [37] = 1 };
+static unsigned long vector_tries[2], vector_slips[2];
+
+static void try_vectors(int where)
+{
+	for (int i = 0; i < 64; i++) {
+		const uint8_t *found = memchr(still + (i & 7), 1, 48);
+
+		vector_tries[where]++;
+		if (found != still + 37 && vector_slips[where]++ < 4)
+			host_log("gx: memchr() of memory that does not change went wrong %s (%ld for %d)\n",
+				 where ? "where faults are handled" : "elsewhere",
+				 found ? (long)(found - still) : -1L, 37);
+	}
+}
+
+/* The guest's registers as gx_fault_tramp keeps them (nx/exception.S): x0-x8,
+ * lr, sp and pc as the kernel gave them, then x9-x18 and x29, and x19-x28. */
+static u64 *reg_at(u64 *kept, unsigned r)
+{
+	if (r <= 8)
+		return &kept[r];
+	if (r <= 18)
+		return &kept[16 + (r - 9)];
+	if (r <= 28)
+		return &kept[96 + (r - 19)];
+	return r == 29 ? &kept[26] : &kept[9];
+}
+
+/* An atomic instruction of ARMv8.1 the processor does not have, in code that
+ * cannot be given a veneer for it (gmem_illegal()): what a compiler inside
+ * the program wrote, which is neither where it will stay nor ours to write
+ * to. Done here instead, on the registers kept: returns whether it was one. */
+static int atomic_by_hand(u64 *kept)
+{
+	u32 insn = *(u32 *)kept[11];
+	int is_casp = (insn & 0xBFA07C00u) == 0x08207C00u;
+	int is_cas = (insn & 0x3FA07C00u) == 0x08A07C00u;
+	int is_ld = (insn & 0x3F200C00u) == 0x38200000u;
+	unsigned size = is_casp ? 2 + ((insn >> 30) & 1) : insn >> 30;
+	unsigned rs = (insn >> 16) & 31, rn = (insn >> 5) & 31, rt = insn & 31;
+	unsigned opc = (insn >> 12) & 7, o3 = (insn >> 15) & 1;
+	u64 mask = size == 3 ? ~0UL : (1UL << (8 << size)) - 1;
+	u64 where = rn == 31 ? kept[10] : *reg_at(kept, rn);
+	u64 vs = rs == 31 ? 0 : *reg_at(kept, rs), vt = rt == 31 ? 0 : *reg_at(kept, rt);
+	u64 old = 0;
+
+	if (!is_cas && !is_casp && !is_ld)
+		return 0;
+	if ((is_ld && o3 && opc) || (is_casp && ((rs & 1) || (rt & 1) || rs == 31 || rt == 31)))
+		return 0;
+	if (!gmem_accessible(where, (is_casp ? 2UL : 1UL) << size, 1))
+		return 0;
+	if (is_casp) {
+		/* Two words as one: nothing the processor has does that in one
+		 * go but its exclusive pair, which is what this is. */
+		u64 e0 = vs & mask, e1 = *reg_at(kept, rs + 1) & mask;
+		u64 n0 = vt & mask, n1 = *reg_at(kept, rt + 1) & mask, o0, o1;
+
+		if (size == 3) {
+			u32 failed;
+
+			__asm__ volatile(
+				"1: ldaxp %[o0], %[o1], [%[at]]\n"
+				"   cmp %[o0], %[e0]\n"
+				"   ccmp %[o1], %[e1], #0, eq\n"
+				"   b.ne 2f\n"
+				"   stlxp %w[f], %[n0], %[n1], [%[at]]\n"
+				"   cbnz %w[f], 1b\n"
+				"   b 3f\n"
+				"2: stlxp %w[f], %[o0], %[o1], [%[at]]\n"
+				"   cbnz %w[f], 1b\n"
+				"3:\n"
+				: [o0] "=&r"(o0), [o1] "=&r"(o1), [f] "=&r"(failed)
+				: [at] "r"(where), [e0] "r"(e0), [e1] "r"(e1), [n0] "r"(n0), [n1] "r"(n1)
+				: "cc", "memory");
+		} else {
+			u64 expected = (e1 << 32) | e0;
+
+			__atomic_compare_exchange_n((u64 *)where, &expected, (n1 << 32) | n0, 0,
+						    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+			o0 = expected & mask;
+			o1 = expected >> 32;
+		}
+		*reg_at(kept, rs) = o0;
+		*reg_at(kept, rs + 1) = o1;
+		kept[11] += 4;
+		return 1;
+	}
+#define BY_SIZE(type) do { \
+		type *at = (type *)where, s = (type)vs, t = (type)vt; \
+		if (is_cas) { \
+			type expected = s; \
+			__atomic_compare_exchange_n(at, &expected, t, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); \
+			old = expected; \
+		} else if (o3) { \
+			old = __atomic_exchange_n(at, s, __ATOMIC_SEQ_CST); \
+		} else if (opc == 0) { \
+			old = __atomic_fetch_add(at, s, __ATOMIC_SEQ_CST); \
+		} else if (opc == 1) { \
+			old = __atomic_fetch_and(at, (type)~s, __ATOMIC_SEQ_CST); \
+		} else if (opc == 2) { \
+			old = __atomic_fetch_xor(at, s, __ATOMIC_SEQ_CST); \
+		} else if (opc == 3) { \
+			old = __atomic_fetch_or(at, s, __ATOMIC_SEQ_CST); \
+		} else { \
+			/* The larger or the smaller of the two, signed or not. */ \
+			type was = __atomic_load_n(at, __ATOMIC_SEQ_CST), put; \
+			do { \
+				int keep = opc == 4 ? signed_of(was) > signed_of(s) : \
+					   opc == 5 ? signed_of(was) < signed_of(s) : \
+					   opc == 6 ? was > s : was < s; \
+				put = keep ? was : s; \
+			} while (!__atomic_compare_exchange_n(at, &was, put, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)); \
+			old = was; \
+		} \
+	} while (0)
+	if (size == 0) {
+#define signed_of(v) ((long)(int8_t)(v))
+		BY_SIZE(uint8_t);
+#undef signed_of
+	} else if (size == 1) {
+#define signed_of(v) ((long)(int16_t)(v))
+		BY_SIZE(uint16_t);
+#undef signed_of
+	} else if (size == 2) {
+#define signed_of(v) ((long)(int32_t)(v))
+		BY_SIZE(uint32_t);
+#undef signed_of
+	} else {
+#define signed_of(v) ((long)(v))
+		BY_SIZE(uint64_t);
+#undef signed_of
+	}
+#undef BY_SIZE
+	/* What was there goes to the register that held what was expected (a
+	 * compare and swap) or to the one named for it. */
+	if (is_cas) {
+		if (rs != 31)
+			*reg_at(kept, rs) = old & mask;
+	} else if (rt != 31) {
+		*reg_at(kept, rt) = old & mask;
+	}
+	kept[11] += 4;
+	return 1;
+}
+
+int gx_nx_fault(u64 addr, int exec, u64 *kept)
 {
 	static int said;
-	int fixed = gmem_fault(addr, exec);
+	struct fault_seen *seen = &faults_seen[__atomic_fetch_add(&faults_count, 1, __ATOMIC_SEQ_CST) % 16];
+	int fixed;
+
+	try_vectors(1);
+	seen->addr = addr;
+	seen->kind = exec;
+	seen->fixed = -1;
+	__asm__ volatile("mrs %0, tpidr_el0" : "=r"(seen->tp));
+	if (exec == 2) {
+		static unsigned long by_hand;
+
+		fixed = gmem_illegal(addr);
+		if (!fixed && kept && gmem_describe(addr, &(uint64_t){ 0 }) && atomic_by_hand(kept)) {
+			fixed = 1;
+			by_hand++;
+			if (!(by_hand & (by_hand - 1)))
+				host_log("gx: atomic instructions of compiled code done by hand: %lu\n", by_hand);
+		}
+		return seen->fixed = fixed;
+	}
+	if (exec == 3)
+		return seen->fixed = gmem_counter(addr);
+	fixed = seen->fixed = gmem_fault(addr, exec);
 
 	/* The first ones, to tell in the log how far this got. */
 	if (fixed && said < 4 && __atomic_fetch_add(&said, 1, __ATOMIC_SEQ_CST) < 4) {
@@ -1481,8 +2102,32 @@ void __libnx_exception_handler(ThreadExceptionDump *ctx)
 		/* For addresses in the host: gx.map has them from this base. */
 		host_log("  gx is loaded at %p\n", _start);
 		report_address("pc ", ctx->pc.x);
+		if (!(ctx->pc.x & 3) && gmem_accessible(ctx->pc.x, 4, 0) && gmem_describe(ctx->pc.x, &(uint64_t){ 0 })) {
+			host_log("  the instruction there is %#x\n", *(u32 *)ctx->pc.x);
+			/* And what is around it, and around where it was called from:
+			 * code that a program wrote for itself is nowhere else. */
+			for (int which = 0; which < 2; which++) {
+				u64 at = ((which ? ctx->lr.x : ctx->pc.x) & ~3UL) - 96;
+
+				if (!gmem_accessible(at, 192, 0))
+					continue;
+				host_log("  from %#lx:", (unsigned long)at);
+				for (int i = 0; i < 48; i++)
+					host_log("%s%08x", i % 8 ? " " : "\n   ", ((u32 *)at)[i]);
+				host_log("\n");
+			}
+		}
 		report_address("lr ", ctx->lr.x);
-		host_log("  far %#lx\n  sp  %#lx\n", (unsigned long)ctx->far.x, (unsigned long)ctx->sp.x);
+		host_log("  far %#lx\n  sp  %#lx\n  esr %#x (class %#x)\n", (unsigned long)ctx->far.x,
+			 (unsigned long)ctx->sp.x, ctx->esr, ctx->esr >> 26);
+		host_log("  the faults before it, %u in all (kind 0 an access, 1 a jump, 2 an instruction):\n",
+			 faults_count);
+		for (unsigned i = 0; i < 16 && i < faults_count; i++) {
+			struct fault_seen *seen = &faults_seen[(faults_count - 1 - i) % 16];
+
+			host_log("    %#lx kind %d, answered %d, thread pointer %#lx\n", (unsigned long)seen->addr,
+				 seen->kind, seen->fixed, (unsigned long)seen->tp);
+		}
 		{
 			/* What the guest's memory and the kernel each say of the
 			 * page: a fault in memory that is writable and executable
@@ -1495,8 +2140,32 @@ void __libnx_exception_handler(ThreadExceptionDump *ctx)
 				 gmem_page_state(ctx->far.x), info.type, info.perm,
 				 (unsigned long)info.addr, (unsigned long)info.size);
 		}
-		for (int i = 0; i < 9; i++)
+		for (int i = 0; i < 29; i++)
 			host_log("  x%d  %#lx\n", i, (unsigned long)ctx->cpu_gprs[i].x);
+		host_log("  fp  %#lx\n  pstate %#x\n", (unsigned long)ctx->fp.x, ctx->pstate);
+		{
+			/* Whose thread of the guest's, if any: by the thread pointer
+			 * it has now, and by where its stack is. */
+			u64 tp;
+
+			__asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+			host_log("  tpidr_el0 %#lx\n", (unsigned long)tp);
+			gx_report_fault(tp, ctx->sp.x);
+		}
+		/* What is on its stack, if that is memory that can be read. */
+		{
+			MemoryInfo info = { 0 };
+			u32 page_info;
+			u64 sp = ctx->sp.x & ~7UL;
+
+			if (R_SUCCEEDED(svcQueryMemory(&info, &page_info, sp)) && (info.perm & Perm_R) &&
+			    info.addr + info.size >= sp + 48 * 8) {
+				for (int i = 0; i < 48; i += 4)
+					host_log("  sp+%-3d %#lx %#lx %#lx %#lx\n", i * 8,
+						 (unsigned long)((u64 *)sp)[i], (unsigned long)((u64 *)sp)[i + 1],
+						 (unsigned long)((u64 *)sp)[i + 2], (unsigned long)((u64 *)sp)[i + 3]);
+			}
+		}
 		host_log("Press + to quit.\n");
 		sync_log();
 		finished = 1;
@@ -1726,6 +2395,10 @@ static int screen_open(void)
 
 /* Shows pixels of four bytes, red first or blue first; twice when the picture
  * is to stay (there are two buffers, and the screen shows either). */
+/* (With the vector registers: it hands numbers that are not whole to the
+ * drawing library, and no fault is handled through here.) */
+#pragma GCC push_options
+#pragma GCC reset_options
 static void screen_show(const u8 *pixels, int width, int height, int blue_first, int passes)
 {
 	if (!screen_ready && screen_open())
@@ -1740,6 +2413,7 @@ static void screen_show(const u8 *pixels, int width, int height, int blue_first,
 		eglSwapBuffers(screen_display, screen_surface);
 	}
 }
+#pragma GCC pop_options
 
 /* Puts a PNG on the screen in place of the console: the page a headless
  * Chromium drew when it was asked for a picture. The text that follows only
@@ -2096,6 +2770,9 @@ static const char *root_image_name;   /* @<image>: an ext4 image next to the pro
 static const char *profile_name;      /* =<image>: one that is the guest's /root, and written */
 static int browser;                   /* -b: the program is a Chromium to drive (cdp.c) */
 static int cpu_count;                 /* -c<n>: processors the guest is told about */
+static int kernel_mb = KERNEL_MB;     /* -k<n>: megabytes the kernel has */
+static char *more_env[16];            /* -e<name>=<value>: one more variable for the guest, ahead of ours */
+static int more_env_count;
 static int command_count;
 static char *guest_argv[MAX_ARGS + 1];
 static int guest_argc;
@@ -2201,7 +2878,27 @@ static void run(void *arg)
 	long params[6] = { LKL_CLOCK_REALTIME, (long)&now };
 	int ret, net_id = -1, disk_id = -1, profile_id = -1;
 
-	host_log("gx: starting the kernel (%s)\n", KERNEL_ARGS);
+	static char *all_env[48];
+	char kernel_args[64];
+	int env_count = 0;
+
+	/* The guest's variables: what the menu's line gives, then ours. */
+	for (int i = 0; i < more_env_count; i++)
+		all_env[env_count++] = more_env[i];
+	for (int i = 0; guest_env[i] && env_count < 47; i++) {
+		/* Not one the line gave: a name twice is the first to some
+		 * (getenv()) and the last to others (the loader). */
+		size_t name = strcspn(guest_env[i], "=") + 1;
+		int given = 0;
+
+		for (int j = 0; j < more_env_count; j++)
+			given |= !strncmp(more_env[j], guest_env[i], name);
+		if (!given)
+			all_env[env_count++] = guest_env[i];
+	}
+	all_env[env_count] = NULL;
+	snprintf(kernel_args, sizeof(kernel_args), "mem=%dM loglevel=4", kernel_mb);
+	host_log("gx: starting the kernel (%s)\n", kernel_args);
 	/* Where LKL's virtio devices tell the kernel they exist. */
 	lkl_host_ops.virtio_devices = lkl_virtio_devs;
 	/* The kernel's messages go where ours do. The function nx_host.c has
@@ -2246,7 +2943,7 @@ static void run(void *arg)
 			host_log("gx: cannot use %s as a disk: nothing will be kept\n", path);
 	}
 	if (!ret)
-		ret = lkl_start_kernel(KERNEL_ARGS);
+		ret = lkl_start_kernel(kernel_args);
 	if (ret) {
 		host_log("gx: the kernel did not start (%d)\n", ret);
 		host_exit(1);
@@ -2325,7 +3022,10 @@ static void run(void *arg)
 	if (wayland && wl_start())
 		host_log("gx: cannot open the Wayland display\n");
 	host_log("gx: running %s\n\n", guest_argv[0]);
-	gx_exec(guest_argv[0], guest_argc, guest_argv, guest_env);
+	if (gx_pool || gmem_lazy)
+		host_log("gx: %s%s\n", gx_pool ? "guest threads share the host's; " : "",
+			 gmem_lazy ? "memory is committed when first used" : "");
+	gx_exec(guest_argv[0], guest_argc, guest_argv, all_env);
 	host_exit(1);
 }
 
@@ -2369,6 +3069,60 @@ static void report_kernel_use(void)
 		 "%d shared objects; %lu MB of the pool free\n",
 		 (unsigned long)blocks, (unsigned long)code, (unsigned long)shared,
 		 (unsigned long)heap, handles, (unsigned long)(pool_free >> 8));
+	for (int i = 0; i < 1000; i++)
+		try_vectors(0);
+	/* The vector registers of a thread that came back from a fault: do
+	 * they last, when the processor is taken from it for a moment? */
+	{
+		extern unsigned long gx_vector_test(unsigned long mode, unsigned long turns);
+		static unsigned long lost[3], rounds;
+
+		for (int mode = 0; mode < 3; mode++)
+			lost[mode] += gx_vector_test(mode, 15000000);
+		rounds++;
+		host_log("gx: vector registers lost, in %lu rounds: %lu with no fault before, %lu after a fault, "
+			 "%lu after a fault and a call to the kernel\n", rounds, lost[0], lost[1], lost[2]);
+		{
+			extern unsigned long gx_vector_test_across(unsigned long times, unsigned long turns);
+			static unsigned long across[2];
+
+			across[0] += gx_vector_test_across(2000, 0);
+			across[1] += gx_vector_test_across(12, 20000000);
+			host_log("gx: vector registers lost across a fault: %lu of %lu at once, %lu of %lu after a while "
+				 "without them\n", across[0], rounds * 2000, across[1], rounds * 12);
+		}
+		/* And for the guest's own faults: how many there were, how many
+		 * times the processor may have been taken away on the way in
+		 * (when the registers are lost) and on the way back (when they
+		 * are put back again). */
+		host_log("gx: faults: %u in all; the processor away on the way in %lu times, on the way back %lu "
+			 "(begun again); kept from being taken away %lu times; found by slot %#x\n", faults_count,
+			 (unsigned long)gx_fault_away, (unsigned long)gx_fault_again,
+			 (unsigned long)gx_fault_pinned, gx_fault_slot);
+	}
+	if (vector_slips[0] || vector_slips[1])
+		host_log("gx: memchr() wrong %lu times of %lu where faults are handled, %lu of %lu elsewhere\n",
+			 vector_slips[1], vector_tries[1], vector_slips[0], vector_tries[0]);
+	/* The two records of the pool, one against the other. */
+	{
+		size_t wrong = 0, where = 0;
+		uint8_t as = 0;
+
+		mem_take();
+		for (size_t p = 0; p < pool_pages; p++)
+			if (pool_owner[p] ? pool_used[p] != 1 : pool_used[p] > 1) {
+				if (!wrong++) {
+					where = p;
+					as = pool_used[p];
+				}
+			}
+		if (wrong)
+			host_log("gx: memory table: %lu pool pages are noted wrongly, the first %#lx as %#x while behind "
+				 "arena page %#x (last event %d, %u events ago)\n", (unsigned long)wrong,
+				 (unsigned long)where, as, pool_owner[where] - 1, pool_last[where],
+				 pool_events - pool_when[where]);
+		mem_leave();
+	}
 	host_log("gx: guest blocks by size: %lu up to 16 KB, %lu to 256 KB, %lu to 2 MB, %lu larger; "
 		 "by use: %lu nothing, %lu read, %lu write, %lu run\n",
 		 sizes[0], sizes[1], sizes[2], sizes[3], perms[0], perms[1], perms[2], perms[3]);
@@ -2590,6 +3344,31 @@ int main(int argc, char **argv)
 		}
 		else if (!guest_argc && !strncmp(word, "-c", 2) && word[2])
 			cpu_count = atoi(word + 2);
+		else if (!guest_argc && !strcmp(word, "-C1"))
+			one_core = 1;       /* all threads on one processor of the console's */
+		else if (!guest_argc && !strncmp(word, "-k", 2) && atoi(word + 2) >= 64)
+			kernel_mb = atoi(word + 2);
+		else if (!guest_argc && !strncmp(word, "-m", 2) && atoi(word + 2) >= 48)
+			heap_kept = (size_t)atoi(word + 2) << 20;
+		else if (!guest_argc && !strncmp(word, "-P", 2)) {
+			/* -P[n]: guest threads that wait give their host thread
+			 * up, and at most n are made (gsys.c). */
+			gx_pool = 1;
+			if (atoi(word + 2) > 0)
+				gx_pool_cap = atoi(word + 2);
+		}
+		else if (!guest_argc && !strncmp(word, "-x", 2) && word[2])
+			gx_more_for = word + 2;   /* -x<end of a program's path>, then -X<argument> for each */
+		else if (!guest_argc && !strncmp(word, "-X", 2) && word[2] && gx_more_count < 16)
+			gx_more[gx_more_count++] = word + 2;
+		else if (!guest_argc && !strcmp(word, "-v"))
+			gx_processes = 1;   /* the log says when processes start and end */
+		else if (!guest_argc && !strcmp(word, "-L"))
+			gmem_lazy = 1;      /* memory is committed when first used (gmem.c) */
+		else if (!guest_argc && !strncmp(word, "-L", 2) && atoi(word + 2) > 0)
+			gmem_lazy = 1, lazy_pages_asked = atoi(word + 2);   /* and in pieces of so many pages */
+		else if (!guest_argc && !strncmp(word, "-e", 2) && strchr(word, '=') && more_env_count < 16)
+			more_env[more_env_count++] = word + 2;
 		else if (!guest_argc && word[0] == '@')
 			root_image_name = word + 1;
 		else if (!guest_argc && word[0] == '=')

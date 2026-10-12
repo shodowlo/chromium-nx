@@ -58,8 +58,10 @@ gx_svc_trampoline:
 	stp	x28, x29, [x10, #48]
 	mov	x19, sp
 
-	/* Which guest thread is this? Its TPIDR_EL0 (x9) says; a thread that has
-	 * not set one yet can only be the main thread. */
+	/* Which guest thread is this? Its TPIDR_EL0 (x9) says; if no thread is
+	 * known by it, it is one that has just set its own, and where its
+	 * stack is says which (gx_thread_at(), which is careful to need
+	 * nothing of the host's thread: we are still on the guest's). */
 	adrp	x10, gx_tp_tab
 	add	x10, x10, :lo12:gx_tp_tab
 	mov	x11, #MAX_THREADS
@@ -68,9 +70,14 @@ gx_svc_trampoline:
 	b.eq	2f
 	subs	x11, x11, #1
 	b.ne	1b
-	adrp	x13, gx_main_thread
-	ldr	x13, [x13, :lo12:gx_main_thread]
-2:	str	x13, [x19, #216]
+3:	mov	x0, x9
+	mov	x1, x19
+	bl	gx_thread_at
+	mov	x13, x0
+	b	4f
+2:	ldr	x12, [x13, #16]		/* others with the same TPIDR_EL0? */
+	cbnz	x12, 3b
+4:	str	x13, [x19, #216]
 	ldp	x10, x11, [x13]		/* host_tp, host_sp */
 	msr	tpidr_el0, x10
 	mov	sp, x11
@@ -138,6 +145,20 @@ gx_enter_frame:
 	mov	x19, x0
 	b	gx_resume_frame
 	.size gx_enter_frame, .-gx_enter_frame
+
+/*
+ * void gx_resume(struct gx_frame *frame)
+ * Leaves the host for the guest state in frame, from inside a syscall: what
+ * the host stack held of that syscall is dropped, the thread's next one
+ * starts where they all do. For signals: into a handler, and back out of it.
+ */
+	.global gx_resume
+	.type gx_resume, %function
+	.balign 4
+gx_resume:
+	mov	x19, x0
+	b	gx_resume_frame
+	.size gx_resume, .-gx_resume
 
 /*
  * gx_hostcall: calls the host function in x16 for the guest, with the guest's

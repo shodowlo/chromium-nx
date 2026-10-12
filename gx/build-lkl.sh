@@ -10,13 +10,18 @@ CROSS=aarch64-linux-gnu-
 # UNIX: AF_UNIX sockets and socketpair(), which curl's resolver thread needs.
 # The others are what Chromium expects of any Linux: timerfd, signalfd, file
 # locks, inotify, and fadvise/madvise.
-OPTIONS="UNIX TIMERFD SIGNALFD FILE_LOCKING INOTIFY_USER ADVISE_SYSCALLS"
+OPTIONS="UNIX TIMERFD SIGNALFD FILE_LOCKING INOTIFY_USER ADVISE_SYSCALLS SYSVIPC"
 # What LKL's defconfig has and gx has no use for. Each of these keeps threads
 # of the kernel waiting, every one of them a thread of the host, and Horizon
 # gives an application 96 threads in all: a browser needs most of them.
 WITHOUT="XFS_FS BTRFS_FS BLK_DEV_NVME NVME_CORE IPV6"
 
 cd "$LINUX"
+# gx's own changes to the kernel (what they are for is said in the patch).
+if ! git apply -R --check /project/gx/lkl-gx.patch 2>/dev/null; then
+	git checkout arch/lkl/kernel/syscalls.c arch/lkl/kernel/threads.c
+	git apply /project/gx/lkl-gx.patch
+fi
 build() { make -C tools/lkl CROSS_COMPILE=$CROSS -j"$(nproc)" >/tmp/lkl-build.log 2>&1 ||
 	{ tail -n 40 /tmp/lkl-build.log; exit 1; }; }
 

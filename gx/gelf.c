@@ -96,6 +96,7 @@ int gelf_load(const char *path, struct gx_image *img)
 	}
 	lkl_sys_close(fd);
 	img->base = base;
+	img->start = base + lo;
 	img->entry = base + eh.entry;
 	img->phdr = base + (phdr_vaddr ? phdr_vaddr : lo + eh.phoff);
 	img->phnum = eh.phnum;
@@ -115,15 +116,12 @@ static uint64_t push_bytes(uint64_t *top, const void *data, size_t len)
 	return *top;
 }
 
-char gx_exe_path[256];
-
-int gx_exec(const char *path, int argc, char **argv, char **envp)
+int gx_load(const char *path, int argc, char **argv, char **envp, struct gx_start *start)
 {
 	static const uint8_t random_bytes[16] = {
 		0x5a, 0x13, 0xc4, 0x9e, 0x27, 0xb8, 0x61, 0xf0,
 		0x8d, 0x36, 0xe9, 0x4b, 0x72, 0xa5, 0x1c, 0xd7,
 	};
-	static struct gx_thread main_thread;
 	struct gx_image exe, interp;
 	struct gx_frame *frame;
 	uint64_t top, *sp, execfn, platform, random;
@@ -133,12 +131,10 @@ int gx_exec(const char *path, int argc, char **argv, char **envp)
 
 	if (gelf_load(path, &exe))
 		return -1;
-	strncpy(gx_exe_path, path, sizeof(gx_exe_path) - 1);
-	interp.base = 0;
+	interp.base = interp.start = interp.end = 0;
 	interp.entry = exe.entry;
 	if (exe.interp[0] && gelf_load(exe.interp, &interp))
 		return -1;
-	gmem_set_brk(exe.end);
 
 	stack = gmem_mmap(0, STACK_SIZE, GX_PROT_READ | GX_PROT_WRITE, GX_MAP_ANONYMOUS, -1, 0);
 	if (stack < 0)
@@ -165,7 +161,11 @@ int gx_exec(const char *path, int argc, char **argv, char **envp)
 	*sp++ = argc;
 	for (int i = 0; i < n; i++)
 		*sp++ = strings[i];
-#define AUX(type, value) do { *sp++ = (type); *sp++ = (value); } while (0)
+	start->aux_words = 0;
+#define AUX(type, value) do { \
+		*sp++ = start->aux[start->aux_words++] = (type); \
+		*sp++ = start->aux[start->aux_words++] = (value); \
+	} while (0)
 	AUX(3, exe.phdr);          /* AT_PHDR */
 	AUX(4, exe.phent);         /* AT_PHENT */
 	AUX(5, exe.phnum);         /* AT_PHNUM */
@@ -191,12 +191,27 @@ int gx_exec(const char *path, int argc, char **argv, char **envp)
 	frame = (struct gx_frame *)(top - GX_FRAME_SIZE);
 	memset(frame, 0, GX_FRAME_SIZE);
 	frame->exit = interp.entry;
-	main_thread.tid = 100;
-	main_thread.nr = -1;
-	gx_main_thread = &main_thread;
+	start->frame = frame;
+	start->stack_lo = stack;
+	start->stack_hi = stack + STACK_SIZE;
+	start->image_end = exe.end;
+	start->loaded[0][0] = exe.start;
+	start->loaded[0][1] = exe.end;
+	start->loaded[1][0] = interp.start;
+	start->loaded[1][1] = interp.end;
 	if (gx_trace)
 		host_log("gx: %s at %#lx, interp at %#lx, entry %#lx, sp %#lx\n", path,
 			 (unsigned long)exe.base, (unsigned long)interp.base,
 			 (unsigned long)interp.entry, (unsigned long)top);
-	gx_enter_frame(frame, &main_thread);
+	return 0;
+}
+
+int gx_exec(const char *path, int argc, char **argv, char **envp)
+{
+	struct gx_start start;
+
+	if (gx_load(path, argc, argv, envp, &start))
+		return -1;
+	gmem_set_brk(start.image_end);
+	gx_start_first(path, &start);
 }

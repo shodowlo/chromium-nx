@@ -1,0 +1,190 @@
+diff --git a/arch/lkl/kernel/syscalls.c b/arch/lkl/kernel/syscalls.c
+index cd4431ff2..7d55f2a14 100644
+--- a/arch/lkl/kernel/syscalls.c
++++ b/arch/lkl/kernel/syscalls.c
+@@ -10,6 +10,8 @@
+ #include <linux/syscalls.h>
+ #include <linux/kthread.h>
+ #include <linux/platform_device.h>
++#include <linux/fdtable.h>
++#include <linux/fs_struct.h>
+ #include <asm/host_ops.h>
+ #include <asm/syscalls.h>
+ #include <asm/syscalls_32.h>
+@@ -35,6 +37,128 @@ void *syscall_table[__NR_syscalls] = {
+ #endif
+ };
+ 
++/*
++ * gx: the open files and the directories (root, current) of host tasks. Host
++ * tasks are all made out of host0 and share its; a program run by gx as a
++ * process of its own has unshared them, and the threads that run it, which
++ * are not always the same host tasks, take them from where they were kept.
++ * Asked for as setns(n, what), with numbers that are no namespace:
++ * GX_ADOPT_FILES, the calling task takes those of task n;
++ * GX_FILES_SAVE, those of the calling task are kept as number n;
++ * GX_FILES_USE, the calling task takes those kept as number n;
++ * GX_FILES_DROP, number n is forgotten.
++ */
++#define GX_ADOPT_FILES 0x47580000
++#define GX_FILES_SAVE 0x47580001
++#define GX_FILES_USE 0x47580002
++#define GX_FILES_DROP 0x47580003
++#define GX_FILE_SLOTS 128
++
++static struct {
++	struct files_struct *files;
++	struct fs_struct *fs;
++} gx_kept[GX_FILE_SLOTS];
++
++static void gx_put_files(struct files_struct *files, struct fs_struct *fs)
++{
++	int last;
++
++	if (files)
++		put_files_struct(files);
++	if (fs) {
++		spin_lock(&fs->lock);
++		last = !--fs->users;
++		spin_unlock(&fs->lock);
++		if (last)
++			free_fs_struct(fs);
++	}
++}
++
++/* Has the calling task use these, of which the caller holds a reference
++ * that becomes the task's. */
++static void gx_use_files(struct files_struct *files, struct fs_struct *fs)
++{
++	struct files_struct *old_files;
++	struct fs_struct *old_fs;
++
++	task_lock(current);
++	old_files = current->files;
++	current->files = files;
++	old_fs = current->fs;
++	current->fs = fs;
++	task_unlock(current);
++	gx_put_files(old_files, old_fs);
++}
++
++static int gx_get_files(struct task_struct *from, struct files_struct **files, struct fs_struct **fs)
++{
++	task_lock(from);
++	*files = from->files;
++	*fs = from->fs;
++	if (*files && *fs) {
++		atomic_inc(&(*files)->count);
++		spin_lock(&(*fs)->lock);
++		(*fs)->users++;
++		spin_unlock(&(*fs)->lock);
++	}
++	task_unlock(from);
++	return *files && *fs ? 0 : -ESRCH;
++}
++
++static long gx_files(long n, long what)
++{
++	struct task_struct *from;
++	struct files_struct *files;
++	struct fs_struct *fs;
++	long ret;
++
++	if (what == GX_ADOPT_FILES) {
++		rcu_read_lock();
++		from = find_task_by_pid_ns(n, &init_pid_ns);
++		if (from)
++			get_task_struct(from);
++		rcu_read_unlock();
++		if (!from)
++			return -ESRCH;
++		ret = gx_get_files(from, &files, &fs);
++		put_task_struct(from);
++		if (!ret)
++			gx_use_files(files, fs);
++		return ret;
++	}
++	if (n < 0 || n >= GX_FILE_SLOTS)
++		return -EINVAL;
++	switch (what) {
++	case GX_FILES_SAVE:
++		ret = gx_get_files(current, &files, &fs);
++		if (ret)
++			return ret;
++		gx_put_files(gx_kept[n].files, gx_kept[n].fs);
++		gx_kept[n].files = files;
++		gx_kept[n].fs = fs;
++		return 0;
++	case GX_FILES_USE:
++		files = gx_kept[n].files;
++		fs = gx_kept[n].fs;
++		if (!files || !fs)
++			return -ENOENT;
++		atomic_inc(&files->count);
++		spin_lock(&fs->lock);
++		fs->users++;
++		spin_unlock(&fs->lock);
++		gx_use_files(files, fs);
++		return 0;
++	case GX_FILES_DROP:
++		files = gx_kept[n].files;
++		fs = gx_kept[n].fs;
++		gx_kept[n].files = NULL;
++		gx_kept[n].fs = NULL;
++		gx_put_files(files, fs);
++		return 0;
++	}
++	return -EINVAL;
++}
++
+ static long run_syscall(long no, long *params)
+ {
+ 	long ret;
+@@ -43,6 +167,9 @@ static long run_syscall(long no, long *params)
+ 	if (no < 0 || no >= __NR_syscalls)
+ 		return -ENOSYS;
+ 
++	if (no == __NR_setns && (params[1] & ~3L) == GX_ADOPT_FILES)
++		return gx_files(params[0], params[1]);
++
+ 	ret = handler(params[0], params[1], params[2], params[3], params[4],
+ 		      params[5]);
+ 
+diff --git a/arch/lkl/kernel/threads.c b/arch/lkl/kernel/threads.c
+index 84564d528..4aaf21a1b 100644
+--- a/arch/lkl/kernel/threads.c
++++ b/arch/lkl/kernel/threads.c
+@@ -91,6 +91,16 @@ struct task_struct *__switch_to(struct task_struct *prev,
+ 	struct thread_info *_next = task_thread_info(next);
+ 	unsigned long _prev_flags = _prev->flags;
+ 	struct lkl_jmp_buf _prev_jb;
++	/*
++	 * gx: a host task that is on its way out (del_host_task()) leaves its
++	 * host thread by this jump, which is right once it is dead and wrong
++	 * before: exiting may give the processor up (closing the files of a
++	 * task that has its own does), and jumping then would leave a task
++	 * that is to run again without a thread to run it, the kernel
++	 * waiting for it for ever. Until it is dead it waits like any other.
++	 */
++	int jump = test_bit(TIF_SCHED_JB, &_prev_flags) &&
++		   (!(prev->flags & PF_EXITING) || READ_ONCE(prev->__state) == TASK_DEAD);
+ 
+ 	_current_thread_info = task_thread_info(next);
+ 	_next->prev_sched = prev;
+@@ -99,14 +109,14 @@ struct task_struct *__switch_to(struct task_struct *prev,
+ 	BUG_ON(!_next->tid);
+ 	lkl_cpu_change_owner(_next->tid);
+ 
+-	if (test_bit(TIF_SCHED_JB, &_prev_flags)) {
++	if (jump) {
+ 		/* Atomic. Must be done before wakeup next */
+ 		clear_ti_thread_flag(_prev, TIF_SCHED_JB);
+ 		_prev_jb = _prev->sched_jb;
+ 	}
+ 
+ 	lkl_ops->sem_up(_next->sched_sem);
+-	if (test_bit(TIF_SCHED_JB, &_prev_flags)) {
++	if (jump) {
+ 		lkl_ops->jmp_buf_longjmp(&_prev_jb, 1);
+ 	} else {
+ 		lkl_ops->sem_down(_prev->sched_sem);

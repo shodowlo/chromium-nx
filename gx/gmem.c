@@ -21,6 +21,7 @@
  * to the file when its last view goes, so that a later mapping finds it. On
  * a host without such memory, every view of a file is at the same address.
  */
+#include <stdlib.h>
 #include <string.h>
 #include <lkl.h>
 #include "gx.h"
@@ -32,7 +33,7 @@
 #endif
 #define ARENA_MAX_PAGES (GX_ARENA_SIZE / GX_PAGE)
 #define ARENA_MIN (1UL << 30)
-#define BRK_SIZE (256UL << 20)
+#define BRK_SIZE (1UL << 30)
 
 #define PG_USED 0x80
 #define PG_COMMITTED 0x40
@@ -112,6 +113,10 @@ static uint64_t search_hint;
 static struct image images[MAX_IMAGES];
 static uint64_t brk_start, brk_cur;
 static struct host_lock *lock;
+int gmem_lazy;                          /* see lazy_fault() */
+int gmem_lazy_pages = DATA_UNIT / GX_PAGE;
+int gmem_lazy_wanted_only;              /* see lazy_fault() */
+static struct host_lock *lazy_lock;
 
 static inline uint64_t page_of(uint64_t addr) { return (addr - (uint64_t)arena) / GX_PAGE; }
 static inline int in_arena(uint64_t addr, uint64_t len)
@@ -139,6 +144,7 @@ int gmem_init(void)
 			memset(&page_state[page_of(from)], PG_USED | PG_HOLE, (to - from) / GX_PAGE);
 	}
 	lock = host_lock_new();
+	lazy_lock = host_lock_new();
 	return 0;
 }
 
@@ -192,6 +198,15 @@ static uint64_t find_free_anonymous(uint64_t size)
 static uint64_t committed_pages, committed_peak, top_page;
 static int chunk_count, chunk_peak;   /* pieces of the host's shared memory */
 static uint64_t wx_to_write, wx_to_exec;   /* see gmem_fault() */
+static uint64_t atomics_replaced;          /* see gmem_illegal() */
+static uint64_t lazy_commits;              /* see lazy_fault() */
+static uint64_t lazy_ahead, eager_commits; /* and what spares it its faults */
+static uint64_t counters_replaced;         /* see gmem_counter() */
+static uint64_t given_back;                /* pages, see gmem_madvise() */
+/* What a program says it no longer needs is given back to the host from this
+ * size up; less is cleared and kept, to be used again without a fault. */
+#define DONTNEED_GIVEN_BACK (64UL << 10)
+static uint64_t spurious_faults;           /* see the end of gmem_fault() */
 
 static void count_committed(int64_t pages, uint64_t last_page)
 {
@@ -208,6 +223,51 @@ void gmem_report(void)
 		 "%d pieces of shared memory at most\n",
 		 (unsigned long)(committed_peak >> 8), (unsigned long)(committed_pages >> 8),
 		 (unsigned long)(top_page >> 8), chunk_peak);
+	{
+		/* What the committed memory is: code, what can only be read
+		 * (both from files, mostly), what can be written, and views
+		 * of shared files (which are counted once per view). */
+		uint64_t code = 0, read = 0, written = 0, views = 0;
+
+		for (uint64_t p = 0; p < top_page && p < arena_size / GX_PAGE; p++) {
+			uint8_t state = page_state[p];
+
+			if (!(state & PG_COMMITTED))
+				continue;
+			if (state & (PG_SHARED | PG_COPY))
+				views++;
+			else if (state & GX_PROT_EXEC)
+				code++;
+			else if (state & GX_PROT_WRITE)
+				written++;
+			else
+				read++;
+		}
+		host_log("gx: of which now: %lu MB of code, %lu MB read only, %lu MB written to, %lu MB of shared files\n",
+			 (unsigned long)(code >> 8), (unsigned long)(read >> 8), (unsigned long)(written >> 8),
+			 (unsigned long)(views >> 8));
+	}
+	{
+		uint64_t pieces = 0;
+
+		for (int i = 0; i < MAX_CHUNKS; i++)
+			pieces += chunks[i].size;
+		if (pieces)
+			host_log("gx: shared memory in use: %lu MB\n", (unsigned long)(pieces >> 20));
+	}
+	if (spurious_faults)
+		host_log("gx: faults on memory that was there, tried again: %lu\n", (unsigned long)spurious_faults);
+	if (lazy_commits || eager_commits)
+		host_log("gx: memory committed when first used: %lu times (%lu MB of it ahead of a run of them); "
+			 "when asked for, being small: %lu times\n", (unsigned long)lazy_commits,
+			 (unsigned long)(lazy_ahead >> 8), (unsigned long)eager_commits);
+	if (given_back)
+		host_log("gx: memory given back when no longer needed: %lu MB\n", (unsigned long)(given_back >> 8));
+	if (counters_replaced)
+		host_log("gx: reads of the virtual counter replaced: %lu\n", (unsigned long)counters_replaced);
+	if (atomics_replaced)
+		host_log("gx: atomic instructions the processor does not have, replaced: %lu\n",
+			 (unsigned long)atomics_replaced);
 	if (wx_to_write || wx_to_exec)
 		host_log("gx: compiled code: made writable %lu times, executable %lu times\n",
 			 (unsigned long)wx_to_write, (unsigned long)wx_to_exec);
@@ -218,12 +278,20 @@ static void release(uint64_t addr, uint64_t len)
 	uint64_t first = page_of(addr), n = len / GX_PAGE;
 	uint64_t committed = 0;
 
+	/* Not while a page of it is being committed for its first use
+	 * (lazy_fault()), or what is noted here and what the host has would
+	 * part ways: a page left with the host though it is free here comes
+	 * back, to whoever maps that place next, with what it held. For the
+	 * same reason the host is told to let go of all of it where memory
+	 * comes that way, whatever is noted. */
+	host_lock_acquire(lazy_lock);
 	for (uint64_t p = first; p < first + n; p++)
 		committed += !!(page_state[p] & PG_COMMITTED);
 	count_committed(-(int64_t)committed, 0);
-	if (committed)
+	if (committed || gmem_lazy)
 		host_decommit((void *)addr, len);
 	memset(&page_state[first], 0, n);
+	host_lock_release(lazy_lock);
 	if (first < search_hint)
 		search_hint = first;
 }
@@ -243,6 +311,43 @@ static int commit(uint64_t addr, uint64_t len, int prot)
 }
 
 static struct image *image_of(uint64_t addr);
+
+/* What was last given back of the guest's memory and by what, kept to be
+ * said of a page that is found gone while a program still uses it. */
+#define FREED_KEPT 8192
+static struct freed {
+	uint64_t lo, hi, who;
+	uint32_t when;
+	const char *how;
+} freed[FREED_KEPT];
+static uint32_t freed_count;
+
+void gmem_note(const char *how, uint64_t lo, uint64_t hi, uint64_t who)
+{
+	uint32_t n = __atomic_fetch_add(&freed_count, 1, __ATOMIC_SEQ_CST);
+	struct freed *f = &freed[n % FREED_KEPT];
+
+	f->lo = lo;
+	f->hi = hi;
+	f->who = who;
+	f->how = how;
+	f->when = n;
+}
+
+void gmem_say_freed(uint64_t addr)
+{
+	int said = 0;
+
+	for (uint32_t back = 1; back <= FREED_KEPT && back <= freed_count && said < 12; back++) {
+		const struct freed *f = &freed[(freed_count - back) % FREED_KEPT];
+
+		if (f->how && addr >= f->lo && addr < f->hi && ++said)
+			host_log("gx:   %u events before: %s, %#lx-%#lx, by %ld\n", back, f->how,
+				 (unsigned long)f->lo, (unsigned long)f->hi, (long)f->who);
+	}
+	if (!said)
+		host_log("gx:   nothing kept of who gave it back (%u events in all)\n", freed_count);
+}
 
 /*
  * Memory the guest wants writable and executable at once: what a compiler
@@ -272,16 +377,416 @@ int gmem_page_state(uint64_t addr)
 	return arena && in_arena(addr, 1) ? page_state[page_of(addr)] : -1;
 }
 
+/* ---------- memory that is there when it is first used ---------- */
+
+/*
+ * A program asks for much more memory than it uses: a megabyte or more of
+ * stack for each thread, room to grow for every heap. A kernel with an MMU
+ * gives each page when it is first touched; a host that commits for real
+ * (Horizon) would give it all at once, and a large program does not fit.
+ * With gmem_lazy, data the guest maps is noted as wanted and no more: the
+ * first access faults, and the unit it is in (DATA_UNIT, the host being
+ * short of pieces, not of pages) is committed then.
+ *
+ * The fault may be the kernel's, on its way to or from a buffer of the
+ * guest's, with locks held that the lock of this file must not be taken
+ * under: lazy_fault() has a lock of its own and calls nothing but the host.
+ * Pages of this kind are: used, not committed, readable or writable (as the
+ * guest was told), never executable.
+ */
+
+static int is_lazy(uint8_t state)
+{
+	return (state & (PG_USED | PG_COMMITTED | PG_SHARED | PG_COPY | PG_HOLE | GX_PROT_EXEC)) == PG_USED &&
+	       (state & PG_PROT);
+}
+
+static int is_data(uint64_t addr, int prot);
+
+/* Where the last pieces committed that way ended, and how large they were. */
+#define LAZY_RUNS 16
+/* (Half a megabyte. With a whole one, a Steam client that logs in had 470 MB
+ * committed ahead in ten seconds; with none, its largest script, 14 MB read
+ * in one go, came out wrong two times in three.) */
+#define LAZY_RUN_MAX ((512UL << 10) / GX_PAGE)
+static struct lazy_run {
+	uint64_t end, pages;
+} lazy_runs[LAZY_RUNS];
+static unsigned lazy_run_next;
+
+/* Memory that is wanted is not left for its first use when there is little
+ * of it: a program that asks for a few pages (an allocator that takes what
+ * it is about to hand out from what it had reserved, a small buffer) uses
+ * them at once, and the fault of that first use is what is to be spared
+ * (nx/exception.S). What is left to be committed on use is what is large:
+ * the stacks of threads, the reach of heaps. */
+uint64_t gmem_eager_mapped = 256UL << 10;      /* mapped readable or writable */
+uint64_t gmem_eager_protected = 1UL << 20;     /* made so, having been reserved */
+#define EAGER_MAPPED gmem_eager_mapped
+#define EAGER_PROTECTED gmem_eager_protected
+
+/* Stacks are the other thing left for their first use, whatever their size: a
+ * thread is given megabytes and uses a few pages. The C library says which
+ * mappings they are (MAP_STACK), and makes them usable afterwards. */
+#define GX_MAP_STACK 0x20000
+#define MAX_STACKS 512
+static struct { uint64_t lo, hi; } stacks[MAX_STACKS];
+
+static void note_stack(uint64_t lo, uint64_t hi)
+{
+	static unsigned next;
+	int at = -1;
+
+	for (int i = 0; i < MAX_STACKS && at < 0; i++)
+		if (!stacks[i].hi || (stacks[i].lo < hi && lo < stacks[i].hi))
+			at = i;
+	if (at < 0)
+		at = next++ % MAX_STACKS;
+	stacks[at].lo = lo;
+	stacks[at].hi = hi;
+}
+
+static int in_stack(uint64_t addr)
+{
+	for (int i = 0; i < MAX_STACKS; i++)
+		if (addr >= stacks[i].lo && addr < stacks[i].hi)
+			return 1;
+	return 0;
+}
+
+static int lazy_fault(uint64_t addr)
+{
+	const uint64_t unit_pages = gmem_lazy_pages;
+	uint64_t at = page_of(addr), first, end, from, to;
+	uint8_t state = page_state[at];
+
+	/* Data that is there already: another thread touched it at the same
+	 * moment and was first, between this one's fault and now. (Data is
+	 * the host's to read and write once it is there: no access to it
+	 * faults for any other reason.) */
+	if ((state & (PG_USED | PG_COMMITTED | PG_SHARED | PG_COPY | PG_HOLE | GX_PROT_EXEC)) ==
+	    (PG_USED | PG_COMMITTED) && gmem_lazy && is_data((uint64_t)arena + at * GX_PAGE, 0))
+		return 1;
+	if (!is_lazy(state))
+		return 0;
+	host_lock_acquire(lazy_lock);
+	if (!is_lazy(page_state[at])) {
+		/* Another thread was first. */
+		int there = page_state[at] & PG_COMMITTED;
+
+		host_lock_release(lazy_lock);
+		return there != 0;
+	}
+	first = at & ~(unit_pages - 1);
+	end = first + unit_pages;
+	if (end > arena_size / GX_PAGE)
+		end = arena_size / GX_PAGE;
+	/* With it, what else of the unit is wanted or likely to be: one piece
+	 * for the host. Where the host is not short of pieces
+	 * (gmem_lazy_wanted_only), only what is wanted: what is reserved
+	 * around it may never be, and a unit can then be large for nothing. */
+#define FILLABLE(p) ((page_state[p] & (PG_USED | PG_COMMITTED | PG_SHARED | PG_COPY | PG_HOLE | GX_PROT_EXEC)) == PG_USED && \
+		     ((page_state[p] & PG_PROT) || \
+		      (!gmem_lazy_wanted_only && !image_of((uint64_t)arena + (p) * GX_PAGE))))
+	for (from = at; from > first && FILLABLE(from - 1); from--)
+		;
+	for (to = at + 1; to < end && FILLABLE(to); to++)
+		;
+#undef FILLABLE
+	/* A fault where the last piece ended is a program filling what it
+	 * mapped from one end to the other: each fault in such a run is one
+	 * more chance for the host to lose what the program is copying (see
+	 * nx/exception.S), so each piece is twice the one before it, up to
+	 * LAZY_RUN_MAX and as far as the memory is wanted. */
+	{
+		struct lazy_run *run = NULL;
+		uint64_t reach;
+
+		for (int i = 0; i < LAZY_RUNS && !run; i++)
+			if (lazy_runs[i].end == from && lazy_runs[i].pages)
+				run = &lazy_runs[i];
+		if (run) {
+			reach = run->pages * 2 < LAZY_RUN_MAX ? run->pages * 2 : LAZY_RUN_MAX;
+			if (from + reach > arena_size / GX_PAGE)
+				reach = arena_size / GX_PAGE - from;
+			if (to < from + reach) {
+				uint64_t was = to;
+
+				while (to < from + reach && is_lazy(page_state[to]))
+					to++;
+				lazy_ahead += to - was;
+			}
+		} else {
+			run = &lazy_runs[lazy_run_next++ % LAZY_RUNS];
+		}
+		run->end = to;
+		run->pages = to - from;
+	}
+	if (host_commit(arena + from * GX_PAGE, (to - from) * GX_PAGE, DATA_PROT)) {
+		host_lock_release(lazy_lock);
+		host_log("gx: no memory left for a page the guest was promised (%lu MB committed)\n",
+			 (unsigned long)(committed_pages >> 8));
+		return 0;
+	}
+	for (uint64_t p = from; p < to; p++)
+		page_state[p] |= PG_COMMITTED;
+	__atomic_add_fetch(&committed_pages, to - from, __ATOMIC_SEQ_CST);
+	if (committed_pages > committed_peak)
+		committed_peak = committed_pages;
+	if (to > top_page)
+		top_page = to;
+	lazy_commits++;
+	host_lock_release(lazy_lock);
+	return 1;
+}
+
+/* ---------- what a forked child writes ---------- */
+
+/*
+ * The pages watched are made read-only for the host, and stay writable as far
+ * as page_state[] and the guest know. The first write to one faults: if it is
+ * the child's, the page is copied aside first; either way the page is made
+ * writable again and the write goes on. Other threads write too, the guest's
+ * and the kernel's: theirs just go through, a few pages at a time.
+ *
+ * A fault may come from anywhere, with any lock held: nothing here waits for
+ * one. A page is claimed by setting its bit, and whoever sets it does the
+ * work; a thread that faults on a page already claimed tries its write again
+ * until that work is done.
+ */
+#define WATCH_KEPT 2048            /* pages of the child's that can be put back */
+#define WATCH_GROUP 1              /* pages let go at once for other writers: each is one the child's
+                                    * writes will not be noticed on */
+
+struct watch_run {
+	uint64_t first, pages;     /* pages of the arena */
+	uint64_t bit;              /* where its bits start */
+};
+
+static struct {
+	volatile int active;
+	int busy;
+	volatile uint64_t child;
+	struct watch_run *runs;
+	int run_count, run_room;
+	uint64_t *bits;
+	uint64_t *kept_page;
+	uint8_t *kept;
+	volatile int kept_count;
+} watch;
+
+static int watchable(uint8_t state)
+{
+	const uint8_t need = PG_COMMITTED | GX_PROT_READ | GX_PROT_WRITE;
+
+	return (state & need) == need && !(state & (PG_SHARED | PG_COPY | PG_HOLE)) && !is_wx(state);
+}
+
+/* Claims a page: whether it was free to claim. */
+static int watch_claim(const struct watch_run *r, uint64_t page)
+{
+	uint64_t bit = r->bit + (page - r->first), mask = 1UL << (bit & 63);
+
+	return !(__atomic_fetch_or(&watch.bits[bit >> 6], mask, __ATOMIC_SEQ_CST) & mask);
+}
+
+static int watch_fault(uint64_t addr)
+{
+	uint64_t page = page_of(addr), lo, hi, from = 0;
+	const struct watch_run *r = NULL;
+	int low = 0, high = watch.run_count - 1, open = 0;
+
+	while (low <= high) {
+		int mid = (low + high) / 2;
+
+		if (page < watch.runs[mid].first) {
+			high = mid - 1;
+		} else if (page >= watch.runs[mid].first + watch.runs[mid].pages) {
+			low = mid + 1;
+		} else {
+			r = &watch.runs[mid];
+			break;
+		}
+	}
+	if (!r)
+		return 0;
+	if (host_thread_self() == watch.child) {
+		if (watch_claim(r, page)) {
+			int n = __atomic_fetch_add(&watch.kept_count, 1, __ATOMIC_SEQ_CST);
+
+			if (n < WATCH_KEPT) {
+				memcpy(watch.kept + (uint64_t)n * GX_PAGE, arena + page * GX_PAGE, GX_PAGE);
+				watch.kept_page[n] = page;
+			}
+			host_protect(arena + page * GX_PAGE, GX_PAGE, GX_PROT_READ | GX_PROT_WRITE);
+		}
+		return 1;
+	}
+	lo = page & ~(uint64_t)(WATCH_GROUP - 1);
+	hi = lo + WATCH_GROUP;
+	if (lo < r->first)
+		lo = r->first;
+	if (hi > r->first + r->pages)
+		hi = r->first + r->pages;
+	for (uint64_t p = lo; p <= hi; p++) {
+		int mine = p < hi && watch_claim(r, p);
+
+		if (mine && !open) {
+			from = p;
+			open = 1;
+		} else if (!mine && open) {
+			host_protect(arena + from * GX_PAGE, (p - from) * GX_PAGE, GX_PROT_READ | GX_PROT_WRITE);
+			open = 0;
+		}
+	}
+	return 1;
+}
+
+static int watch_add(uint64_t first, uint64_t pages, uint64_t *bits)
+{
+	if (watch.run_count == watch.run_room) {
+		int room = watch.run_room ? watch.run_room * 2 : 256;
+		struct watch_run *runs = realloc(watch.runs, room * sizeof(*runs));
+
+		if (!runs)
+			return -1;
+		watch.runs = runs;
+		watch.run_room = room;
+	}
+	watch.runs[watch.run_count].first = first;
+	watch.runs[watch.run_count].pages = pages;
+	watch.runs[watch.run_count].bit = *bits;
+	watch.run_count++;
+	*bits += pages;
+	return 0;
+}
+
+static int by_lo(const void *a, const void *b)
+{
+	const struct gx_range *x = a, *y = b;
+
+	return x->lo < y->lo ? -1 : x->lo > y->lo;
+}
+
+int gmem_watch(const struct gx_range *ranges, int count, int with_break)
+{
+	struct gx_range *sorted;
+	uint64_t bits = 0, done = 0;
+	int failed = 0;
+
+	if (!host_write_faults())
+		return -1;
+	sorted = malloc((count + 1) * sizeof(*sorted));
+	if (!sorted)
+		return -1;
+	memcpy(sorted, ranges, count * sizeof(*sorted));
+	host_lock_acquire(lock);
+	if (watch.busy) {
+		host_lock_release(lock);
+		free(sorted);
+		return -1;
+	}
+	if (with_break && brk_start) {
+		sorted[count].lo = brk_start;
+		sorted[count].hi = GX_PAGE_UP(brk_cur);
+		count++;
+	}
+	qsort(sorted, count, sizeof(*sorted), by_lo);
+	watch.run_count = 0;
+	for (int i = 0; i < count && !failed; i++) {
+		uint64_t lo = sorted[i].lo > done ? sorted[i].lo : done, hi = sorted[i].hi;
+
+		if (lo >= hi || !in_arena(lo, hi - lo))
+			continue;
+		done = hi;
+		for (uint64_t p = page_of(lo), end = page_of(hi - 1) + 1, q; p < end && !failed; p = q) {
+			for (q = p; q < end && watchable(page_state[q]); q++)
+				;
+			if (q > p)
+				failed = watch_add(p, q - p, &bits);
+			else
+				q++;
+		}
+	}
+	free(sorted);
+	watch.bits = failed ? NULL : calloc(bits / 64 + 1, sizeof(*watch.bits));
+	watch.kept_page = failed ? NULL : malloc(WATCH_KEPT * sizeof(*watch.kept_page));
+	watch.kept = failed ? NULL : malloc(WATCH_KEPT * GX_PAGE);
+	if (!watch.bits || !watch.kept_page || !watch.kept) {
+		free(watch.bits);
+		free(watch.kept_page);
+		free(watch.kept);
+		host_lock_release(lock);
+		return -1;
+	}
+	watch.kept_count = 0;
+	watch.child = 0;
+	watch.busy = 1;
+	__atomic_store_n(&watch.active, 1, __ATOMIC_SEQ_CST);
+	for (int i = 0; i < watch.run_count; i++)
+		host_protect(arena + watch.runs[i].first * GX_PAGE, watch.runs[i].pages * GX_PAGE, GX_PROT_READ);
+	host_lock_release(lock);
+	return 0;
+}
+
+void gmem_watch_child(uint64_t host_thread)
+{
+	watch.child = host_thread;
+}
+
+void gmem_unwatch(void)
+{
+	int kept;
+
+	host_lock_acquire(lock);
+	/* Everything writable again that still is meant to be... */
+	for (int i = 0; i < watch.run_count; i++) {
+		for (uint64_t p = watch.runs[i].first, end = p + watch.runs[i].pages, q; p < end; p = q) {
+			for (q = p; q < end && watchable(page_state[q]); q++)
+				;
+			if (q > p)
+				host_protect(arena + p * GX_PAGE, (q - p) * GX_PAGE, GX_PROT_READ | GX_PROT_WRITE);
+			else
+				q++;
+		}
+	}
+	__atomic_store_n(&watch.active, 0, __ATOMIC_SEQ_CST);
+	/* ... and what the child wrote, as it was. */
+	kept = watch.kept_count < WATCH_KEPT ? watch.kept_count : WATCH_KEPT;
+	if (watch.kept_count > WATCH_KEPT)
+		host_log("gx: a child wrote to %d pages of its parent's memory, of which %d were put back\n",
+			 watch.kept_count, WATCH_KEPT);
+	for (int i = 0; i < kept; i++)
+		if (watchable(page_state[watch.kept_page[i]]))
+			memcpy(arena + watch.kept_page[i] * GX_PAGE, watch.kept + (uint64_t)i * GX_PAGE, GX_PAGE);
+	free(watch.bits);
+	free(watch.kept_page);
+	free(watch.kept);
+	watch.busy = 0;
+	host_lock_release(lock);
+}
+
 int gmem_fault(uint64_t addr, int exec)
 {
 	int prot = GX_PROT_READ | (exec ? GX_PROT_EXEC : GX_PROT_WRITE);
 	uint64_t first, end, at;
-	int ret = 0;
+	int ret = 0, waited = 0;
 
 	if (!arena || !in_arena(addr, 1))
 		return 0;
+	if (!exec && __atomic_load_n(&watch.active, __ATOMIC_SEQ_CST) && watch_fault(addr))
+		return 1;
+	if (!exec && lazy_fault(addr))
+		return 1;
 	host_lock_acquire(lock);
 	at = page_of(addr);
+	if (exec && !is_wx(page_state[at]) &&
+	    (page_state[at] & (PG_COMMITTED | GX_PROT_EXEC)) == (PG_COMMITTED | GX_PROT_EXEC)) {
+		/* Code that is being written to (gmem_illegal()): it was
+		 * done while we waited for the lock. */
+		host_lock_release(lock);
+		return 1;
+	}
 	if (is_wx(page_state[at])) {
 		first = at & ~(WX_UNIT / GX_PAGE - 1);
 		end = first + WX_UNIT / GX_PAGE;
@@ -316,7 +821,38 @@ int gmem_fault(uint64_t addr, int exec)
 		else
 			wx_to_write++;
 	}
+	if (!ret) {
+		/* Memory that is there and allows what was refused, as far as
+		 * we know: the refusal was of a moment (the guest changing a
+		 * page's protection and back under a thread that uses it; a
+		 * host that takes a mapping apart to change part of it). The
+		 * thread tries again, though not for ever at the same place. */
+		static uint64_t last_page;
+		static unsigned again;
+		uint8_t need = PG_COMMITTED | (exec ? GX_PROT_EXEC : GX_PROT_READ);
+
+		/* Code that is mapped but not there yet, likewise: it is on
+		 * its way, in the hands of another thread. */
+		if (exec && (page_state[at] & (PG_USED | PG_HOLE | GX_PROT_EXEC)) == (PG_USED | GX_PROT_EXEC))
+			need = 0;
+		if ((page_state[at] & need) == need && !(page_state[at] & PG_HOLE)) {
+			again = at == last_page ? again + 1 : 0;
+			last_page = at;
+			if (again < 4096) {
+				ret = 1;
+				spurious_faults++;
+				waited = !need;
+			}
+		}
+		if (!ret) {
+			host_log("gx: a fault that is not ours to mend: %s %#lx, page state %#x, tried %u times\n",
+				 exec ? "a jump to" : "an access to", (unsigned long)addr, page_state[at], again);
+			gmem_say_freed(addr);
+		}
+	}
 	host_lock_release(lock);
+	if (ret && (!exec || waited))
+		host_yield();
 	return ret;
 }
 
@@ -390,7 +926,10 @@ static struct image *image_of(uint64_t addr)
 
 static uint64_t pool_size_for(uint64_t len)
 {
-	uint64_t size = GX_PAGE_UP(len / 128);
+	/* A veneer of 32 bytes for every svc: one in 128 bytes was plenty for
+	 * a browser, and the Steam client, which makes its system calls itself
+	 * rather than through libc, has nearly twice that. */
+	uint64_t size = GX_PAGE_UP(len / 32);
 
 	return size < 16 * GX_PAGE ? 16 * GX_PAGE : size;
 }
@@ -431,19 +970,270 @@ static uint64_t new_image(uint64_t len)
  * the mapping. */
 static struct image *adopt_image(uint64_t addr, uint64_t len)
 {
-	uint64_t pool = pool_size_for(len), run = 0;
+	uint64_t pool = pool_size_for(len), run = 0, above = 0, below = 0;
 
-	for (uint64_t p = page_of(addr + len); p < (arena_size / GX_PAGE); p++) {
+	for (uint64_t p = page_of(addr + len); p < (arena_size / GX_PAGE) && !above; p++) {
 		run = (page_state[p] & PG_USED) ? 0 : run + 1;
 		if (run == pool / GX_PAGE)
-			return add_image(addr, len, (uint64_t)arena + (p + 1) * GX_PAGE - pool, pool);
+			above = (uint64_t)arena + (p + 1) * GX_PAGE - pool;
 	}
-	return NULL;
+	/* Or the last one before it, if that is nearer: a branch only reaches
+	 * so far, and a program with much memory has no hole for a long way
+	 * after where a library of its child's is put. */
+	run = 0;
+	for (uint64_t p = page_of(addr); p-- > 0 && !below;) {
+		run = (page_state[p] & PG_USED) ? 0 : run + 1;
+		if (run == pool / GX_PAGE)
+			below = (uint64_t)arena + p * GX_PAGE;
+	}
+	if (above && below && addr - below < above + pool - (addr + len))
+		above = 0;
+	if (!above && !below)
+		return NULL;
+	return add_image(addr, len, above ? above : below, pool);
+}
+
+/*
+ * The atomic instructions of ARMv8.1 ("LSE": swap, compare and swap, add and
+ * the like, to memory, in one instruction) for a processor that does not have
+ * them, which is the Switch's: programs built for newer ones use them without
+ * asking (the client of a game store does, some twelve thousand times). Each
+ * is replaced, like an svc, by a branch to a veneer, which does the same with
+ * the instructions every ARMv8 has (load exclusive, store exclusive, again if
+ * something came between) on registers it saves and puts back. Not when the
+ * program is loaded, as for svc: what looks like one of them may be numbers
+ * kept among the code, and 22 bits of the 32 are free. When the processor
+ * refuses one (gmem_illegal()), which only happens to those that are run.
+ *
+ * Returns how many words the veneer has, 0 if the instruction is not one of
+ * these. `back_from_start` is where the veneer returns to, as an offset from
+ * its first word.
+ */
+#define LSE_VENEER 80   /* bytes kept for one: 20 words at most */
+
+static int lse_veneer(uint32_t insn, uint32_t *v, int64_t back_from_start)
+{
+	int is_casp = (insn & 0xBFA07C00u) == 0x08207C00u;
+	int is_cas = (insn & 0x3FA07C00u) == 0x08A07C00u;
+	int is_ld = (insn & 0x3F200C00u) == 0x38200000u;
+	uint32_t size = is_casp ? 2 + ((insn >> 30) & 1) : insn >> 30;
+	uint32_t rs = (insn >> 16) & 31, rn = (insn >> 5) & 31, rt = insn & 31;
+	uint32_t sf = size == 3 ? 0x80000000u : 0, opc = (insn >> 12) & 7, o3 = (insn >> 15) & 1;
+	int extreme = is_ld && !o3 && opc > 3;   /* the larger or the smaller of the two */
+	uint32_t s[5];
+	int n = 0, k = 0, loop;
+
+	if (!is_cas && !is_casp && !is_ld)
+		return 0;
+	if (is_ld && o3 && opc)
+		return 0;
+	if (is_casp && ((rs & 1) || (rt & 1)))
+		return 0;
+	/* Registers that the instruction does not name. */
+	for (uint32_t r = 9; r <= 17 && k < 5; r++)
+		if (r != rs && r != rn && r != rt && !(is_casp && (r == rs + 1 || r == rt + 1)))
+			s[k++] = r;
+	if (k < (extreme ? 5 : 4))
+		return 0;
+#define A s[0]   /* what was in memory */
+#define B s[1]   /* what goes there (for a pair: the second half of what was) */
+#define C s[2]   /* whether it went */
+#define D s[3]   /* where */
+#define E s[4]   /* the flags, when a comparison is needed */
+	if (extreme)
+		v[n++] = 0xF81F0FE0u | E;                             /* str E, [sp, #-16]! */
+	v[n++] = 0xA9BE0000u | (B << 10) | (31 << 5) | A;             /* stp A, B, [sp, #-32]! */
+	v[n++] = 0xA9010000u | (D << 10) | (31 << 5) | C;             /* stp C, D, [sp, #16] */
+	if (rn == 31)
+		v[n++] = (extreme ? 0x9100C3E0u : 0x910083E0u) | D;   /* add D, sp, #32 (or #48) */
+	else
+		v[n++] = 0xAA0003E0u | (rn << 16) | D;                /* mov D, Xn */
+	if (extreme)
+		v[n++] = 0xD53B4200u | E;                             /* mrs E, nzcv */
+	loop = n;
+	if (is_casp) {
+		/* The pair instructions say their width one bit lower. */
+		uint32_t wide = size == 3 ? 0x40000000u : 0;
+		int skip1, skip2, same;
+
+		v[n++] = wide | 0x887F8000u | (B << 10) | (D << 5) | A;         /* ldaxp A, B, [D] */
+		v[n++] = sf | 0x4A000000u | (rs << 16) | (A << 5) | C;        /* eor C, A, Rs */
+		skip1 = n++;                                                  /* cbnz C, 2f */
+		v[n++] = sf | 0x4A000000u | ((rs + 1) << 16) | (B << 5) | C;  /* eor C, B, Rs+1 */
+		skip2 = n++;                                                  /* cbnz C, 2f */
+		v[n++] = wide | 0x88208000u | (C << 16) | ((rt + 1) << 10) | (D << 5) | rt;   /* stlxp wC, Rt, Rt+1, [D] */
+		v[n] = 0x35000000u | ((uint32_t)((loop - n) & 0x7FFFF) << 5) | C;           /* cbnz wC, 1b */
+		n++;
+		same = n++;                                                   /* b 3f */
+		v[skip1] = sf | 0x35000000u | ((uint32_t)(n - skip1) << 5) | C;
+		v[skip2] = sf | 0x35000000u | ((uint32_t)(n - skip2) << 5) | C;
+		/* 2: not what was expected. It is put back as it was read, to
+		 * know that the two halves were read as one. */
+		v[n++] = wide | 0x88208000u | (C << 16) | (B << 10) | (D << 5) | A;   /* stlxp wC, A, B, [D] */
+		v[n] = 0x35000000u | ((uint32_t)((loop - n) & 0x7FFFF) << 5) | C;   /* cbnz wC, 1b */
+		n++;
+		v[same] = 0x14000000u | (uint32_t)(n - same);
+		v[n++] = sf | 0x2A0003E0u | (A << 16) | rs;                   /* 3: mov Rs, A */
+		v[n++] = sf | 0x2A0003E0u | (B << 16) | (rs + 1);             /* mov Rs+1, B */
+	} else if (is_cas) {
+		int skip;
+
+		v[n++] = (size << 30) | 0x085FFC00u | (D << 5) | A;   /* ldaxr A, [D] */
+		v[n++] = sf | 0x4A000000u | (rs << 16) | (A << 5) | C;   /* eor C, A, Rs */
+		if (size < 2)                                         /* and wC, wC, #0xff or #0xffff */
+			v[n++] = (size ? 0x12003C00u : 0x12001C00u) | (C << 5) | C;
+		skip = n;
+		n++;                                                  /* cbnz C, 2f */
+		v[n++] = (size << 30) | 0x0800FC00u | (C << 16) | (D << 5) | rt;   /* stlxr wC, Rt, [D] */
+		v[n] = 0x35000000u | ((uint32_t)((loop - n) & 0x7FFFF) << 5) | C;  /* cbnz wC, 1b */
+		n++;
+		v[skip] = sf | 0x35000000u | ((uint32_t)(n - skip) << 5) | C;
+		if (rs != 31)                                         /* 2: mov Rs, A */
+			v[n++] = sf | 0x2A0003E0u | (A << 16) | rs;
+	} else {
+		static const uint32_t ops[4] = {
+			0x0B000000u /* add */, 0x0A200000u /* bic */, 0x4A000000u /* eor */, 0x2A000000u /* orr */,
+		};
+		/* Signed larger, signed smaller, unsigned larger, unsigned smaller. */
+		static const uint32_t keep_if[4] = { 12 /* gt */, 11 /* lt */, 8 /* hi */, 3 /* lo */ };
+		int is_signed = extreme && opc < 6;
+		uint32_t stored = rs;
+
+		v[n++] = (size << 30) | 0x085FFC00u | (D << 5) | A;   /* ldaxr A, [D] */
+		if (extreme) {
+			if (is_signed && size < 2)                    /* sxtb or sxth wA, wA */
+				v[n++] = (size ? 0x13003C00u : 0x13001C00u) | (A << 5) | A;
+			/* cmp A, Rs, as wide as the operation and signed as it is */
+			v[n++] = sf | 0x6B200000u | (rs << 16) | (((is_signed ? 4u : 0u) | size) << 13) | (A << 5) | 31;
+			/* csel B, A, Rs, cond */
+			v[n++] = sf | 0x1A800000u | (rs << 16) | (keep_if[opc - 4] << 12) | (A << 5) | B;
+			stored = B;
+		} else if (!o3) {
+			v[n++] = sf | ops[opc] | (rs << 16) | (A << 5) | B;   /* op B, A, Rs */
+			stored = B;
+		}
+		v[n++] = (size << 30) | 0x0800FC00u | (C << 16) | (D << 5) | stored;   /* stlxr wC, .., [D] */
+		v[n] = 0x35000000u | ((uint32_t)((loop - n) & 0x7FFFF) << 5) | C;      /* cbnz wC, 1b */
+		n++;
+		if (is_signed && size < 2)                            /* and wA, wA, #0xff or #0xffff */
+			v[n++] = (size ? 0x12003C00u : 0x12001C00u) | (A << 5) | A;
+		if (extreme)
+			v[n++] = 0xD51B4200u | E;                     /* msr nzcv, E */
+		if (rt != 31)
+			v[n++] = sf | 0x2A0003E0u | (A << 16) | rt;   /* mov Rt, A */
+	}
+	v[n++] = 0xA9410000u | (D << 10) | (31 << 5) | C;             /* ldp C, D, [sp, #16] */
+	v[n++] = 0xA8C20000u | (B << 10) | (31 << 5) | A;             /* ldp A, B, [sp], #32 */
+	if (extreme)
+		v[n++] = 0xF84107E0u | E;                             /* ldr E, [sp], #16 */
+	v[n] = 0x14000000u | ((uint32_t)((back_from_start - n * 4) >> 2) & 0x03FFFFFFu);   /* b back */
+	n++;
+#undef A
+#undef B
+#undef C
+#undef D
+#undef E
+	return n;
+}
+
+/* The processor refused the instruction at pc, in the guest's code: if it
+ * is an atomic one that can be done otherwise it is replaced by a branch to
+ * a veneer that does, and the thread is to run it again (returns 1). The code
+ * and the veneers are not executable for the time it takes to write to them;
+ * threads that run into that try again too (gmem_fault()). */
+int gmem_illegal(uint64_t pc)
+{
+	const uint8_t need = PG_COMMITTED | GX_PROT_READ | GX_PROT_EXEC;
+	uint64_t page = GX_PAGE_DOWN(pc), pool_page, pool_span;
+	uint32_t insn, scratch[24], *code = (uint32_t *)pc;
+	struct image *img;
+	int64_t to_veneer;
+	int done = 0;
+
+	if (!arena || (pc & 3) || !in_arena(pc, 4))
+		return 0;
+	host_lock_acquire(lock);
+	if ((page_state[page_of(pc)] & need) != need || is_wx(page_state[page_of(pc)]))
+		goto out;
+	insn = *code;
+	if ((insn & 0xFC000000u) == 0x14000000u) {
+		done = 1;   /* another thread got here first */
+		goto out;
+	}
+	if (!lse_veneer(insn, scratch, 0))
+		goto out;
+	img = image_of(pc);
+	if (!img)
+		img = adopt_image(page, GX_PAGE);
+	to_veneer = img ? (int64_t)(img->pool_next - pc) : 0;
+	if (!img || img->pool_next + LSE_VENEER > img->pool_end || to_veneer >= BRANCH_RANGE ||
+	    to_veneer <= -BRANCH_RANGE) {
+		host_log("gx: no veneer to be had for the instruction at %#lx\n", (unsigned long)pc);
+		goto out;
+	}
+	pool_page = GX_PAGE_DOWN(img->pool_next);
+	pool_span = GX_PAGE_UP(img->pool_next + LSE_VENEER) - pool_page;
+	if (host_protect((void *)pool_page, pool_span, GX_PROT_READ | GX_PROT_WRITE))
+		goto out;
+	lse_veneer(insn, (uint32_t *)img->pool_next, (int64_t)(pc + 4 - img->pool_next));
+	host_protect((void *)pool_page, pool_span, GX_PROT_READ | GX_PROT_EXEC);
+	host_flush_icache((void *)img->pool_next, LSE_VENEER);
+	if (host_protect((void *)page, GX_PAGE, GX_PROT_READ | GX_PROT_WRITE))
+		goto out;
+	*code = 0x14000000u | (((uint32_t)(to_veneer >> 2)) & 0x03FFFFFFu);
+	host_protect((void *)page, GX_PAGE, page_state[page_of(pc)] & PG_PROT);
+	host_flush_icache(code, 4);
+	img->pool_next += LSE_VENEER;
+	atomics_replaced++;
+	done = 1;
+out:
+	host_lock_release(lock);
+	return done;
+}
+
+/* A host may refuse the guest the virtual counter and let it have the
+ * physical one, which counts the same (Horizon): the instruction at pc, in
+ * the guest's code, that reads the first is made to read the second, and the
+ * thread is to run it again (returns 1). Each read that is refused is a fault,
+ * and a program that times itself by the counter has thousands a second. */
+#define MRS_CNTVCT 0xD53BE040u
+#define MRS_CNTPCT 0xD53BE020u
+
+int gmem_counter(uint64_t pc)
+{
+	const uint8_t need = PG_COMMITTED | GX_PROT_READ | GX_PROT_EXEC;
+	uint64_t page = GX_PAGE_DOWN(pc);
+	uint32_t insn, *code = (uint32_t *)pc;
+	int done = 0;
+
+	if (!arena || (pc & 3) || !in_arena(pc, 4))
+		return 0;
+	host_lock_acquire(lock);
+	if ((page_state[page_of(pc)] & need) != need || is_wx(page_state[page_of(pc)]) ||
+	    (page_state[page_of(pc)] & (PG_SHARED | PG_COPY | PG_HOLE)))
+		goto out;
+	insn = *code;
+	if ((insn & ~31u) == MRS_CNTPCT) {
+		done = 1;   /* another thread got here first */
+		goto out;
+	}
+	if ((insn & ~31u) != MRS_CNTVCT)
+		goto out;
+	if (host_protect((void *)page, GX_PAGE, GX_PROT_READ | GX_PROT_WRITE))
+		goto out;
+	*code = MRS_CNTPCT | (insn & 31);
+	host_protect((void *)page, GX_PAGE, page_state[page_of(pc)] & PG_PROT);
+	host_flush_icache(code, 4);
+	counters_replaced++;
+	done = 1;
+out:
+	host_lock_release(lock);
+	return done;
 }
 
 /* Replaces each svc #0 in [addr, addr+len) by a branch to a veneer. The pool
  * is not executable while veneers are added to it: that is safe as long as an
- * image is mapped entirely before any of it runs, which is what ld.so does. */
+ * image is patched before any of its code runs. */
 static int patch_syscalls(uint64_t addr, uint64_t len)
 {
 	struct image *img = image_of(addr);
@@ -454,13 +1244,15 @@ static int patch_syscalls(uint64_t addr, uint64_t len)
 		uint64_t site = addr + k * 4;
 		uint32_t *v;
 		int64_t to_veneer, back;
+		int is_svc = 1;
+		uint64_t need = VENEER_SIZE;
 
 		if (code[k] != SVC0)
 			continue;
 		if (!img)
 			img = adopt_image(addr, len);
-		if (!img || img->pool_next + VENEER_SIZE > img->pool_end) {
-			host_log("gx: no veneer left for the svc at %#lx\n", (unsigned long)site);
+		if (!img || img->pool_next + need > img->pool_end) {
+			host_log("gx: no veneer left for the instruction at %#lx\n", (unsigned long)site);
 			ret = -1;
 			break;
 		}
@@ -473,21 +1265,24 @@ static int patch_syscalls(uint64_t addr, uint64_t len)
 		v = (uint32_t *)img->pool_next;
 		to_veneer = (int64_t)(img->pool_next - site);
 		back = (int64_t)(site + 4 - (img->pool_next + 5 * 4));
-		if (to_veneer >= BRANCH_RANGE || back <= -BRANCH_RANGE) {
-			host_log("gx: the svc at %#lx is too far from its veneer pool\n",
+		if (to_veneer >= BRANCH_RANGE || to_veneer <= -BRANCH_RANGE || back >= BRANCH_RANGE ||
+		    back <= -BRANCH_RANGE) {
+			host_log("gx: the instruction at %#lx is too far from its veneer pool\n",
 				 (unsigned long)site);
 			ret = -1;
 			break;
 		}
-		v[0] = 0xA9BF47F0u; /* stp x16, x17, [sp, #-16]! */
-		v[1] = 0x10000070u; /* adr x16, exit */
-		v[2] = 0x58000091u; /* ldr x17, trampoline */
-		v[3] = 0xD61F0220u; /* br  x17 */
-		v[4] = 0xA8C147F0u; /* exit: ldp x16, x17, [sp], #16 */
-		v[5] = 0x14000000u | (((uint32_t)(back >> 2)) & 0x03FFFFFFu);
-		*(uint64_t *)&v[6] = (uint64_t)gx_svc_trampoline;
+		if (is_svc) {
+			v[0] = 0xA9BF47F0u; /* stp x16, x17, [sp, #-16]! */
+			v[1] = 0x10000070u; /* adr x16, exit */
+			v[2] = 0x58000091u; /* ldr x17, trampoline */
+			v[3] = 0xD61F0220u; /* br  x17 */
+			v[4] = 0xA8C147F0u; /* exit: ldp x16, x17, [sp], #16 */
+			v[5] = 0x14000000u | (((uint32_t)(back >> 2)) & 0x03FFFFFFu);
+			*(uint64_t *)&v[6] = (uint64_t)gx_svc_trampoline;
+		}
 		code[k] = 0x14000000u | (((uint32_t)(to_veneer >> 2)) & 0x03FFFFFFu);
-		img->pool_next += VENEER_SIZE;
+		img->pool_next += need;
 		patched++;
 	}
 	if (patched) {
@@ -502,18 +1297,33 @@ static int patch_syscalls(uint64_t addr, uint64_t len)
 	return ret ? ret : patched;
 }
 
+/* What is read here is in the guest's memory from now on, and the copy the
+ * kernel keeps of everything it reads serves nobody: on a kernel with a few
+ * hundred megabytes for all it does, a library of that size, read at once,
+ * took them all, and the kernel had nothing left to work with. So: a few
+ * megabytes at a time, and the kernel is told after each that it may forget
+ * them. */
+#define READ_PIECE (4UL << 20)
+
 static long read_file(int fd, uint64_t off, uint8_t *dst, uint64_t len)
 {
-	uint64_t done = 0;
+	uint64_t done = 0, forgotten = 0;
 
 	while (done < len) {
-		long n = lkl_sys_pread64(fd, (char *)dst + done, len - done, off + done);
+		uint64_t want = len - done < READ_PIECE ? len - done : READ_PIECE;
+		long n = lkl_sys_pread64(fd, (char *)dst + done, want, off + done);
 
 		if (n < 0)
 			return n;
 		if (n == 0)
 			break;
 		done += n;
+		if (done - forgotten >= READ_PIECE || done == len) {
+			long params[6] = { fd, (long)(off + forgotten), (long)(done - forgotten), 4 /* POSIX_FADV_DONTNEED */ };
+
+			lkl_syscall(__lkl__NR_fadvise64, params);
+			forgotten = done;
+		}
 	}
 	return 0;
 }
@@ -751,6 +1561,30 @@ static void retire_shared(struct shared *s)
 		collect_shared();
 }
 
+/* One address for a place in memory that may be seen at several: a file that
+ * is shared has a view per mapping, in every program that maps it, and they
+ * are all the same memory. Its place in our own mapping of it stands for
+ * them all; any other address stands for itself. */
+uint64_t gmem_same_place(uint64_t addr)
+{
+	uint64_t place = addr;
+
+	if (!arena || !in_arena(addr, 1) || !(page_state[page_of(addr)] & PG_SHARED))
+		return addr;
+	host_lock_acquire(lock);
+	for (int i = 0; i < MAX_VIEWS; i++) {
+		const struct view *v = &views[i];
+
+		if (v->pages && addr >= v->addr && addr < v->addr + v->pages * GX_PAGE) {
+			if (v->object && v->object->chunk)
+				place = v->object->chunk->addr + (addr - v->base);
+			break;
+		}
+	}
+	host_lock_release(lock);
+	return place;
+}
+
 uint8_t *gmem_shared_peek(int fd, uint64_t *size)
 {
 	struct lkl_stat st;
@@ -949,19 +1783,33 @@ static long do_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd, ui
 	}
 
 	if (flags & (GX_MAP_FIXED | GX_MAP_FIXED_NOREPLACE)) {
-		if ((addr & (GX_PAGE - 1)) || !in_arena(addr, size))
+		if ((addr & (GX_PAGE - 1)) || !in_arena(addr, size)) {
+			host_log("gx: no mapping at %#lx+%#lx: %s\n", (unsigned long)addr, (unsigned long)size,
+				 addr & (GX_PAGE - 1) ? "not the start of a page" : "outside the guest's addresses");
 			return -GX_ENOMEM;
+		}
 		for (uint64_t p = page_of(addr); p < page_of(addr) + size / GX_PAGE; p++)
-			if (page_state[p] & PG_HOLE)
+			if (page_state[p] & PG_HOLE) {
+				host_log("gx: no mapping at %#lx+%#lx: %#lx is the host's\n", (unsigned long)addr,
+					 (unsigned long)size, (unsigned long)((uint64_t)arena + p * GX_PAGE));
 				return -GX_ENOMEM;
+			}
 		if (flags & GX_MAP_FIXED_NOREPLACE) {
 			for (uint64_t p = page_of(addr); p < page_of(addr) + size / GX_PAGE; p++)
 				if (page_state[p] & PG_USED)
 					return -17; /* EEXIST */
 		}
+		gmem_note("a mapping at a fixed address", addr, addr + size, prot);
 		unmap_range(addr, size);
 	} else {
-		addr = anonymous ? find_free_anonymous(size) : new_image(size);
+		/* A library is loaded into room that was asked for first, with
+		 * nothing in it and no file (and, by the C library's loader, as
+		 * not to be written to: the one use the flag still has). Room
+		 * of that kind gets its veneers next to it like a file's: code
+		 * comes there, and veneers found for it later may be too far. */
+		int for_library = anonymous && !(prot & PG_PROT) && (flags & GX_MAP_DENYWRITE);
+
+		addr = anonymous && !for_library ? find_free_anonymous(size) : new_image(size);
 		if (!addr)
 			return -GX_ENOMEM;
 	}
@@ -975,6 +1823,16 @@ static long do_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd, ui
 	}
 	if (anonymous) {
 		/* Data is the host's to read and write whatever the guest says. */
+		if (flags & GX_MAP_STACK)
+			note_stack(addr, addr + size);
+		if (gmem_lazy && (prot & PG_PROT) && is_data(addr, prot) &&
+		    (size > EAGER_MAPPED || (flags & GX_MAP_STACK))) {
+			/* When it is first used: see lazy_fault(). */
+			memset(&page_state[page_of(addr)], PG_USED | (prot & PG_PROT), size / GX_PAGE);
+			return (long)addr;
+		}
+		if (gmem_lazy && (prot & PG_PROT) && is_data(addr, prot))
+			eager_commits++;
 		if ((prot & PG_PROT) && is_data(addr, prot)) {
 			if (host_commit((void *)addr, size, DATA_PROT))
 				return -GX_ENOMEM;
@@ -1026,6 +1884,29 @@ long gmem_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd, uint64_
 	return ret;
 }
 
+uint64_t gmem_code(const uint32_t *code, int words)
+{
+	uint64_t addr;
+
+	host_lock_acquire(lock);
+	addr = new_image(GX_PAGE);
+	if (addr && commit(addr, GX_PAGE, GX_PROT_READ | GX_PROT_WRITE))
+		addr = 0;
+	if (addr) {
+		memcpy((void *)addr, code, (size_t)words * 4);
+		if (patch_syscalls(addr, GX_PAGE) < 0 ||
+		    host_protect((void *)addr, GX_PAGE, GX_PROT_READ | GX_PROT_EXEC)) {
+			addr = 0;
+		} else {
+			memset(&page_state[page_of(addr)],
+			       PG_USED | PG_COMMITTED | GX_PROT_READ | GX_PROT_EXEC, 1);
+			host_flush_icache((void *)addr, GX_PAGE);
+		}
+	}
+	host_lock_release(lock);
+	return addr;
+}
+
 long gmem_reserve_image(uint64_t span)
 {
 	uint64_t addr;
@@ -1049,8 +1930,33 @@ long gmem_munmap(uint64_t addr, uint64_t len)
 	for (int i = 0; i < MAX_IMAGES; i++) {
 		struct image *img = &images[i];
 
-		if (!img->end || addr > img->start || addr + size < img->end)
+		int gone;
+
+		if (!img->end || addr + size <= img->start || addr >= img->end)
 			continue;
+		/* An image goes when the last of it does, in however many
+		 * pieces: the loader gives back what it asked too much of
+		 * (either end of the room it had a library in) and a program
+		 * that ends gives back the rest, piece by piece. An image that
+		 * was kept after that stood for addresses that others had by
+		 * then: their code was sent to its veneers, wherever those had
+		 * been, and its veneers were given back from under whoever had
+		 * that place since. What goes from either end is no longer the
+		 * image's either. */
+		if (addr <= img->start && addr + size >= img->end) {
+			gone = 1;
+		} else {
+			if (addr <= img->start)
+				img->start = addr + size;
+			else if (addr + size >= img->end)
+				img->end = addr;
+			gone = 1;
+			for (uint64_t a = img->start; a < img->end && gone; a += GX_PAGE)
+				gone = !(page_state[page_of(a)] & PG_USED);
+		}
+		if (!gone)
+			continue;
+		gmem_note("the veneers of an image that was unmapped", img->pool, img->pool_end, img->start);
 		release(img->pool, img->pool_end - img->pool);
 		memset(img, 0, sizeof(*img));
 	}
@@ -1075,6 +1981,9 @@ long gmem_mprotect(uint64_t addr, uint64_t len, int prot)
 		uint64_t q = p;
 		uint64_t run_addr = (uint64_t)arena + p * GX_PAGE;
 
+		/* What a run is and what becomes of it, as one: a page of it
+		 * may be on its way to being committed (lazy_fault()). */
+		host_lock_acquire(lazy_lock);
 		while (q < first + n && page_state[q] == page_state[p])
 			q++;
 		if (!(page_state[p] & PG_USED) || (page_state[p] & PG_HOLE)) {
@@ -1085,6 +1994,22 @@ long gmem_mprotect(uint64_t addr, uint64_t len, int prot)
 			/* The host's protection follows when the page is touched:
 			 * see gmem_fault(). */
 			memset(&page_state[p], PG_USED | WX_PROT | (page_state[p] & PG_COMMITTED), q - p);
+		} else if (is_lazy(page_state[p]) ||
+			   (gmem_lazy && !(page_state[p] & PG_COMMITTED) && (prot & PG_PROT) &&
+			    !(prot & GX_PROT_EXEC) && is_data(run_addr, prot))) {
+			/* Wanted, or no longer: there when it is first used, or
+			 * now if it is little (see EAGER_PROTECTED). */
+			if ((prot & GX_PROT_EXEC)) {
+				if (commit(run_addr, (q - p) * GX_PAGE, prot))
+					ret = -GX_ENOMEM;
+			} else if ((prot & PG_PROT) && (q - p) * GX_PAGE <= EAGER_PROTECTED && !in_stack(run_addr) &&
+				   !host_commit((void *)run_addr, (q - p) * GX_PAGE, DATA_PROT)) {
+				memset(&page_state[p], PG_USED | PG_COMMITTED | (prot & PG_PROT), q - p);
+				count_committed(q - p, q);
+				eager_commits++;
+			} else {
+				memset(&page_state[p], PG_USED | (prot & PG_PROT), q - p);
+			}
 		} else if (!(page_state[p] & PG_COMMITTED)) {
 			if (!(prot & PG_PROT))
 				;   /* reserved it was, reserved it stays */
@@ -1105,6 +2030,7 @@ long gmem_mprotect(uint64_t addr, uint64_t len, int prot)
 				memset(&page_state[p], PG_USED | PG_COMMITTED | (prot & PG_PROT) |
 				       (page_state[p] & PG_SHARED), q - p);
 		}
+		host_lock_release(lazy_lock);
 		p = q;
 	}
 	host_lock_release(lock);
@@ -1123,9 +2049,11 @@ long gmem_madvise(uint64_t addr, uint64_t len, int advice)
 	 * count on it. */
 	host_lock_acquire(lock);
 	for (uint64_t p = page_of(addr), end = p + size / GX_PAGE; p < end;) {
-		uint8_t state = page_state[p];
+		uint8_t state;
 		uint64_t q = p;
 
+		host_lock_acquire(lazy_lock);   /* as in gmem_mprotect() */
+		state = page_state[p];
 		while (q < end && page_state[q] == state)
 			q++;
 		if (!(state & PG_COMMITTED) || (state & (PG_SHARED | PG_COPY))) {
@@ -1135,6 +2063,20 @@ long gmem_madvise(uint64_t addr, uint64_t len, int advice)
 			host_decommit(arena + p * GX_PAGE, (q - p) * GX_PAGE);
 			memset(&page_state[p], PG_USED | WX_PROT, q - p);
 			count_committed(-(int64_t)(q - p), 0);
+		} else if (gmem_lazy && gmem_lazy_wanted_only && !(state & GX_PROT_EXEC) &&
+			   is_data((uint64_t)arena + p * GX_PAGE, 0) &&
+			   (!(state & PG_PROT) || (q - p) * GX_PAGE >= DONTNEED_GIVEN_BACK)) {
+			/* Given back for real where the host has pieces to spare:
+			 * this is how a browser's allocators let go of memory
+			 * (they then take away all access, or unmap), and kept
+			 * it was never anyone's again: the 28 MB of a large
+			 * script, taken and let go some twenty-five times while
+			 * a Steam client logs in, stayed committed each time.
+			 * What is still wanted is there again when it is used. */
+			host_decommit(arena + p * GX_PAGE, (q - p) * GX_PAGE);
+			memset(&page_state[p], PG_USED | (state & PG_PROT), q - p);
+			count_committed(-(int64_t)(q - p), 0);
+			given_back += q - p;
 		} else if ((state & GX_PROT_WRITE) ||
 			   (!(state & PG_PROT) && is_data((uint64_t)arena + p * GX_PAGE, 0))) {
 			/* Cleared and kept, also what has no access (how
@@ -1146,10 +2088,27 @@ long gmem_madvise(uint64_t addr, uint64_t len, int advice)
 			memset(&page_state[p], PG_USED, q - p);
 			count_committed(-(int64_t)(q - p), 0);
 		}
+		host_lock_release(lazy_lock);
 		p = q;
 	}
 	host_lock_release(lock);
 	return 0;
+}
+
+/* How much of [addr, addr+max) can be read and written right now, from addr
+ * on: memory that is there, not memory that would be on first use, and
+ * memory of the program's own, not a file it shares. */
+uint64_t gmem_writable(uint64_t addr, uint64_t max)
+{
+	const uint8_t need = PG_COMMITTED | GX_PROT_READ | GX_PROT_WRITE;
+	uint64_t end = addr;
+
+	if (!in_arena(addr, 1))
+		return 0;
+	while (end < addr + max && in_arena(end, 1) && (page_state[page_of(end)] & need) == need &&
+	       !(page_state[page_of(end)] & (PG_SHARED | PG_COPY)) && !is_wx(page_state[page_of(end)]))
+		end = GX_PAGE_DOWN(end) + GX_PAGE;
+	return end > addr + max ? max : end - addr;
 }
 
 int gmem_accessible(uint64_t addr, uint64_t len, int write)
@@ -1161,7 +2120,8 @@ int gmem_accessible(uint64_t addr, uint64_t len, int write)
 	if (!in_arena(addr, len))
 		return 0;
 	for (uint64_t p = page_of(addr); p <= page_of(addr + len - 1); p++)
-		if ((page_state[p] & need) != need && !is_wx(page_state[p]))
+		if ((page_state[p] & need) != need && !is_wx(page_state[p]) &&
+		    !(is_lazy(page_state[p]) && (page_state[p] & need & PG_PROT)))
 			return 0;
 	return 1;
 }
@@ -1179,14 +2139,40 @@ void gmem_set_brk(uint64_t start)
 	host_lock_release(lock);
 }
 
+/* Where the break is: from where it started to where it is now. */
+void gmem_break(uint64_t *start, uint64_t *end)
+{
+	*start = brk_start;
+	*end = GX_PAGE_UP(brk_cur);
+}
+
 long gmem_brk(uint64_t addr)
 {
 	host_lock_acquire(lock);
 	if (brk_start && addr >= brk_start && addr <= brk_start + BRK_SIZE) {
 		uint64_t old_top = GX_PAGE_UP(brk_cur), new_top = GX_PAGE_UP(addr);
 
+		/* As one with lazy_fault(), which may have committed the
+		 * bottom of what is kept for the break along with a neighbour. */
+		host_lock_acquire(lazy_lock);
 		if (new_top > old_top) {
-			if (commit(old_top, new_top - old_top, GX_PROT_READ | GX_PROT_WRITE) == 0)
+			int failed = 0;
+
+			/* In runs: each call is a piece of memory of its own for
+			 * the host. */
+			for (uint64_t a = old_top, b; a < new_top && !failed; a = b) {
+				int there = page_state[page_of(a)] & PG_COMMITTED;
+
+				for (b = a + GX_PAGE; b < new_top &&
+				     (page_state[page_of(b)] & PG_COMMITTED) == there; b += GX_PAGE)
+					;
+				if (there)
+					memset(&page_state[page_of(a)],
+					       PG_USED | PG_COMMITTED | GX_PROT_READ | GX_PROT_WRITE, (b - a) / GX_PAGE);
+				else
+					failed = commit(a, b - a, GX_PROT_READ | GX_PROT_WRITE);
+			}
+			if (!failed)
 				brk_cur = addr;
 		} else {
 			if (new_top < old_top) {
@@ -1196,6 +2182,7 @@ long gmem_brk(uint64_t addr)
 			}
 			brk_cur = addr;
 		}
+		host_lock_release(lazy_lock);
 	}
 	addr = brk_cur;
 	host_lock_release(lock);

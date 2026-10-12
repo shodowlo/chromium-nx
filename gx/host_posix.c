@@ -87,8 +87,47 @@ static int writable_and_executable(int prot)
 	return (prot & (PROT_WRITE | PROT_EXEC)) == (PROT_WRITE | PROT_EXEC);
 }
 
+/* The pieces memory was committed in: on a host that keeps a record or two
+ * per piece and has a limit to them (Horizon), what a program costs. Each
+ * page remembers the piece it came with (GX_REPORT_EVERY says how many pieces
+ * are left, a piece cut in two by what was given back counting twice). */
+static uint32_t *piece_of;
+static uint32_t pieces_made;
+
+static void note_pieces(void *addr, size_t len, int commit)
+{
+	uint32_t id = commit ? __atomic_add_fetch(&pieces_made, 1, __ATOMIC_RELAXED) : 0;
+	size_t first = ((uint8_t *)addr - (uint8_t *)reserved) / 4096;
+
+	if (!getenv("GX_REPORT_EVERY") || !reserved)
+		return;
+	if (!piece_of) {
+		void *p = mmap(NULL, (256UL << 30) / 4096 * sizeof(*piece_of), PROT_READ | PROT_WRITE,
+			       MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+
+		if (p == MAP_FAILED)
+			return;
+		piece_of = p;
+	}
+	for (size_t i = 0; i < len / 4096; i++)
+		piece_of[first + i] = id;
+}
+
+static unsigned long pieces_left(void)
+{
+	unsigned long count = 0;
+	uint32_t last = 0;
+
+	for (size_t i = 0; piece_of && i < (48UL << 30) / 4096; i++) {
+		count += piece_of[i] && piece_of[i] != last;
+		last = piece_of[i];
+	}
+	return count;
+}
+
 int host_commit(void *addr, size_t len, int prot)
 {
+	note_pieces(addr, len, 1);
 	return writable_and_executable(prot) ? -1 : mprotect(addr, len, prot);
 }
 
@@ -100,7 +139,10 @@ int host_protect(void *addr, size_t len, int prot)
 int host_decommit(void *addr, size_t len)
 {
 	/* A fresh mapping drops the pages, so the next commit reads zeroes. */
-	void *p = mmap(addr, len, PROT_NONE,
+	void *p;
+
+	note_pieces(addr, len, 0);
+	p = mmap(addr, len, PROT_NONE,
 		       MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
 
 	return p == MAP_FAILED ? -1 : 0;
@@ -148,11 +190,96 @@ struct start {
 	void *arg;
 };
 
+/* Faults are handled on a stack of their own: the one the thread is on may
+ * be what cannot be written to (gmem_watch()). */
+static void fault_stack(void)
+{
+	stack_t stack = { .ss_size = 64 << 10 };
+
+	stack.ss_sp = malloc(stack.ss_size);
+	if (stack.ss_sp)
+		sigaltstack(&stack, NULL);
+}
+
+/* GX_LIGHT_FORK=1: as on a host that cannot do this (the Switch, so far), to
+ * see here what a program does there. */
+int host_write_faults(void)
+{
+	static int light = -1;
+
+	if (light < 0)
+		light = getenv("GX_LIGHT_FORK") != NULL;
+	return !light;
+}
+
+/* Stopping a thread in the guest's code: it is sent a signal, and its handler
+ * says where the thread was and, if that was the guest's code, does not
+ * return until told. One at a time. */
+static volatile int stop_answer;
+static volatile uint64_t stop_round;   /* goes up each time the stopped threads are let go */
+static volatile int stop_only_says;    /* the signal asks where the thread is, no more */
+static void put_hex(const char *label, uint64_t v);
+extern char __executable_start[], etext[];
+
+static void on_stop(int sig, siginfo_t *info, void *uctx)
+{
+	ucontext_t *uc = uctx;
+	uint64_t base;
+	int in_guest = gmem_describe(uc->uc_mcontext.pc, &base) != 0;
+	uint64_t round = __atomic_load_n(&stop_round, __ATOMIC_SEQ_CST);
+
+	(void)sig;
+	(void)info;
+	if (stop_only_says) {
+		/* Where it is, and what of gx called that, innermost first:
+		 * the words of its stack that are addresses of gx's code. */
+		const uint64_t *sp = (const uint64_t *)uc->uc_mcontext.sp;
+		uint64_t from = (uint64_t)__executable_start, to = (uint64_t)etext;
+
+		put_hex(in_guest ? "    in the guest at " : "    in the host at  ", uc->uc_mcontext.pc - (in_guest ? base : 0));
+		for (int i = 0, said = 0; !in_guest && i < 600 && said < 10; i++) {
+			if (sp[i] >= from && sp[i] < to) {
+				put_hex("      gx + ", sp[i] - from);
+				said++;
+			}
+		}
+		__atomic_store_n(&stop_answer, 1, __ATOMIC_SEQ_CST);
+		return;
+	}
+	__atomic_store_n(&stop_answer, in_guest ? 2 : 1, __ATOMIC_SEQ_CST);
+	while (in_guest && __atomic_load_n(&stop_round, __ATOMIC_SEQ_CST) == round) {
+		/* The thread pointer is the guest's: nothing of the C
+		 * library's here, the bare syscall (nanosleep). */
+		struct timespec ts = { 0, 200000 };
+		register long x8 __asm__("x8") = 101;
+		register long x0 __asm__("x0") = (long)&ts;
+		register long x1 __asm__("x1") = 0;
+
+		__asm__ volatile("svc 0" : "+r"(x0) : "r"(x8), "r"(x1) : "memory");
+	}
+}
+
+int host_thread_stop(uint64_t thread)
+{
+	__atomic_store_n(&stop_answer, 0, __ATOMIC_SEQ_CST);
+	if (pthread_kill((pthread_t)thread, SIGUSR2))
+		return 0;
+	while (!__atomic_load_n(&stop_answer, __ATOMIC_SEQ_CST))
+		sched_yield();
+	return stop_answer == 2;
+}
+
+void host_threads_go(void)
+{
+	__atomic_add_fetch(&stop_round, 1, __ATOMIC_SEQ_CST);
+}
+
 static void *thread_start(void *p)
 {
 	struct start s = *(struct start *)p;
 
 	free(p);
+	fault_stack();
 	s.fn(s.arg);
 	return NULL;
 }
@@ -871,6 +998,39 @@ static void on_fault(int sig, siginfo_t *info, void *uctx)
 				__asm__ volatile("msr tpidr_el0, %0" : : "r"(gx_tp_tab[i].thread->host_tp));
 		fixed = gmem_fault(addr, addr == pc);
 		__asm__ volatile("msr tpidr_el0, %0" : : "r"(tp));
+		if (fixed) {
+			/* qemu-user does not say where a `dc zva` faulted but where
+			 * the block of code it is in began, with the registers as
+			 * they were at the fault. The C library's memset() has
+			 * `add xN, xN, #64; dc zva, xN` at the top of its loop:
+			 * run again from there, the add is done twice, 64 bytes
+			 * are left as they were and 64 past the end are cleared,
+			 * for every fault in the loop (memory committed when first
+			 * used has one per unit). The add is stepped over. */
+			if (kind && !(pc & 3) && gmem_describe(pc + 4, &base)) {
+				uint32_t first = *(uint32_t *)pc, second = *(uint32_t *)(pc + 4);
+				unsigned reg = second & 31;
+
+				if ((second & ~31u) == 0xD50B7420u && reg < 31 &&
+				    (first & 0xFFC003FFu) == (0x91000000u | (reg << 5) | reg) &&
+				    uc->uc_mcontext.regs[reg] == addr)
+					uc->uc_mcontext.pc = pc + 4;
+			}
+			return;
+		}
+	}
+	if (sig == SIGILL && kind) {
+		/* An instruction this processor does not have, that can be
+		 * done otherwise (gmem.c)? */
+		uint64_t tp;
+		int fixed;
+
+		__asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+		for (int i = 0; i < GX_MAX_THREADS; i++)
+			if (gx_tp_tab[i].guest_tp == tp)
+				__asm__ volatile("msr tpidr_el0, %0" : : "r"(gx_tp_tab[i].thread->host_tp));
+		fixed = gmem_illegal(pc);
+		__asm__ volatile("msr tpidr_el0, %0" : : "r"(tp));
 		if (fixed)
 			return;
 	}
@@ -889,6 +1049,27 @@ static void on_fault(int sig, siginfo_t *info, void *uctx)
 	put_hex("  sp      ", uc->uc_mcontext.sp);
 	for (int i = 0; i < 9; i++)
 		put_hex("  x       ", uc->uc_mcontext.regs[i]);
+	if (kind) {
+		/* Which thread of the guest, and who called what it was in. */
+		const uint64_t *fp = (const uint64_t *)uc->uc_mcontext.regs[29];
+		uint64_t guest_tp;
+
+		__asm__ volatile("mrs %0, tpidr_el0" : "=r"(guest_tp));
+		for (int i = 0; i < GX_MAX_THREADS; i++)
+			if (gx_tp_tab[i].guest_tp == guest_tp && gx_tp_tab[i].thread)
+				put_hex("  thread  ", gx_tp_tab[i].thread->tid);
+		put_hex("  frame   ", (uint64_t)fp);
+		for (int i = 0; i < 24 && fp && !((uint64_t)fp & 7) && gmem_describe((uint64_t)fp, &base) &&
+				gmem_accessible((uint64_t)fp, 16, 0); i++) {
+			if (gmem_describe(fp[1], &base) == 2)
+				put_hex("  called from image + ", fp[1] - base);
+			else
+				put_hex("  called from ", fp[1]);
+			if ((const uint64_t *)fp[0] <= fp)
+				break;
+			fp = (const uint64_t *)fp[0];
+		}
+	}
 	if (kind && export_spec) {
 		/* The guest died in its own code, so the kernel is in order:
 		 * back on this thread's host thread pointer, what the guest
@@ -902,6 +1083,9 @@ static void on_fault(int sig, siginfo_t *info, void *uctx)
 				self = gx_tp_tab[i].thread;
 		__asm__ volatile("msr tpidr_el0, %0" : : "r"(self->host_tp));
 		export_file();
+		/* What the guest wrote before it fell (its own account of
+		 * why, often) is worth having on the disk. */
+		lkl_sys_sync();
 	}
 	_exit(128 + sig);
 }
@@ -1042,6 +1226,39 @@ static void populate_root(void)
 	lkl_sys_mkdir("/dev/shm", 01777);
 	for (size_t i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++)
 		lkl_sys_mknod(nodes[i].path, LKL_S_IFCHR | 0666, 1 << 8 | nodes[i].minor);
+}
+
+/* GX_REPORT_EVERY=<seconds>: says where every guest thread is, that often. */
+static void *report_threads(void *arg)
+{
+	int seconds = atoi(arg);
+
+	gx_report_idle = 1;
+	for (;;) {
+		sleep(seconds > 0 ? seconds : 10);
+		gx_report_threads();
+		gmem_report();
+		gx_report_kernel_memory();
+		host_log("gx: memory was committed in %u pieces, of which %lu are left\n", pieces_made,
+			 pieces_left());
+		if (!getenv("GX_REPORT_STACKS"))
+			continue;
+		/* And where each is in the host (addresses for addr2line). */
+		stop_only_says = 1;
+		for (int i = 0; i < GX_MAX_THREADS; i++) {
+			const struct gx_thread *t = gx_tp_tab[i].thread;
+
+			if (gx_tp_tab[i].guest_tp == ~0UL || !t || !t->host_id)
+				continue;
+			host_log("  [%d]\n", t->tid);
+			stop_answer = 0;
+			if (!pthread_kill((pthread_t)t->host_id, SIGUSR2))
+				for (int tries = 0; !stop_answer && tries < 2000; tries++)
+					usleep(500);
+		}
+		stop_only_says = 0;
+	}
+	return NULL;
 }
 
 int main(int argc, char **argv)
@@ -1188,14 +1405,50 @@ int main(int argc, char **argv)
 		fprintf(stderr, "gx: cannot open the Wayland display\n");
 		return 1;
 	}
+	fault_stack();
 	sa.sa_sigaction = on_fault;
-	sa.sa_flags = SA_SIGINFO;
+	sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
 	sigaction(SIGSEGV, &sa, NULL);
 	sigaction(SIGBUS, &sa, NULL);
 	sigaction(SIGILL, &sa, NULL);
 	sigaction(SIGTRAP, &sa, NULL);
+	sa.sa_sigaction = on_stop;
+	sigaction(SIGUSR2, &sa, NULL);
 
 	fflush(NULL);
+	if (getenv("GX_PROCESSES"))
+		gx_processes = 1;
+	if (getenv("GX_MORE_ARGS")) {
+		/* GX_MORE_ARGS="<end of a program's path> <argument>...": see gx_more_for. */
+		static char more[1024];
+
+		strncpy(more, getenv("GX_MORE_ARGS"), sizeof(more) - 1);
+		gx_more_for = strtok(more, " ");
+		for (char *word; gx_more_for && gx_more_count < 16 && (word = strtok(NULL, " "));)
+			gx_more[gx_more_count++] = word;
+	}
+	if (getenv("GX_LAZY")) {
+		gmem_lazy = 1;
+		if (atoi(getenv("GX_LAZY")) > 1)
+			gmem_lazy_pages = atoi(getenv("GX_LAZY"));   /* in pieces of so many pages */
+		if (getenv("GX_EAGER_MB"))                       /* all but stacks and what is larger */
+			gmem_eager_mapped = gmem_eager_protected = (uint64_t)atoi(getenv("GX_EAGER_MB")) << 20;
+		if (getenv("GX_EAGER_KB"))
+			gmem_eager_mapped = gmem_eager_protected = (uint64_t)atoi(getenv("GX_EAGER_KB")) << 10;
+		if (getenv("GX_LAZY_WANTED"))
+			gmem_lazy_wanted_only = 1;               /* and nothing of what is only reserved */
+	}
+	if (getenv("GX_POOL")) {
+		/* GX_POOL=<n>: guest threads share at most n threads of the host. */
+		gx_pool = 1;
+		if (atoi(getenv("GX_POOL")) > 0)
+			gx_pool_cap = atoi(getenv("GX_POOL"));
+	}
+	if (getenv("GX_REPORT_EVERY")) {
+		pthread_t reporter;
+
+		pthread_create(&reporter, NULL, report_threads, getenv("GX_REPORT_EVERY"));
+	}
 	gx_exec(argv[arg + 1], argc - arg - 1, argv + arg + 1, guest_env);
 	return 1;
 }
