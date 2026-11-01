@@ -24,7 +24,7 @@ PC_OUT=${PC_OUT:-/work/gx-out}
 PC_SYSROOT=$PC_OUT/sysroot
 CROSS=aarch64-none-elf-
 # UNIX: AF_UNIX sockets and socketpair(), as in build-lkl.sh.
-OPTIONS="UNIX TIMERFD SIGNALFD FILE_LOCKING INOTIFY_USER ADVISE_SYSCALLS"
+OPTIONS="UNIX TIMERFD SIGNALFD FILE_LOCKING INOTIFY_USER ADVISE_SYSCALLS HOSTFS"
 # And without these, as in build-lkl.sh: threads of the kernel nothing here
 # uses, out of the 96 an application may have.
 WITHOUT="XFS_FS BTRFS_FS BLK_DEV_NVME NVME_CORE IPV6"
@@ -33,7 +33,34 @@ mkdir -p "$OUT/obj" "$OUT/lkl"
 
 echo "== kernel"
 if [ ! -d "$LINUX" ]; then
-	git clone -q file:///work/linux "$LINUX"
+	# A copy of the PC's kernel tree (build-lkl.sh), built apart.
+	if [ -d /work/linux/.git ]; then
+		git clone -q file:///work/linux "$LINUX"
+	else
+		cp -a /work/linux "$LINUX"
+		make -C "$LINUX" mrproper >/dev/null 2>&1 || true
+	fi
+fi
+# hostfs, UML's filesystem of the host's files, made to build in LKL: the
+# browser's profile and downloads are folders of the SD card (gx/hostfs_nx.c
+# is the other half).
+if ! grep -q "^config HOSTFS" "$LINUX/arch/lkl/Kconfig"; then
+	printf '\nconfig HOSTFS\n\tbool "Host filesystem (gx)"\n\tdefault y\n' >>"$LINUX/arch/lkl/Kconfig"
+	rm -f "$LKL/lib/lkl.o" "$LINUX/.config"
+fi
+for f in Makefile os.h init.h kern.h hostfs_lkl.c; do
+	if ! cmp -s "$SRC/lkl/hostfs/$f" "$LINUX/fs/hostfs/$f"; then
+		cp "$SRC/lkl/hostfs/$f" "$LINUX/fs/hostfs/$f"
+		rm -f "$LKL/lib/lkl.o"
+	fi
+done
+# UML's hostfs forgets every name as soon as it is unused, so that what the
+# host changes behind it is seen: each lookup went to the card (3000 a page
+# load). Nothing else writes these folders here: names are kept.
+if grep -q "sb->s_d_op = &simple_dentry_operations;" "$LINUX/fs/hostfs/hostfs_kern.c"; then
+	sed -i 's|\tsb->s_d_op = &simple_dentry_operations;|\t/* gx: names kept (build-nx.sh) */|' \
+		"$LINUX/fs/hostfs/hostfs_kern.c"
+	rm -f "$LKL/lib/lkl.o"
 fi
 for opt in $OPTIONS; do
 	grep -q "^CONFIG_$opt=y" "$LINUX/arch/lkl/configs/defconfig" ||
@@ -76,6 +103,11 @@ printf '#define LKL_HOST_CONFIG_AARCH64 y\n#define LKL_HOST_CONFIG_VIRTIO_NET y\
 	>"$OUT/include/lkl_autoconf.h"
 cp "$LKL"/lib/{iomem.c,iomem.h,jmp_buf.c,jmp_buf.h,utils.c,virtio.c,virtio.h,virtio_net.c,virtio_blk.c,net.c,fs.c,endian.h} \
 	"$OUT/lkl/"
+# The disk's requests on threads of their own rather than under the kernel's
+# processor (gx/lkl/virtio-defer.c says why): LKL's virtio_blk.c is replaced,
+# and what it needs is added to virtio.c.
+cp "$SRC/lkl/virtio_blk.c" "$OUT/lkl/virtio_blk.c"
+cat "$SRC/lkl/virtio-defer.c" >>"$OUT/lkl/virtio.c"
 
 # The EGL and GLES functions the guest can reach: those of its thunk libraries
 # (lists made by build-pc.sh) that Mesa for the Switch has.
@@ -95,6 +127,18 @@ PORTLIBS=$DEVKITPRO/portlibs/switch
 } >"$OUT/gl_table.c"
 echo "$(grep -c '^	{ "' "$OUT/gl_table.c") EGL and GLES functions"
 
+# The profile's empty image, packed (build-chromium.sh makes it): in the
+# program, which unpacks it next to itself the first time (profile.ext4), so
+# that nothing else has to be on the card.
+[ -e "$PC_OUT/profile.ext4.gz" ] || { echo "run build-chromium.sh first: it makes profile.ext4.gz"; exit 1; }
+python3 - "$PC_OUT/profile.ext4.gz" "$OUT/profile_gz.c" <<'PY'
+import sys
+data = open(sys.argv[1], 'rb').read()
+with open(sys.argv[2], 'w') as f:
+    f.write('const unsigned char gx_profile_gz[] = {%s};\n' % ','.join(str(b) for b in data))
+    f.write('const unsigned int gx_profile_gz_len = %d;\n' % len(data))
+PY
+
 echo "== gx"
 ARCH="-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE"
 # -iquote: LKL's host sources find their own headers, and nothing else does.
@@ -104,8 +148,8 @@ CFLAGS="-g -O2 -Wall -ffunction-sections $ARCH -D__SWITCH__ -DGX_ARENA_SIZE=(256
 	-I$DEVKITPRO/libnx/include -I$PORTLIBS/include -I$OUT/include -I$SRC/nx -I$SRC \
 	-iquote $OUT/lkl"
 objs=
-for f in "$SRC"/tramp.S "$SRC"/nx/exception.S "$SRC"/gmem.c "$SRC"/gelf.c "$SRC"/gsys.c "$SRC"/nat.c "$SRC"/cdp.c "$SRC"/wl.c "$SRC"/glwin.c "$SRC"/video.c "$SRC"/host_nx.c \
-	"$OUT"/gl_table.c "$SRC"/../nro/source/nx_host.c "$OUT"/lkl/iomem.c "$OUT"/lkl/jmp_buf.c \
+for f in "$SRC"/tramp.S "$SRC"/nx/exception.S "$SRC"/gmem.c "$SRC"/gelf.c "$SRC"/gsys.c "$SRC"/nat.c "$SRC"/cdp.c "$SRC"/wl.c "$SRC"/glwin.c "$SRC"/video.c "$SRC"/hostfs_nx.c "$SRC"/host_nx.c \
+	"$OUT"/gl_table.c "$OUT"/profile_gz.c "$SRC"/../nro/source/nx_host.c "$OUT"/lkl/iomem.c "$OUT"/lkl/jmp_buf.c \
 	"$OUT"/lkl/utils.c "$OUT"/lkl/virtio.c "$OUT"/lkl/virtio_net.c "$OUT"/lkl/virtio_blk.c \
 	"$OUT"/lkl/net.c "$OUT"/lkl/fs.c; do
 	o=$OUT/obj/$(basename "${f%.*}").o
@@ -113,12 +157,59 @@ for f in "$SRC"/tramp.S "$SRC"/nx/exception.S "$SRC"/gmem.c "$SRC"/gelf.c "$SRC"
 	objs="$objs $o"
 done
 # Mesa is C++ inside.
-${CROSS}g++ -specs=$DEVKITPRO/libnx/switch.specs -g $ARCH -Wl,-Map,"$OUT/gx.map" \
+${CROSS}g++ -specs=$DEVKITPRO/libnx/switch.specs -g $ARCH -Wl,-Map,"$OUT/gx.map" -Wl,--wrap=lkl_syscall \
 	$objs "$OUT/lkl-nro.o" -L$PORTLIBS/lib -L$DEVKITPRO/libnx/lib \
 	-lavcodec -ldav1d -lswresample -lavutil \
 	-lEGL -lGLESv2 -lglapi -ldrm_nouveau -lpng -lturbojpeg -lz -lnx -lm -o "$OUT/gx.elf"
 nacptool --create "Chromium NX" "shodowlo" "0.1" "$OUT/gx.nacp"
 elf2nro "$OUT/gx.elf" "$OUT/gx.nro" --nacp="$OUT/gx.nacp" --icon="$SRC/nx/icon.jpg"
+
+echo "== launcher"
+# What the tile opens (gx/launcher/main.c): a home screen and the settings,
+# then the browser, gx.nro, loaded in its place. Its own program, so that the
+# browser has every byte it had without it.
+mkdir -p "$OUT/launcher"
+python3 - "$SRC/nx/icon.jpg" "$OUT/launcher/icon.c" <<'PY'
+import sys
+data = open(sys.argv[1], 'rb').read()
+with open(sys.argv[2], 'w') as f:
+    f.write('const unsigned char icon_jpg[] = {%s};\n' % ','.join(str(b) for b in data))
+    f.write('const unsigned int icon_jpg_len = %d;\n' % len(data))
+PY
+LCFLAGS="-O2 -Wall $ARCH -D__SWITCH__ -I$DEVKITPRO/libnx/include -I$PORTLIBS/include -I$PORTLIBS/include/freetype2"
+${CROSS}gcc $LCFLAGS -c "$SRC/launcher/main.c" -o "$OUT/launcher/main.o"
+${CROSS}gcc $LCFLAGS -c "$OUT/launcher/icon.c" -o "$OUT/launcher/icon.o"
+${CROSS}gcc -specs=$DEVKITPRO/libnx/switch.specs $ARCH "$OUT/launcher/main.o" "$OUT/launcher/icon.o" \
+	-L$PORTLIBS/lib -L$DEVKITPRO/libnx/lib -lfreetype -lharfbuzz -lfreetype -lbz2 -lpng16 -lz -lturbojpeg \
+	-lnx -lm -o "$OUT/launcher/launcher.elf"
+elf2nro "$OUT/launcher/launcher.elf" "$OUT/launcher.nro" --nacp="$OUT/gx.nacp" --icon="$SRC/nx/icon.jpg"
+
+# What the browser is started with on the console, on top of
+# chromium-full.cmd (build-chromium.sh):
+# - AutomationControlled: --remote-debugging-pipe (cdp.c) makes
+#   navigator.webdriver true, and YouTube then takes the browser for a robot
+#   and stops its videos.
+# - The features below work in the background for nothing here: models
+#   downloaded and run on the device (the log showed it trying to load one),
+#   hints fetched for pages, casting to other screens.
+# - BackForwardCache: a page left stays in memory, in case Back comes; a
+#   game of a page left for a video site in the same tab took its 1.5 GB
+#   along, and the guest ran out.
+# - GPU memory: textures come out of the host's heap (448 MB, also the GPU
+#   driver's and the video decoder's), which Chromium does not know of; a page
+#   of thousands of images filled it, and the GPU's context was lost. And no
+#   texture over 4096 pixels a side (the screen is 1280): the driver wants
+#   each in one piece of the heap, and a texture refused (while the heap had
+#   229 MB free, in pieces) lost the context too.
+# - No Sparkplug (V8's quick compiler): it writes code in small batches,
+#   and a page of code here is writable or executable by turns, each turn a
+#   fault and a remapping (gmem.c). YouTube went from 5000 turns to 1900,
+#   from 2.2 s of them to 1.1, its video stuttering less, and no page or
+#   benchmark was slower for it: the faster compilers do the hot code.
+NX_FLAGS="--disable-blink-features=AutomationControlled \
+--disable-features=OptimizationHints,OptimizationGuideModelDownloading,OptimizationGuideOnDeviceModel,OnDeviceModelBackgroundDownload,MediaRouter,DialMediaRouteProvider,BackForwardCache \
+--force-gpu-mem-available-mb=128 --force-gpu-mem-discardable-limit-mb=32 --force-max-texture-size=4096 --disable-gl-extensions=GL_EXT_disjoint_timer_query,GL_EXT_disjoint_timer_query_webgl2,GL_ARB_timer_query,GL_EXT_timer_query \
+--js-flags=--no-sparkplug"
 
 echo "== SD card"
 # Everything is in one folder of the card, sdmc:/switch/chromium-nx: the
@@ -132,7 +223,9 @@ for log in "$APP"/*.log; do
 done
 rm -rf "$DIST"
 mkdir -p "$APP"
-cp "$OUT/gx.nro" "$APP/chromium-nx.nro"
+# The tile opens chromium-nx.nro: the launcher, which loads gx.nro.
+cp "$OUT/launcher.nro" "$APP/chromium-nx.nro"
+cp "$OUT/gx.nro" "$APP/gx.nro"
 if [ -n "${DEV:-}" ]; then
 	[ -e "$PC_SYSROOT/bin/hello" ] ||
 		{ echo "run build-pc.sh first: it makes the guest programs"; exit 1; }
@@ -149,55 +242,19 @@ if [ -n "${DEV:-}" ]; then
 -t /bin/hello
 EOF
 fi
-# Chromium, if build-chromium.sh made its root: the one with a window, in the
-# image made for the console (without what only the PC's tests use).
-if [ -e "$PC_OUT/chromium-switch.ext4" ]; then
-	cp "$PC_OUT/chromium-switch.ext4" "$APP/chromium.ext4"
-	[ -z "${DEV:-}" ] || {
-		# A page that changes at every frame and says how many frames a
-		# second the page itself gets (requestAnimationFrame).
-		A='data:text/html,<body%20style="margin:0;background:%23204080;color:white;font:80px%20sans-serif"><div%20id=d%20style="position:absolute;top:300px;width:300px;height:300px;background:linear-gradient(red,lime)"></div><p%20id=o%20style="margin:100px%20200px">...</p><script>t=0;n=0;l=0;function%20f(now){t+=6;n++;if(now-l>=1000){o.textContent=n+"%20frames/s%20in%20the%20page";n=0;l=now}d.style.left=(t%251000)+"px";requestAnimationFrame(f)}requestAnimationFrame(f)</script>'
-		# On gx's Wayland display (wl.c), with the debugging pipe for
-		# what a window does not say (cdp.c).
-		W="-w -b @chromium.ext4 /usr/lib/chromium/chromium-shell --no-sandbox --single-process --no-zygote --disable-gpu --js-flags=--jitless --ozone-platform=wayland --enable-spatial-navigation --remote-debugging-pipe"
-		# The same drawing with the GPU: ANGLE inside Chromium, on the
-		# console's own EGL and GLES through gx's libEGL and libGLESv2.
-		G="${W/--disable-gpu/--use-gl=angle --use-angle=gles-egl --ignore-gpu-blocklist --disable-gpu-sandbox --in-process-gpu}"
-		echo "[Chromium GPU: the test page] $G file:///usr/share/gx/page.html"
-		echo "[Chromium GPU: speed test] $G $A"
-		echo "[Chromium GPU: wikipedia.org] $G https://www.wikipedia.org/"
-		echo "[Chromium GPU: google.com] $G https://www.google.com/"
-		# And with V8's compilers: memory writable and executable by
-		# turns (gmem.c) is what they needed.
-		J="${G/ --js-flags=--jitless/}"
-		echo "[Chromium GPU+JIT: speed test] $J $A"
-		echo "[Chromium GPU+JIT: wikipedia.org] $J https://www.wikipedia.org/"
-		echo "[Chromium GPU+JIT: google.com] $J https://www.google.com/"
-		echo "[Chromium GPU+JIT: youtube.com] $J https://www.youtube.com/"
-		echo "[Chromium WINDOW: google.com] $W https://www.google.com/"
-		echo "[Chromium WINDOW: wikipedia.org] $W https://www.wikipedia.org/"
-		echo "[Chromium WINDOW: speed test] $W $A"
-		echo "[Chromium WINDOW: the test page] $W file:///usr/share/gx/page.html"
-	} >>"$APP/programs.txt"
-fi
-# The whole browser, a trial next to chromium-shell: its own image, and a menu
-# of two to choose from (the first is what runs without a menu).
+# Chromium: the whole browser, in its own image (chromium-full.ext4), and its
+# profile. programs.txt has one line, so it starts without a menu; with DEV=1
+# the test programs come first and the menu is shown.
 if [ -e "$PC_OUT/chromium-full-switch.ext4" ] && [ -e "$PC_OUT/chromium-full.cmd" ]; then
 	cp "$PC_OUT/chromium-full-switch.ext4" "$APP/chromium-full.ext4"
-	if [ -z "${DEV:-}" ]; then
-		S="-w -b @chromium.ext4 /usr/lib/chromium/chromium-shell --no-sandbox --single-process --no-zygote --use-gl=angle --use-angle=gles-egl --ignore-gpu-blocklist --disable-gpu-sandbox --in-process-gpu --ozone-platform=wayland --enable-spatial-navigation --remote-debugging-pipe https://www.google.com/"
-		echo "[Chromium NX (chromium-shell, GPU)] $S" >"$APP/programs.txt"
-	fi
-	# Its profile: an empty filesystem, packed, that the program unpacks
-	# next to itself the first time (profile.ext4, which is then the user's:
-	# nothing here replaces it).
-	[ ! -e "$PC_OUT/profile.ext4.gz" ] || cp "$PC_OUT/profile.ext4.gz" "$APP/profile.ext4.gz"
-	# -c3: the browser is told of the three processors it runs on. Told of
-	# one (what gx says by default) it decodes video on two threads and
-	# keeps its other pools as small.
-	F="-w -b -c3 @chromium-full.ext4 =profile.ext4 $(cat "$PC_OUT/chromium-full.cmd")"
-	echo "[Chromium, the whole browser (GPU)] $F --use-gl=angle --use-angle=gles-egl --ignore-gpu-blocklist --disable-gpu-sandbox --in-process-gpu https://www.google.com/" >>"$APP/programs.txt"
-	echo "[Chromium, the whole browser (no GPU)] $F --disable-gpu https://www.google.com/" >>"$APP/programs.txt"
+	# Its profile is the folder profile/ next to it, and its downloads
+	# Downloads/ (host_nx.c, mount_home()). =profile.ext4 names the image
+	# a profile was kept in before: copied into the folder once, if there.
+	# -c3: the browser is told of the three processors it runs on.
+	F="-w -b -c3 @chromium-full.ext4 =profile.ext4 $(cat "$PC_OUT/chromium-full.cmd") $NX_FLAGS"
+	GPU="--use-gl=angle --use-angle=gles-egl --ignore-gpu-blocklist --disable-gpu-sandbox --in-process-gpu"
+	echo "[Chromium NX] $F $GPU https://www.google.com/" >>"$APP/programs.txt"
+	[ -z "${DEV:-}" ] || echo "[Chromium NX (no GPU)] $F --disable-gpu https://www.google.com/" >>"$APP/programs.txt"
 fi
 ls -la "$APP"
 echo "copy the contents of gx/dist-nx to the root of the SD card"

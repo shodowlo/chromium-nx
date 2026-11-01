@@ -30,7 +30,7 @@ $CC -O2 -g -Wall -Wextra -Wno-unused-parameter -DGX_ARENA_SIZE='(256UL << 30)' \
 	-I"$LKL/include" -I"$SRC" \
 	"$SRC"/tramp.S "$SRC"/gmem.c "$SRC"/gelf.c "$SRC"/gsys.c "$SRC"/nat.c "$SRC"/cdp.c "$SRC"/wl.c "$SRC"/glwin.c "$SRC"/video.c "$SRC"/host_posix.c \
 	"$LKL/liblkl.a" -lavcodec -lavutil -lpthread -lrt -ldl \
-	-o "$OUT/gx" || exit 1
+	-o "$OUT/gx" || [ -n "${NO_TESTS:-}" ] || exit 1
 
 echo "== sysroot"
 for lib in ld-linux-aarch64.so.1 libc.so.6 libm.so.6; do
@@ -100,6 +100,8 @@ run() {
 	fi
 }
 
+# NO_TESTS=1: only what the console's image needs (the guest libraries).
+[ -z "${NO_TESTS:-}" ] || exit 0
 echo "== tests"
 [ $# -gt 0 ] && TESTS="$*"
 failed=0

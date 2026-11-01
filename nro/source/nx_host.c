@@ -95,6 +95,10 @@ static void nx_panic(void)
 		svcSleepThread(100000000ULL); /* 100 ms */
 }
 
+/* What the kernel asks of the host, counted: see bench_syscalls() in gx. */
+unsigned long nx_counts[6];   /* sem_up, sem_down, sem_down that waited, timer_set, mutex_lock, thread_create */
+#define COUNT(i) __atomic_add_fetch(&nx_counts[i], 1, __ATOMIC_RELAXED)
+
 /* ---------- semáforos ---------- */
 
 /*
@@ -132,6 +136,7 @@ static void nx_sem_free(struct lkl_sem *s)
 static void nx_sem_up(struct lkl_sem *s)
 {
 	oplog("sem_up", s);
+	COUNT(0);
 	mutexLock(&s->m);
 	s->count++;
 	condvarWakeOne(&s->cv);
@@ -141,7 +146,10 @@ static void nx_sem_up(struct lkl_sem *s)
 static void nx_sem_down(struct lkl_sem *s)
 {
 	oplog("sem_down>", s);
+	COUNT(1);
 	mutexLock(&s->m);
+	if (s->count == 0)
+		COUNT(2);
 	while (s->count == 0)
 		condvarWait(&s->cv, &s->m);
 	s->count--;
@@ -181,6 +189,7 @@ static void nx_mutex_free(struct lkl_mutex *mx)
 static void nx_mutex_lock(struct lkl_mutex *mx)
 {
 	oplog("mutex_lock>", mx);
+	COUNT(4);
 	if (mx->recursive)
 		rmutexLock(&mx->rm);
 	else
@@ -204,6 +213,7 @@ static lkl_thread_t nx_thread_create(void (*f)(void *), void *arg)
 	Thread *t = malloc(sizeof(*t));
 	Result rc;
 
+	COUNT(5);
 	if (!t)
 		return 0;
 	rc = threadCreate(t, f, arg, NULL, NX_THREAD_STACK, NX_THREAD_PRIO,
@@ -380,6 +390,8 @@ static void nx_timer_thread(void *arg)
 	mutexUnlock(&t->m);
 }
 
+void gx_know_thread(Handle handle, const char *what) __attribute__((weak));
+
 static void *nx_timer_alloc(void (*fn)(void))
 {
 	struct nx_timer *t = calloc(1, sizeof(*t));
@@ -403,6 +415,9 @@ static void *nx_timer_alloc(void (*fn)(void))
 		free(t);
 		return NULL;
 	}
+	/* gx: told of the thread, for its reports of who is where. */
+	if (gx_know_thread)
+		gx_know_thread(t->thread.handle, "timer");
 	if (R_FAILED(threadStart(&t->thread))) {
 		threadClose(&t->thread);
 		free(t);
@@ -417,6 +432,7 @@ static int nx_timer_set_oneshot(void *timer, unsigned long delta)
 	struct nx_timer *t = timer;
 
 	oplog("timer_set", (void *)delta);
+	COUNT(3);
 	mutexLock(&t->m);
 	t->delta_ns = delta;
 	t->armed = 1;

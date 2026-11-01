@@ -5,6 +5,7 @@
  * no MMU, no user processes and is built without futexes. Everything else
  * (files, pipes, sockets, time) goes to the kernel through lkl_syscall().
  */
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <lkl.h>
@@ -325,12 +326,16 @@ static long do_clone(struct gx_frame *f)
 
 static void do_exit_thread(struct gx_thread *t, int code)
 {
+	int *clear_tid = t->clear_tid;
 	int last;
 
-	if (t->clear_tid) {
-		*t->clear_tid = 0;
-		futex_wake((uint32_t *)t->clear_tid, 1, ~0u, NULL, 0);
-	}
+	/* Out of the table first, then the joiner is told. Once told, the
+	 * guest may give this thread's stack and TLS block to a new thread,
+	 * which then has the same TLS pointer: tramp.S knows a thread by it,
+	 * and found this one, still in the table, for the new thread's
+	 * syscalls, which ran on this thread's host stack while it was still
+	 * using it (seen as a crash in a lock, with its stack gone to zeroes,
+	 * when a decoder made and ended threads by the dozen). */
 	lock();
 	last = --live_threads == 0;
 	if (t != gx_main_thread) {
@@ -340,6 +345,10 @@ static void do_exit_thread(struct gx_thread *t, int code)
 		thread_used[slot] = 0;
 	}
 	unlock();
+	if (clear_tid) {
+		*clear_tid = 0;
+		futex_wake((uint32_t *)clear_tid, 1, ~0u, NULL, 0);
+	}
 	if (last)
 		host_exit(code);
 	host_thread_exit();
@@ -374,6 +383,51 @@ static void hostcall_missing(void)
 	host_exit(127);
 }
 
+/* The guest's thread with that id; 0 is the caller. */
+static struct gx_thread *thread_of(struct gx_thread *self, int tid)
+{
+	if (!tid || tid == self->tid)
+		return self;
+	for (int i = 0; i < GX_MAX_THREADS; i++)
+		if (gx_tp_tab[i].guest_tp != ~0UL && gx_tp_tab[i].thread &&
+		    gx_tp_tab[i].thread->tid == tid)
+			return gx_tp_tab[i].thread;
+	return NULL;
+}
+
+/* What a thread is asked to run at: a real-time policy (SCHED_FIFO 1,
+ * SCHED_RR 2) or a nice value. */
+static long set_thread_priority(struct gx_thread *self, int tid, int policy, int rt, int nice)
+{
+	struct gx_thread *t = thread_of(self, tid);
+	static int said;
+
+	int level = policy == 1 || policy == 2 ? 2 : nice < 0 ? 1 : 0;
+
+	if (!t)
+		return -3;   /* ESRCH */
+	/* Except the renderer's main thread, which runs the pages' scripts: a
+	 * browser in one process asks for it what it asks for display threads,
+	 * and above the time-sliced priority it held a core for as long as a
+	 * page's script ran, the video's threads waiting behind it. */
+	if (!strncmp(t->name, "Chrome_InProcRe", 15))
+		level = 0;
+	if (level && said < 40 && __atomic_fetch_add(&said, 1, __ATOMIC_SEQ_CST) < 40)
+		host_log("gx: thread %d (%s) asks for policy %d, priority %d, nice %d\n",
+			 t->tid, t->name, policy, rt, nice);
+	if (gx_no_priorities)
+		return 0;
+	/* The caller's own handle when it is the caller: another thread's is
+	 * only known once it has started. */
+	if (t == self)
+		host_thread_priority(host_thread_self(), level);
+	else if (t->host_id)
+		host_thread_priority(t->host_id, level);
+	return 0;
+}
+
+int gx_no_priorities;
+
 static long dispatch(struct gx_frame *f, struct gx_thread *self)
 {
 	long nr = f->x[8];
@@ -406,7 +460,27 @@ static long dispatch(struct gx_frame *f, struct gx_thread *self)
 			return ret;
 		break;
 	}
-	case 114:                          /* clock_settime: the constants are no more */
+	case 169: {                        /* gettimeofday: CLOCK_REALTIME, in microseconds */
+		struct lkl_timespec ts;
+
+		if (f->x[1]) {
+			/* The kernel's time zone, which nothing here ever sets: UTC. */
+			if (!gmem_accessible(f->x[1], 8, 1))
+				return -GX_EFAULT;
+			((int32_t *)f->x[1])[0] = 0;
+			((int32_t *)f->x[1])[1] = 0;
+		}
+		if (f->x[0]) {
+			if (!gmem_accessible(f->x[0], 16, 1))
+				return -GX_EFAULT;
+			if (fast_clock_gettime(0, &ts))
+				break;
+			((int64_t *)f->x[0])[0] = ts.tv_sec;
+			((int64_t *)f->x[0])[1] = ts.tv_nsec / 1000;
+		}
+		return 0;
+	}
+	case 114: case 170:                /* clock_settime, settimeofday: the constants are no more */
 		memset(clock_known, 0, sizeof(clock_known));
 		break;
 	}
@@ -460,8 +534,19 @@ static long dispatch(struct gx_frame *f, struct gx_thread *self)
 	case 124: host_yield(); return 0;  /* sched_yield */
 	/* The kernel does not know the guest's threads by the ids they have
 	 * here: scheduling is the host's business. */
-	case 118: case 119: case 122:      /* sched_setparam, _setscheduler, _setaffinity */
+	case 118: case 122:                /* sched_setparam, _setaffinity */
 		return 0;
+	case 119:                          /* sched_setscheduler(tid, policy, param) */
+		return set_thread_priority(self, (int)f->x[0], (int)f->x[1],
+					   f->x[2] ? *(int *)f->x[2] : 0, 0);
+	case 140:                          /* setpriority(which, who, nice) */
+		if (f->x[0] != 0)          /* PRIO_PROCESS: a thread, here */
+			return 0;
+		return set_thread_priority(self, (int)f->x[1], 0, 0, (int)f->x[2]);
+	case 274:                          /* sched_setattr(tid, attr, flags) */
+		/* struct sched_attr: size, policy, flags, nice, priority */
+		return set_thread_priority(self, (int)f->x[0], ((int *)f->x[1])[1],
+					   ((int *)f->x[1])[5], ((int *)f->x[1])[4]);
 	case 120: return 0;                /* sched_getscheduler: SCHED_OTHER */
 	case 121:                          /* sched_getparam */
 		*(int *)f->x[1] = 0;
@@ -736,6 +821,72 @@ void gx_report_threads(void)
 			report_thread(&threads[i], elapsed);
 }
 
+/*
+ * How long each kind of syscall takes, for the ones that should not wait: a
+ * syscall here goes through the kernel's one processor, and what a browser
+ * does between two pictures is mostly made of them. Those that wait for
+ * something (futex, poll, epoll, nanosleep, reads of pipes and sockets) are
+ * counted but say nothing about cost.
+ */
+#define SYSCALL_KINDS 300
+static uint64_t kind_calls[SYSCALL_KINDS], kind_ns[SYSCALL_KINDS];
+
+void gx_report_syscall_cost(void)
+{
+	static uint64_t last_calls[SYSCALL_KINDS], last_ns[SYSCALL_KINDS];
+	static uint64_t calls[SYSCALL_KINDS], ns[SYSCALL_KINDS];
+	char line[400];
+	int len;
+
+	for (int k = 0; k < SYSCALL_KINDS; k++) {
+		uint64_t c = kind_calls[k], t = kind_ns[k];
+
+		calls[k] = c - last_calls[k];
+		ns[k] = t - last_ns[k];
+		last_calls[k] = c;
+		last_ns[k] = t;
+	}
+	len = snprintf(line, sizeof(line), "gx: syscall time in 10 s (number: calls, ms):");
+	for (int n = 0; n < 8; n++) {
+		int best = -1;
+
+		for (int k = 0; k < SYSCALL_KINDS; k++) {
+			/* futex, epoll_pwait, ppoll, pselect, nanosleep, clock_nanosleep,
+			 * read, recvfrom, recvmsg, sched_yield: they wait. */
+			if (k == 98 || k == 22 || k == 73 || k == 72 || k == 101 || k == 115 ||
+			    k == 63 || k == 207 || k == 212 || k == 124)
+				continue;
+			if (ns[k] >= 1000000 && (best < 0 || ns[k] > ns[best]))
+				best = k;
+		}
+		if (best < 0)
+			break;
+		len += snprintf(line + len, sizeof(line) - len, " %d: %lu, %lu;", best,
+				(unsigned long)calls[best], (unsigned long)(ns[best] / 1000000));
+		ns[best] = 0;
+		if (len >= (int)sizeof(line) - 40)
+			break;
+	}
+	host_log("%s\n", line);
+	/* And the most frequent, waiting or not. */
+	len = snprintf(line, sizeof(line), "gx: syscalls in 10 s (number: calls):");
+	for (int n = 0; n < 12; n++) {
+		int best = -1;
+
+		for (int k = 0; k < SYSCALL_KINDS; k++)
+			if (calls[k] >= 100 && (best < 0 || calls[k] > calls[best]))
+				best = k;
+		if (best < 0)
+			break;
+		len += snprintf(line + len, sizeof(line) - len, " %d: %lu;", best,
+				(unsigned long)calls[best]);
+		calls[best] = 0;
+		if (len >= (int)sizeof(line) - 40)
+			break;
+	}
+	host_log("%s\n", line);
+}
+
 long gx_do_syscall(struct gx_frame *f)
 {
 	struct gx_thread *self = (struct gx_thread *)f->ctx;
@@ -752,7 +903,16 @@ long gx_do_syscall(struct gx_frame *f)
 		self->name[sizeof(self->name) - 1] = 0;
 	}
 	__atomic_add_fetch(&syscall_count, 1, __ATOMIC_RELAXED);
-	ret = dispatch(f, self);
+	{
+		uint64_t t0 = host_now_ns();
+		unsigned nr = (unsigned)f->x[8];
+
+		ret = dispatch(f, self);
+		if (nr < SYSCALL_KINDS) {
+			__atomic_add_fetch(&kind_calls[nr], 1, __ATOMIC_RELAXED);
+			__atomic_add_fetch(&kind_ns[nr], host_now_ns() - t0, __ATOMIC_RELAXED);
+		}
+	}
 	self->nr = -1;
 
 	if (gx_trace) {

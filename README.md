@@ -12,8 +12,16 @@ This is experimental software.
 
 ## What it does
 
-- Runs Debian's `chromium-shell` 154 (the Chromium engine with a minimal
-  window), as shipped, without recompiling it.
+- Runs Debian's `chromium` 156, the whole browser (tabs, address bar, a
+  profile that lasts), as shipped, without recompiling it.
+- Opens on a launcher (`chromium-nx.nro`, from `gx/launcher/`): a home
+  screen with a clock, a search bar and a row of sites (Chromium itself
+  opens on its own start page), and the settings (diagnostics, the disk and
+  priority options, clearing the browsing data; kept in `settings.ini`). It writes the browser's command
+  line to `launch.txt` and has the Homebrew loader load the browser,
+  `gx.nro`, once it has ended: the browser gets the whole process, as if
+  started alone (1936 MB for the guest either way). `gx.nro` started by
+  itself still reads `programs.txt`; holding L shows its menu.
 - Renders with the GPU: ANGLE inside Chromium talks to the console's own
   EGL/GLES driver
 - Runs JavaScript
@@ -37,13 +45,51 @@ This is experimental software.
 
 Confirmed on a real console:
 
-- Google, Wikipedia and YouTube load and are usable; YouTube videos play but sometimes crash.
-- GPU rendering and the JIT.
+- Google, Wikipedia and YouTube load and are usable; YouTube videos play
+  (H.264 decoded by the console's hardware decoder).
+- GPU rendering and the JIT: about 60 pictures a second on simple
+  animations, 55 when scrolling a long page, 25 animating 400 elements (at
+  the stock 1 GHz; 38 to 41 at 1.58 GHz).
+- At the stock clock, YouTube's home page is up about 32 s after the app
+  starts (Chromium itself takes most of it), and a video plays at 30
+  pictures a second once the page has finished loading around it; in the
+  half minute before, its scripts take the processors and the video
+  stutters.
 - Touch, scrolling, text entry with the system keyboard, d-pad focus.
+- Memory: the guest (Chromium) has about 1.9 GB, the console's own side
+  (GPU driver, video decoder, thread stacks) 448 MB, Linux 192 MB. A heavy
+  page such as Minecraft Classic takes most of it; a page that is left is
+  freed (no back/forward cache). When something dies anyway, the system's
+  error dialog says so and the app closes, rather than the last picture
+  staying on screen.
 
-Downloads are stored in profile.ext4
+The browser's profile (cookies, history, logins, cache) is kept in
+`/switch/chromium-nx/profile.ext4`, made the first time from an empty image
+inside the program. What it downloads goes to `/switch/chromium-nx/Downloads`
+on the SD card, as plain files: the kernel writes them through hostfs
+(User-Mode Linux's filesystem of the host's files, built into LKL:
+`gx/lkl/hostfs/`) and `gx/hostfs_nx.c`, which makes up on the card what it is
+not (symbolic links, removing an open file, renaming over one). The profile
+was a folder of the card for a while; it is an image again because every
+access to a folder holds the kernel for as long as the card takes, and the
+kernel's memory ran out.
 
 The log of the last run is `/switch/chromium-nx/chromium-nx.log`.
+
+### Options in programs.txt
+
+Before the program, on its line:
+
+| Option | Meaning |
+|---|---|
+| `-w` / `-b` | A Wayland display / the browser driven through its debugging pipe |
+| `@image` / `=image` | The root image / the profile image, next to the NRO |
+| `-c<n>` | Processors the guest is told about |
+| `-A<l>,<t>,<r>,<b>` | Where the address bar is |
+| `-p` | Diagnostics in the log: where the processor goes (a sampling profiler), what a syscall costs, failed requests and media player errors |
+| `-xb`, `-xh` | Experiments: no kernel priority for syscalls, a tickless kernel |
+| `-xp`, `-xd` | Experiments: Chromium's thread priorities ignored, the disk read under the kernel's processor (as LKL does) |
+| `-t` | Traces every syscall |
 
 ## How it works
 
@@ -90,6 +136,27 @@ A few things Horizon does differently had to be worked around:
   committed in large units.
 - **Reading the virtual counter traps**; it is emulated in the exception
   handler.
+- **Memory can be missing for a moment.** When code memory next to it is
+  mapped again, a thread may fault on a page that is there an instant later;
+  the exception handler waits and lets it try again.
+- **newlib's malloc refuses 2 GB or more**, and says yes to sizes it does
+  not have: the guest's memory is sized by counting what the heap has
+  left, not by asking for it. When it runs out, the units the guest made
+  inaccessible and left all zero are given back first.
+- **The kernel's one processor is handed between threads** through
+  semaphores: syscalls of LKL run at the priority of the kernel's threads,
+  and LKL's tick is not stopped when it is idle (`nohz=off`), which made
+  every hand-over wake its timer thread. The disk does not hold it: LKL's
+  virtio block device is replaced by one that reads the SD card on threads
+  of its own and raises the interrupt when done (`gx/lkl/`), where LKL's
+  held every other thread's syscalls for the length of each read.
+- **Only one priority is time-sliced** (0x3B, the guests'). What Chromium
+  asks of its threads' priorities (display, audio) puts them one or two
+  levels above it; the renderer's main thread, which runs the pages'
+  scripts, stays where it can be time-sliced.
+- **A guest thread is known by its TLS pointer**, which a new thread may
+  inherit from one that just ended (glibc reuses stacks): an ending thread
+  leaves the table before its joiner is told.
 
 ## Build
 
@@ -107,9 +174,14 @@ docker exec lkl-gx-nx bash /project/gx/build-nx.sh         # the NRO -> gx/dist-
 docker exec lkl-gx-nx bash /project/gx/build-hbl.sh        # the loader -> gx/dist-hbl
 ```
 
-`DEV=1 build-nx.sh` adds a `programs.txt` next to the NRO: the app then shows
-a menu of what to run (test programs, Chromium without the GPU or the JIT)
-instead of starting the browser.
+The root image wants Debian's arm64 `chromium` installed in `lkl-gx`
+(`apt-get install chromium:arm64`). With `NO_TESTS=1`, `build-pc.sh` and
+`build-chromium.sh` only make what the console needs and run nothing under
+qemu. LKL itself is the unmodified `lkl/linux` tree.
+
+`DEV=1 build-nx.sh` adds the test programs and Chromium without the GPU to
+`programs.txt`: the app then shows a menu of what to run instead of starting
+the browser.
 
 ## Testing on a PC
 

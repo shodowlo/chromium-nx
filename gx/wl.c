@@ -73,6 +73,7 @@ struct object {
 	uint32_t pool, surface, pending, xdg, toplevel;
 	int32_t offset, width, height, stride;
 	uint8_t attached, configured;
+	uint8_t full_screen;   /* wl_surface of a window: asked for and not undone */
 };
 
 struct pool {
@@ -433,11 +434,14 @@ static void keyboard_focus(void);
  * what makes a browser drop the margin it draws its shadow in, and active
  * (4); full-screen (2) when it asks for that, which is a page that wants the
  * whole screen for a video. */
-static void configure_window(struct object *surface, int full_screen)
+static void configure_window(struct object *surface)
 {
-	static const uint32_t states[] = { 1, 4, 2 };
+	static const uint32_t states[] = { 1, 4 }, full_states[] = { 2, 4 };
 
-	event(surface->toplevel, 0, "iia", WL_SCREEN_WIDTH, WL_SCREEN_HEIGHT, states, full_screen ? 3 : 2);
+	if (surface->full_screen)
+		event(surface->toplevel, 0, "iia", WL_SCREEN_WIDTH, WL_SCREEN_HEIGHT, full_states, 2);
+	else
+		event(surface->toplevel, 0, "iia", WL_SCREEN_WIDTH, WL_SCREEN_HEIGHT, states, 2);
 	event(surface->xdg, 0, "u", serial++);   /* xdg_surface.configure */
 }
 
@@ -448,7 +452,7 @@ static void commit(uint32_t id)
 	if (surface->toplevel && !surface->configured) {
 		surface->configured = 1;
 		main_surface = id;
-		configure_window(surface, 0);
+		configure_window(surface);
 		if (output_id)
 			event(id, 0, "u", output_id);    /* wl_surface.enter */
 		keyboard_focus();
@@ -830,8 +834,19 @@ static void request(uint32_t id, uint16_t opcode, const uint32_t *w, uint32_t wo
 		} else if (opcode >= 9 && opcode <= 12 && o->surface < MAX_OBJECTS &&
 			   objects[o->surface].configured) {
 			/* set and unset maximized, set and unset full-screen: it
-			 * is told what it is, which it waits for. */
-			configure_window(&objects[o->surface], opcode == 11);
+			 * is told what it is, which it waits for. Full-screen
+			 * until it is undone: a browser going full-screen asks to
+			 * be maximized no more, and was told it was not full-screen
+			 * either, and gave up on it two seconds later. */
+			static int said;
+			static const char *const names[] = { "maximized", "not maximized",
+							     "full-screen", "not full-screen" };
+
+			if (said < 40 && ++said)
+				host_log("gx: wayland: the window asks to be %s\n", names[opcode - 9]);
+			if (opcode == 11 || opcode == 12)
+				objects[o->surface].full_screen = opcode == 11;
+			configure_window(&objects[o->surface]);
 		}
 		break;
 	case T_SUBSURFACE:

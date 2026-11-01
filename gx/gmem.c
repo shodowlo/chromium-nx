@@ -21,6 +21,7 @@
  * to the file when its last view goes, so that a later mapping finds it. On
  * a host without such memory, every view of a file is at the same address.
  */
+#include <stdio.h>
 #include <string.h>
 #include <lkl.h>
 #include "gx.h"
@@ -192,6 +193,11 @@ static uint64_t find_free_anonymous(uint64_t size)
 static uint64_t committed_pages, committed_peak, top_page;
 static int chunk_count, chunk_peak;   /* pieces of the host's shared memory */
 static uint64_t wx_to_write, wx_to_exec;   /* see gmem_fault() */
+/* And what they cost: all of it, the longest, and the longest wait for the lock. */
+static uint64_t wx_ns, wx_ns_max, wx_wait_max;
+/* What MADV_DONTNEED was given, in pages: compiled code, data kept (cleared),
+ * data given back. */
+static uint64_t madv_wx, madv_kept_rw, madv_kept_none, madv_released;
 
 static void count_committed(int64_t pages, uint64_t last_page)
 {
@@ -202,15 +208,155 @@ static void count_committed(int64_t pages, uint64_t last_page)
 		top_page = last_page;
 }
 
+/* Where the time of mapping files goes: reading them, and patching their
+ * code. */
+static uint64_t file_read_ns, file_read_bytes, patch_ns;
+
+/* Where the committed memory is, when there is a lot of it: the largest runs
+ * of committed pages and the 4 GB pieces of the arena they are in (each of
+ * Chromium's allocators has its own: V8's cage, PartitionAlloc's pools). Said
+ * again each time it grew by 128 MB. */
+static uint64_t madv_calls[3];   /* MADV_DONTNEED of < 64 KB, < 1 MB, more */
+static uint64_t advice_calls[32], advice_pages[32];   /* every advice, by number */
+static uint64_t commit_mmap, commit_mprotect;   /* pages, all along */
+
+static void report_regions(int now)
+{
+	static uint64_t said_at;
+	uint64_t top[8][2] = { { 0 } }, zones[64] = { 0 };
+	uint64_t pages = arena_size / GX_PAGE;
+
+	if (!now && (committed_pages < (1024UL << 8) || committed_pages < said_at + (128UL << 8)))
+		return;
+	said_at = committed_pages;
+	for (uint64_t p = 0; p < pages;) {
+		uint64_t q = p;
+
+		if (!(page_state[p] & PG_COMMITTED)) {
+			p++;
+			continue;
+		}
+		while (q < pages && (page_state[q] & PG_COMMITTED))
+			q++;
+		zones[((p * GX_PAGE) >> 32) & 63] += q - p;
+		for (int i = 0; i < 8; i++) {
+			if (q - p > top[i][1]) {
+				memmove(top[i + 1], top[i], (7 - i) * sizeof(top[0]));
+				top[i][0] = p;
+				top[i][1] = q - p;
+				break;
+			}
+		}
+		p = q;
+	}
+	host_log("gx: committed by mmap %lu MB, by mprotect %lu MB; MADV_DONTNEED calls "
+		 "< 64 KB %lu, < 1 MB %lu, larger %lu\n",
+		 (unsigned long)(commit_mmap >> 8), (unsigned long)(commit_mprotect >> 8),
+		 (unsigned long)madv_calls[0], (unsigned long)madv_calls[1],
+		 (unsigned long)madv_calls[2]);
+	for (int i = 0; i < 64; i++)
+		if (zones[i] >= (16UL << 8))
+			host_log("gx:   arena +%d GB: %lu MB committed\n", i * 4,
+				 (unsigned long)(zones[i] >> 8));
+	for (int i = 0; i < 32; i++)
+		if (advice_calls[i])
+			host_log("gx:   madvise %d: %lu calls, %lu MB\n", i,
+				 (unsigned long)advice_calls[i], (unsigned long)(advice_pages[i] >> 8));
+	for (int i = 0; i < 8 && top[i][1]; i++)
+		host_log("gx:   run at %#lx: %lu MB, state %#x\n",
+			 (unsigned long)(arena + top[i][0] * GX_PAGE),
+			 (unsigned long)(top[i][1] >> 8), page_state[top[i][0]]);
+}
+
 void gmem_report(void)
 {
+	if (file_read_bytes)
+		host_log("gx: mapped files: %lu MB read in %lu ms, %lu ms patching code\n",
+			 (unsigned long)(file_read_bytes >> 20), (unsigned long)(file_read_ns / 1000000),
+			 (unsigned long)(patch_ns / 1000000));
 	host_log("gx: guest memory: %lu MB committed at most, %lu MB at exit, %lu MB of addresses, "
 		 "%d pieces of shared memory at most\n",
 		 (unsigned long)(committed_peak >> 8), (unsigned long)(committed_pages >> 8),
 		 (unsigned long)(top_page >> 8), chunk_peak);
+	if (madv_wx || madv_kept_rw || madv_kept_none || madv_released)
+		host_log("gx: memory let go: %lu MB of code given back, %lu MB of data given back, "
+			 "%lu MB kept (%lu MB of it accessible)\n",
+			 (unsigned long)(madv_wx >> 8), (unsigned long)(madv_released >> 8),
+			 (unsigned long)((madv_kept_rw + madv_kept_none) >> 8),
+			 (unsigned long)(madv_kept_rw >> 8));
 	if (wx_to_write || wx_to_exec)
-		host_log("gx: compiled code: made writable %lu times, executable %lu times\n",
-			 (unsigned long)wx_to_write, (unsigned long)wx_to_exec);
+		host_log("gx: compiled code: made writable %lu times, executable %lu times, "
+			 "in %lu ms (%lu ms at most, %lu ms of it waiting)\n",
+			 (unsigned long)wx_to_write, (unsigned long)wx_to_exec,
+			 (unsigned long)(wx_ns / 1000000), (unsigned long)(wx_ns_max / 1000000),
+			 (unsigned long)(wx_wait_max / 1000000));
+	report_regions(0);
+}
+
+static struct image *image_of(uint64_t addr);
+static uint64_t swept_pages, sweeps;
+
+/*
+ * When the host has no memory left: gives back the data units that are all
+ * inaccessible to the guest and all zeroes. Allocators make what they let go
+ * inaccessible and discard it (gmem_madvise() clears it), but in small pieces,
+ * so that the units of it are left committed; a browser had half a gigabyte
+ * of them when it ran out. Such a unit can go without the guest knowing: it
+ * can only touch it after making it accessible, which commits it anew, and it
+ * would find zeroes there either way. Called with the lock held, which
+ * mprotect takes too.
+ */
+static uint64_t sweep(void)
+{
+	const uint64_t unit = DATA_UNIT / GX_PAGE;
+	uint64_t pages = top_page < arena_size / GX_PAGE ? top_page : arena_size / GX_PAGE;
+	uint64_t freed = 0;
+
+	for (uint64_t p = 0; p + unit <= pages; p += unit) {
+		const uint64_t *word;
+		uint64_t i, a = (uint64_t)arena + p * GX_PAGE;
+
+		for (i = 0; i < unit && page_state[p + i] == (PG_USED | PG_COMMITTED); i++)
+			;
+		if (i < unit || image_of(a) || image_of(a + DATA_UNIT - 1))
+			continue;
+		word = (const uint64_t *)a;
+		for (i = 0; i < DATA_UNIT / 8 && !word[i]; i++)
+			;
+		if (i < DATA_UNIT / 8 || host_decommit((void *)a, DATA_UNIT))
+			continue;
+		memset(&page_state[p], PG_USED, unit);
+		count_committed(-(int64_t)unit, 0);
+		freed += unit;
+	}
+	swept_pages += freed;
+	sweeps++;
+	host_log("gx: no memory left: %lu MB given back that the guest had let go\n",
+		 (unsigned long)(freed >> 8));
+	return freed;
+}
+
+/* host_commit(), and when it fails, once more after a sweep. */
+static int commit_host(void *addr, uint64_t len, int prot)
+{
+	static uint64_t fruitless_at;
+
+	if (!host_commit(addr, len, prot))
+		return 0;
+	/* Not again right after a sweep that found nothing: every allocation
+	 * then fails, and each would go through the whole arena. */
+	if (fruitless_at && host_now_ns() - fruitless_at < 1000000000ULL)
+		return -1;
+	if (!sweep()) {
+		static int said;
+
+		if (!said++)
+			report_regions(1);
+		fruitless_at = host_now_ns();
+		return -1;
+	}
+	fruitless_at = 0;
+	return host_commit(addr, len, prot);
 }
 
 static void release(uint64_t addr, uint64_t len)
@@ -233,7 +379,7 @@ static int commit(uint64_t addr, uint64_t len, int prot)
 	uint8_t state = PG_USED | (prot & PG_PROT);
 
 	if (prot & PG_PROT) {
-		if (host_commit((void *)addr, len, prot))
+		if (commit_host((void *)addr, len, prot))
 			return -1;
 		state |= PG_COMMITTED;
 		count_committed(len / GX_PAGE, page_of(addr) + len / GX_PAGE);
@@ -241,8 +387,6 @@ static int commit(uint64_t addr, uint64_t len, int prot)
 	memset(&page_state[page_of(addr)], state, len / GX_PAGE);
 	return 0;
 }
-
-static struct image *image_of(uint64_t addr);
 
 /*
  * Memory the guest wants writable and executable at once: what a compiler
@@ -280,8 +424,13 @@ int gmem_fault(uint64_t addr, int exec)
 
 	if (!arena || !in_arena(addr, 1))
 		return 0;
-	host_lock_acquire(lock);
 	at = page_of(addr);
+	uint64_t t0 = host_now_ns(), t1;
+
+	host_lock_acquire(lock);
+	t1 = host_now_ns();
+	if (t1 - t0 > wx_wait_max && is_wx(page_state[at]))
+		wx_wait_max = t1 - t0;
 	if (is_wx(page_state[at])) {
 		first = at & ~(WX_UNIT / GX_PAGE - 1);
 		end = first + WX_UNIT / GX_PAGE;
@@ -300,7 +449,7 @@ int gmem_fault(uint64_t addr, int exec)
 			if (state & PG_COMMITTED) {
 				failed = host_protect(run, (q - p) * GX_PAGE, prot);
 			} else {
-				failed = host_commit(run, (q - p) * GX_PAGE, prot);
+				failed = commit_host(run, (q - p) * GX_PAGE, prot);
 				if (!failed) {
 					memset(&page_state[p], state | PG_COMMITTED, q - p);
 					count_committed(q - p, q);
@@ -315,6 +464,10 @@ int gmem_fault(uint64_t addr, int exec)
 			wx_to_exec++;
 		else
 			wx_to_write++;
+		t1 = host_now_ns() - t0;
+		wx_ns += t1;
+		if (t1 > wx_ns_max)
+			wx_ns_max = t1;
 	}
 	host_lock_release(lock);
 	return ret;
@@ -335,20 +488,31 @@ static int commit_data(uint64_t addr, uint64_t len, int prot)
 {
 	uint64_t end = addr + len;
 
+	if (len >= (32UL << 20))
+		host_log("gx: %lu MB made accessible at %#lx\n", (unsigned long)(len >> 20),
+			 (unsigned long)addr);
+
 	for (uint64_t unit = addr & ~(DATA_UNIT - 1); unit < end; unit += DATA_UNIT) {
 		uint64_t from = unit > addr ? unit : addr;
 		uint64_t to = unit + DATA_UNIT < end ? unit + DATA_UNIT : end;
+		uint64_t asked = from, asked_end = to;
 		int whole = in_arena(unit, DATA_UNIT);
 
 		for (uint64_t a = unit; whole && a < unit + DATA_UNIT; a += GX_PAGE)
 			whole = (page_state[page_of(a)] &
 				 (PG_USED | PG_COMMITTED | PG_SHARED | PG_COPY | PG_HOLE)) == PG_USED;
 		if (whole && !image_of(unit) && !image_of(unit + DATA_UNIT - 1)) {
-			if (host_commit((void *)unit, DATA_UNIT, DATA_PROT))
+			if (commit_host((void *)unit, DATA_UNIT, DATA_PROT))
 				return -1;
 			/* All of it is there; the guest has what it asked for. */
 			memset(&page_state[page_of(unit)], PG_USED | PG_COMMITTED, DATA_UNIT / GX_PAGE);
+			/* Its protection now, not at the end: what is committed
+			 * and inaccessible may be taken back by sweep() when a
+			 * later unit finds no memory. */
+			memset(&page_state[page_of(asked)], PG_USED | PG_COMMITTED | (prot & PG_PROT),
+			       (asked_end - asked) / GX_PAGE);
 			count_committed(DATA_UNIT / GX_PAGE, page_of(unit) + DATA_UNIT / GX_PAGE);
+			commit_mprotect += DATA_UNIT / GX_PAGE;
 			continue;
 		}
 		/* A unit with something else in it: what is asked and, of the
@@ -369,12 +533,15 @@ static int commit_data(uint64_t addr, uint64_t len, int prot)
 			}
 			while (b < to && !(page_state[page_of(b)] & PG_COMMITTED))
 				b += GX_PAGE;
-			if (host_commit((void *)a, b - a, DATA_PROT))
+			if (commit_host((void *)a, b - a, DATA_PROT))
 				return -1;
 			memset(&page_state[page_of(a)], PG_USED | PG_COMMITTED, (b - a) / GX_PAGE);
 			count_committed((b - a) / GX_PAGE, page_of(b));
+			commit_mprotect += (b - a) / GX_PAGE;
 			a = b;
 		}
+		memset(&page_state[page_of(asked)], PG_USED | PG_COMMITTED | (prot & PG_PROT),
+		       (asked_end - asked) / GX_PAGE);
 	}
 	memset(&page_state[page_of(addr)], PG_USED | PG_COMMITTED | (prot & PG_PROT), len / GX_PAGE);
 	return 0;
@@ -976,9 +1143,10 @@ static long do_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd, ui
 	if (anonymous) {
 		/* Data is the host's to read and write whatever the guest says. */
 		if ((prot & PG_PROT) && is_data(addr, prot)) {
-			if (host_commit((void *)addr, size, DATA_PROT))
+			if (commit_host((void *)addr, size, DATA_PROT))
 				return -GX_ENOMEM;
 			count_committed(size / GX_PAGE, page_of(addr) + size / GX_PAGE);
+			commit_mmap += size / GX_PAGE;
 			memset(&page_state[page_of(addr)], PG_USED | PG_COMMITTED | (prot & PG_PROT),
 			       size / GX_PAGE);
 			return (long)addr;
@@ -988,16 +1156,61 @@ static long do_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd, ui
 
 	if (commit(addr, size, GX_PROT_READ | GX_PROT_WRITE))
 		return -GX_ENOMEM;
-	ret = read_file(fd, off, (uint8_t *)addr, len);
+	{
+		uint64_t t0 = host_now_ns();
+		/* Read in large pieces, then let go of the kernel's copy: what
+		 * is mapped is a copy of ours, and the kernel's memory is small
+		 * (a browser's 300 MB of code filled it and it had to fight for
+		 * every page it needed after). */
+		long advice[6] = { fd, (long)off, (long)len, 2 /* POSIX_FADV_SEQUENTIAL */ };
+
+		/* Without the lock while the card is read: the range is ours
+		 * already, committed, and its address not given yet; with the
+		 * lock, every other thread's mmap, mprotect and turn of a page
+		 * of compiled code waited for the read (88 ms seen, seconds
+		 * for the browser's own code at start). */
+		host_lock_release(lock);
+		if (len >= (1UL << 20))
+			lkl_syscall(__lkl__NR_fadvise64, advice);
+		ret = read_file(fd, off, (uint8_t *)addr, len);
+		if (len >= (1UL << 20)) {
+			advice[3] = 4;   /* POSIX_FADV_DONTNEED */
+			lkl_syscall(__lkl__NR_fadvise64, advice);
+		}
+		host_lock_acquire(lock);
+		file_read_ns += host_now_ns() - t0;
+		file_read_bytes += len;
+		if (len >= (8UL << 20))
+			host_log("gx: mmap of %lu MB of file %d at %#lx (prot %d, flags %#x): %lu ms\n",
+				 (unsigned long)(len >> 20), fd, (unsigned long)off, prot, flags,
+				 (unsigned long)((host_now_ns() - t0) / 1000000));
+	}
 	if (ret < 0) {
 		release(addr, size);
 		return ret;
 	}
 	if (prot & GX_PROT_EXEC) {
+		uint64_t t0 = host_now_ns();
+		char link[32], path[160];
+		long n;
+
+		/* Which file the code is from: what a crash or a profile gives
+		 * is an address, and this is how to tell which library it is in. */
+		snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+		{
+			long args[6] = { LKL_AT_FDCWD, (long)link, (long)path, sizeof(path) - 1 };
+
+			n = lkl_syscall(__lkl__NR_readlinkat, args);
+		}
+		path[n > 0 ? n : 0] = 0;
+		host_log("gx: code of %s at %#lx-%#lx (file offset %#lx)\n", n > 0 ? path : "?",
+			 (unsigned long)addr, (unsigned long)(addr + size), (unsigned long)off);
+
 		if (patch_syscalls(addr, size) < 0) {
 			release(addr, size);
 			return -GX_ENOMEM;
 		}
+		patch_ns += host_now_ns() - t0;
 		host_flush_icache((void *)addr, size);
 	}
 	if (prot != (GX_PROT_READ | GX_PROT_WRITE)) {
@@ -1111,17 +1324,55 @@ long gmem_mprotect(uint64_t addr, uint64_t len, int prot)
 	return ret;
 }
 
+/*
+ * Data the guest made inaccessible and let go (how PartitionAlloc decommits),
+ * when memory is short: the units of it that are whole go back to the host and
+ * become a reservation again, and the rest is cleared and kept (giving back
+ * less than a unit would cut the host's mappings in pieces, see DATA_UNIT).
+ * The guest only uses it again by making it accessible, which commits it anew
+ * (commit_data()). What is still accessible is only cleared: the guest may
+ * touch it at any time, and nothing would commit it then.
+ */
+static void release_data(uint64_t p, uint64_t q)
+{
+	const uint64_t unit = DATA_UNIT / GX_PAGE;
+
+	while (p < q) {
+		uint64_t u = (p + unit) & ~(unit - 1);
+		uint64_t a = (uint64_t)arena + p * GX_PAGE;
+
+		if (u > q)
+			u = q;
+		if (!(p & (unit - 1)) && u - p == unit && !image_of(a) &&
+		    !image_of(a + DATA_UNIT - 1)) {
+			host_decommit((void *)a, DATA_UNIT);
+			memset(&page_state[p], PG_USED, unit);
+			count_committed(-(int64_t)unit, 0);
+			madv_released += unit;
+		} else {
+			memset((void *)a, 0, (u - p) * GX_PAGE);
+			madv_kept_none += u - p;
+		}
+		p = u;
+	}
+}
+
 long gmem_madvise(uint64_t addr, uint64_t len, int advice)
 {
 	uint64_t size = GX_PAGE_UP(len);
+	int low;
 
 	if ((addr & (GX_PAGE - 1)) || !in_arena(addr, size))
 		return -GX_EINVAL;
+	advice_calls[advice & 31]++;
+	advice_pages[advice & 31] += size / GX_PAGE;
 	if (advice != MADV_DONTNEED)
 		return 0;
+	madv_calls[size < (64UL << 10) ? 0 : size < (1UL << 20) ? 1 : 2]++;
 	/* Private anonymous memory reads as zeroes afterwards, and allocators
 	 * count on it. */
 	host_lock_acquire(lock);
+	low = host_memory_low();
 	for (uint64_t p = page_of(addr), end = p + size / GX_PAGE; p < end;) {
 		uint8_t state = page_state[p];
 		uint64_t q = p;
@@ -1135,12 +1386,16 @@ long gmem_madvise(uint64_t addr, uint64_t len, int advice)
 			host_decommit(arena + p * GX_PAGE, (q - p) * GX_PAGE);
 			memset(&page_state[p], PG_USED | WX_PROT, q - p);
 			count_committed(-(int64_t)(q - p), 0);
-		} else if ((state & GX_PROT_WRITE) ||
-			   (!(state & PG_PROT) && is_data((uint64_t)arena + p * GX_PAGE, 0))) {
-			/* Cleared and kept, also what has no access (how
-			 * PartitionAlloc decommits): giving it back would cut the
-			 * host's mapping in pieces. */
+			madv_wx += q - p;
+		} else if (low && !(state & PG_PROT) && is_data((uint64_t)arena + p * GX_PAGE, 0)) {
+			release_data(p, q);
+		} else if (state & GX_PROT_WRITE) {
+			/* Cleared and kept. */
 			memset(arena + p * GX_PAGE, 0, (q - p) * GX_PAGE);
+			madv_kept_rw += q - p;
+		} else if (!(state & PG_PROT) && is_data((uint64_t)arena + p * GX_PAGE, 0)) {
+			memset(arena + p * GX_PAGE, 0, (q - p) * GX_PAGE);
+			madv_kept_none += q - p;
 		} else if (!(state & PG_PROT)) {
 			host_decommit(arena + p * GX_PAGE, (q - p) * GX_PAGE);
 			memset(&page_state[p], PG_USED, q - p);

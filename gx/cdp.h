@@ -56,6 +56,8 @@ int cdp_page(int what);
 /* Pictures shown during the last whole second, for a host that wants to
  * display it. */
 extern int cdp_frames_per_second;
+/* Failed requests go to the log (with -p): see handle_window_message(). */
+extern int cdp_network_log;
 
 /* What the host provides. Both are called from the one thread of cdp.c. */
 

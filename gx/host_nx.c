@@ -58,26 +58,64 @@
 /* Where everything is on the SD card: the root image next to the program, the
  * log, and programs.txt if there is to be a menu. */
 #define GX_DIR "sdmc:/switch/chromium-nx"
-/* What runs when there is no programs.txt: Chromium with its window (-w) and
- * the debugging pipe (-b), drawing with the GPU, V8 with its compilers. */
+/* What runs when there is no programs.txt: the whole browser with its window
+ * (-w) and the debugging pipe (-b), drawing with the GPU, V8 with its
+ * compilers. build-nx.sh writes the same line, with the flags of its build of
+ * the image, in programs.txt. */
 #define DEFAULT_COMMAND \
-	"-w -b @chromium.ext4 /usr/lib/chromium/chromium-shell --no-sandbox --single-process " \
-	"--no-zygote --use-gl=angle --use-angle=gles-egl --ignore-gpu-blocklist " \
-	"--disable-gpu-sandbox --in-process-gpu --ozone-platform=wayland " \
-	"--enable-spatial-navigation --remote-debugging-pipe https://www.google.com/"
+	"-w -b -c3 @chromium-full.ext4 =profile.ext4 -A225,46,1150,80 /usr/lib/chromium/chromium " \
+	"--no-sandbox --single-process --no-zygote --ozone-platform=wayland --user-data-dir=/root/profile " \
+	"--no-first-run --no-default-browser-check --disable-breakpad --disable-crashpad-for-testing " \
+	"--test-type --password-store=basic --disable-background-networking --disable-component-update " \
+	"--disk-cache-size=33554432 --media-cache-size=33554432 --disable-quic --hide-crash-restore-bubble " \
+	"--enable-spatial-navigation --remote-debugging-pipe --disable-blink-features=AutomationControlled " \
+	"--disable-features=OptimizationHints,OptimizationGuideModelDownloading,OptimizationGuideOnDeviceModel," \
+	"OnDeviceModelBackgroundDownload,MediaRouter,DialMediaRouteProvider,BackForwardCache " \
+	"--force-gpu-mem-available-mb=128 --force-gpu-mem-discardable-limit-mb=32 " \
+	"--force-max-texture-size=4096 " \
+	/* nouveau's GPU clock drifts: Chromium then sees no frame presented and \
+	   leaves fullscreen after 1.5 s. */ \
+	"--disable-gl-extensions=GL_EXT_disjoint_timer_query,GL_EXT_disjoint_timer_query_webgl2," \
+	"GL_ARB_timer_query,GL_EXT_timer_query " \
+	"--js-flags=--no-sparkplug " \
+	"--use-gl=angle --use-angle=gles-egl --ignore-gpu-blocklist --disable-gpu-sandbox --in-process-gpu " \
+	"https://www.google.com/"
 /* The kernel's memory holds every file that is not on the root image (its
  * /tmp, a browser's profile and cache) and its network buffers: a browser on
  * a busy site went through 192 MB and the kernel panicked. With a profile
  * on a disk of its own and the page cache dropped when little is free
- * (gsys.c), 400 of 512 MB stayed free while a browser played videos. */
-#define KERNEL_ARGS "mem=384M loglevel=4"
+ * (gsys.c), 400 of 512 MB stayed free while a browser played videos. At
+ * 384 MB, 200 to 300 stayed free, most of the rest a cache it can drop, while
+ * the guest ran out of its 1.6 GB (a game of a page, then another site). At
+ * 256, 130 stayed free and 40 to 60 could not be dropped (/tmp and shared
+ * memory files): 192, and the guest has the difference.
+ *
+ * nohz=off: the kernel's tick keeps going when it has nothing to do. Without
+ * it, each time it went idle and back (several times a syscall when threads
+ * take turns) it stopped and restarted its tick, each a wake of the host
+ * thread that is its timer: two threads making syscalls at once paid 55 us a
+ * call and 35 with it, and a page animating 400 boxes went from 27 to 38
+ * pictures a second. -xh in programs.txt starts the kernel without it. */
+#define KERNEL_MEM_MB 192
+#define STR_(x) #x
+#define STR(x) STR_(x)
+#define KERNEL_ARGS "mem=" STR(KERNEL_MEM_MB) "M loglevel=4 nohz=off"
+#define KERNEL_ARGS_NOHZ "mem=" STR(KERNEL_MEM_MB) "M loglevel=4"
+static const size_t kernel_mem = (size_t)KERNEL_MEM_MB << 20;
+static size_t peak_host_heap;
+extern int lkl_blk_sync;   /* gx/lkl/virtio_blk.c */
 /* Left to malloc for stacks (a megabyte a thread, eighty threads), libnx, the
  * GPU driver and the video decoder, whose pictures are here too: with 256 MB a
- * third 1080p video in a row left no stack for a new thread. Less when the
- * homebrew runs as an applet and the whole heap is a few hundred megabytes. */
-#define HEAP_KEPT (384UL << 20)
+ * third 1080p video in a row left no stack for a new thread, and a game of a
+ * page (WebGL) then a video had the host use 320 MB and its shaders fail at
+ * 300. YouTube, going from page to page with a video decoder open (60 MB
+ * each) and a preview opening another, went to 470 MB and lost the GPU at
+ * 448. Less when the homebrew runs as an applet and the whole heap is a few
+ * hundred megabytes. */
+#define HEAP_KEPT (512UL << 20)
 #define HEAP_KEPT_SMALL (48UL << 20)
 #define POOL_WORTH_IT (192UL << 20)
+#define POOL_MAX ((2048UL - 16) << 20)   /* see host_reserve() */
 /* Host functions called for the guest (the GL driver) run on these too. */
 #define MAIN_STACK (4UL << 20)
 #define THREAD_STACK (1UL << 20)
@@ -87,6 +125,11 @@
 static Mutex print_lock, mem_lock, screen_lock;
 static FILE *log_file;
 static volatile int finished;
+/* Something died that the guest cannot go on without: the main thread then
+ * says so on the screen, where the browser's last picture would otherwise
+ * stay as if it had frozen, and ends the program. ran_out: memory was
+ * refused before it, the likely reason. */
+static volatile int crashed, ran_out;
 static volatile int console_on = 1;   /* changed under screen_lock */
 
 /*
@@ -135,26 +178,45 @@ void host_console_write(int fd, const void *buf, size_t len)
 {
 	mutexLock(&print_lock);
 	print_stage = 1;
-	if (console_on)
-		fwrite(buf, 1, len, stdout);
+	/* The console only under screen_lock: libnx takes a buffer of the
+	 * screen when text is drawn as well as in consoleUpdate(), and two
+	 * threads doing so at once stopped both for good, this one with the
+	 * log in hand and every thread of the kernel waiting on it. Not for
+	 * long either: the text is in the log anyway. */
+	if (console_on) {
+		int locked = 0;
+
+		for (int i = 0; i < 20 && !(locked = mutexTryLock(&screen_lock)); i++)
+			svcSleepThread(1000000ULL);
+		if (locked) {
+			if (console_on)
+				fwrite(buf, 1, len, stdout);
+			mutexUnlock(&screen_lock);
+		}
+	}
 	print_stage = 2;
 	if (log_file) {
 		static u64 synced;
 		u64 now = armGetSystemTick();
 
-		fwrite(buf, 1, len, log_file);
-		fflush(log_file);
 		/* What is not committed to the card is lost if the console is
 		 * switched off or the program is killed. */
 		static u64 started;
 
+		fwrite(buf, 1, len, log_file);
 		/* Every line while things start: a start that hangs is seen
-		 * once in a while, and its last lines are what tells where. */
+		 * once in a while, and its last lines are what tells where.
+		 * After, a quarter of a second's lines at once (and all of them
+		 * at the end of each of the watchdog's reports, and when
+		 * something dies: sync_log()): a line at a time, the report
+		 * every ten seconds was eighty writes to the card in a row,
+		 * and a video stopped for a quarter of a second each time. */
 		if (!started)
 			started = now;
 		if (armTicksToNs(now - started) < 20000000000ULL ||
 		    armTicksToNs(now - synced) > (gx_trace ? 20000000ULL : 250000000ULL)) {
 			print_stage = 3;
+			fflush(log_file);
 			fsync(fileno(log_file));
 			synced = now;
 		}
@@ -166,8 +228,10 @@ void host_console_write(int fd, const void *buf, size_t len)
 static void sync_log(void)
 {
 	mutexLock(&print_lock);
-	if (log_file)
+	if (log_file) {
+		fflush(log_file);
 		fsync(fileno(log_file));
+	}
 	mutexUnlock(&print_lock);
 }
 
@@ -177,8 +241,20 @@ void host_log(const char *fmt, ...)
 	va_list ap;
 	int n;
 
+	static u64 started;
+	int at = 0;
+
+	/* The lines of our own say when, in seconds from the start. */
+	if (!started)
+		started = armGetSystemTick();
+	if (fmt[0] == 'g' && fmt[1] == 'x' && fmt[2] == ':') {
+		u64 ms = armTicksToNs(armGetSystemTick() - started) / 1000000;
+
+		at = snprintf(buf, sizeof(buf), "[%4lu.%03lu] ", (unsigned long)(ms / 1000),
+			      (unsigned long)(ms % 1000));
+	}
 	va_start(ap, fmt);
-	n = vsnprintf(buf, sizeof(buf), fmt, ap);
+	n = at + vsnprintf(buf + at, sizeof(buf) - at, fmt, ap);
 	va_end(ap);
 	if (n > (int)sizeof(buf) - 1)
 		n = sizeof(buf) - 1;
@@ -380,25 +456,27 @@ void *host_reserve(size_t *len)
 	arena = addr;
 	leaves = calloc(*len / GX_PAGE / LEAF_PAGES + 1, sizeof(*leaves));
 
-	/* The pool is all the heap but what the host keeps for itself. */
-	while (!pool) {
-		for (size = 3072UL << 20; size >= (32UL << 20); size -= 16UL << 20) {
-			void *probe = memalign(GX_PAGE, size + kept);
+	/* The pool is all the heap but what the host keeps for itself, by
+	 * count: what the heap has not handed out yet, less what is kept. Not
+	 * by asking for pool and kept at once, as before, nor by asking for
+	 * what is kept after the pool: newlib's malloc refuses 2 GB or more
+	 * (which held the pool to 1648 MB when the heap had 1940 for it), and
+	 * says yes to sizes it does not have. */
+	{
+		extern char *fake_heap_start, *fake_heap_end;
+		struct mallinfo mi = mallinfo();
+		size_t heap = fake_heap_end - fake_heap_start;
+		size_t free_now = heap > mi.uordblks ? heap - mi.uordblks : 0;
 
-			if (probe) {
-				free(probe);
-				break;
-			}
-		}
-		if (size < POOL_WORTH_IT && kept != HEAP_KEPT_SMALL) {
+		if (free_now < kept + POOL_WORTH_IT)
 			kept = HEAP_KEPT_SMALL;
-			continue;
-		}
-		if (size < (32UL << 20))
-			break;
-		pool = memalign(GX_PAGE, size);
-		if (!pool)
-			break;
+		size = free_now > kept ? (free_now - kept) & ~((16UL << 20) - 1) : 0;
+		if (size > POOL_MAX)
+			size = POOL_MAX;
+		for (; size >= (32UL << 20) && !pool; size -= 16UL << 20)
+			pool = memalign(GX_PAGE, size);
+		if (pool)
+			size += 16UL << 20;   /* the loop went one step past it */
 	}
 	if (!leaves || !pool) {
 		host_log("gx: not enough memory for the guest\n");
@@ -409,8 +487,16 @@ void *host_reserve(size_t *len)
 	if (!pool_used)
 		return NULL;
 	self = envGetOwnProcessHandle();
-	host_log("gx: %lu MB for the guest, %lu MB for shared memory\n",
-		 (unsigned long)(size >> 20), (unsigned long)(shared_budget >> 20));
+	{
+		extern char *fake_heap_start, *fake_heap_end;
+		struct mallinfo mi = mallinfo();
+
+		host_log("gx: %lu MB for the guest, %lu MB for shared memory (heap %lu MB, "
+			 "%lu MB of it in use; pool at %p, heap at %p)\n",
+			 (unsigned long)(size >> 20), (unsigned long)(shared_budget >> 20),
+			 (unsigned long)((fake_heap_end - fake_heap_start) >> 20),
+			 (unsigned long)(mi.uordblks >> 20), pool, fake_heap_start);
+	}
 	return addr;
 }
 
@@ -548,7 +634,16 @@ static int set_protection(size_t p, size_t n, int prot)
 			if (R_SUCCEEDED(rc))
 				set_flags(p, run, PG_MAPPED | PG_DATA | code);
 		} else {
-			/* Data to code: only a fresh mapping is code again. */
+			/* Data to code: only a fresh mapping is code again. What
+			 * was just written there (a compiler's code) goes to
+			 * memory first, out of the data cache, whatever the
+			 * kernel does to the caches when it maps the pages again;
+			 * and the instruction cache forgets the range after. A
+			 * page of code just compiled was once run as if it held
+			 * zeroes (an undefined instruction, in a page that was
+			 * mapped and executable). */
+			if (exec)
+				armDCacheFlush((void *)addr, len);
 			rc = svcUnmapProcessCodeMemory(self, addr, src, len);
 			if (R_SUCCEEDED(rc))
 				rc = svcMapProcessCodeMemory(self, addr, src, len);
@@ -556,8 +651,11 @@ static int set_protection(size_t p, size_t n, int prot)
 				set_flags(p, run, PG_MAPPED | P_FRESH);
 				rc = svcSetProcessMemoryPermission(self, addr, len, perm);
 			}
-			if (R_SUCCEEDED(rc))
+			if (R_SUCCEEDED(rc)) {
 				set_flags(p, run, PG_MAPPED | code);
+				if (exec)
+					armICacheInvalidate((void *)addr, len);
+			}
 		}
 		if (R_FAILED(rc)) {
 			host_log("gx: protection %d of %p+%#lx failed (%#x)\n", prot,
@@ -592,6 +690,7 @@ int host_commit(void *addr, size_t len, int prot)
 	}
 	mutexLock(&mem_lock);
 	if (n > pool_free) {
+		ran_out = 1;
 		host_log("gx: out of guest memory (%lu KB asked, %lu KB left)\n",
 			 (unsigned long)(len >> 10), (unsigned long)(pool_free * 4));
 		ret = -1;
@@ -605,7 +704,31 @@ int host_commit(void *addr, size_t len, int prot)
 		rc = svcMapProcessCodeMemory(self, (u64)addr + done * GX_PAGE,
 					     (u64)(pool + src * GX_PAGE), run * GX_PAGE);
 		if (R_FAILED(rc)) {
-			host_log("gx: map of %p failed (%#x)\n", (uint8_t *)addr + done * GX_PAGE, rc);
+			MemoryInfo si = { 0 }, di = { 0 };
+			u32 pi;
+
+			/* What the kernel says of both ends: their state is what it
+			 * refuses (0xd401). */
+			svcQueryMemory(&si, &pi, (u64)(pool + src * GX_PAGE));
+			svcQueryMemory(&di, &pi, (u64)addr + done * GX_PAGE);
+			host_log("gx: map of %p failed (%#x): %lu KB from pool page %lu of %lu; source type %#x "
+				 "attr %#x perm %#x %#lx+%#lx, destination type %#x %#lx+%#lx\n",
+				 (uint8_t *)addr + done * GX_PAGE, rc, (unsigned long)(run * 4),
+				 (unsigned long)src, (unsigned long)pool_pages, si.type, si.attr, si.perm,
+				 (unsigned long)si.addr, (unsigned long)si.size, di.type,
+				 (unsigned long)di.addr, (unsigned long)di.size);
+			/* Pages of the pool the kernel will not map (an attribute
+			 * left on them: memset() could write them, so they are
+			 * there) are set aside for good, and others taken: a browser
+			 * died of it, unable to make a thread. Not if the fault is
+			 * the destination's. */
+			static int set_aside;
+
+			if ((si.type != MemType_Heap || si.attr || si.perm != Perm_Rw) && set_aside < 64) {
+				set_aside++;
+				host_log("gx: %lu KB of the pool set aside\n", (unsigned long)(run * 4));
+				continue;
+			}
 			pool_give(src, run);
 			ret = -1;
 			break;
@@ -634,6 +757,14 @@ int host_protect(void *addr, size_t len, int prot)
 	ret = set_protection(page_of(addr), len / GX_PAGE, prot);
 	mutexUnlock(&mem_lock);
 	return ret;
+}
+
+/* Short: less than a quarter of the pool left. A browser's pages come and go
+ * by hundreds of megabytes (a game of a page, then another site in the same
+ * tab, ran out of the 1.6 GB). */
+int host_memory_low(void)
+{
+	return pool_free < pool_pages / 4;
 }
 
 int host_decommit(void *addr, size_t len)
@@ -826,6 +957,12 @@ static void know_thread(Handle handle, const char *what)
 	}
 }
 
+/* For nx_host.c, which makes the kernel's timer threads. */
+void gx_know_thread(Handle handle, const char *what)
+{
+	know_thread(handle, what);
+}
+
 static int count_threads(void)
 {
 	int count = 0;
@@ -898,6 +1035,56 @@ void host_thread_exit(void)
 }
 
 void host_yield(void) { svcSleepThread(YieldType_WithCoreMigration); }
+
+/*
+ * Every syscall of the kernel, the guest's and ours, runs at the kernel's
+ * priority (the NRO is linked with --wrap=lkl_syscall). The kernel has one
+ * processor, which threads hand to each other through semaphores; a guest
+ * thread woken to take it had to wait for its core, busy with guest threads
+ * of the same priority as itself, and a syscall took half a millisecond when
+ * a browser was busy. And one of our threads below the kernel's priority
+ * that held that processor was kept off its core by those that wanted it.
+ */
+#define KERNEL_PRIO 0x2C
+
+long __real_lkl_syscall(long no, long *params);
+static int no_kernel_prio;   /* -xb */
+
+long __wrap_lkl_syscall(long no, long *params)
+{
+	s32 prio = KERNEL_PRIO;
+	long ret;
+
+	if (no_kernel_prio)
+		return __real_lkl_syscall(no, params);
+	svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+	if (prio <= KERNEL_PRIO)
+		return __real_lkl_syscall(no, params);
+	svcSetThreadPriority(CUR_THREAD_HANDLE, KERNEL_PRIO);
+	ret = __real_lkl_syscall(no, params);
+	svcSetThreadPriority(CUR_THREAD_HANDLE, prio);
+	return ret;
+}
+
+/* What the guest asks of a thread's priority (gsys.c): 0 as the others, 1
+ * before them (Chromium's display, input and I/O threads ask for that, with a
+ * nice value below 0), 2 before those too (real time: audio). Horizon only
+ * time-slices GUEST_PRIO, so a thread above it runs until it waits: only
+ * threads that wait often are put there. Syscalls still run at KERNEL_PRIO
+ * (__wrap_lkl_syscall() restores what was there). */
+int host_thread_priority(uint64_t thread, int level)
+{
+	static const int prio[] = { GUEST_PRIO, GUEST_PRIO - 1, GUEST_PRIO - 2 };
+
+	if (level < 0 || level > 2)
+		return -1;
+	return R_FAILED(svcSetThreadPriority((Handle)thread, prio[level])) ? -1 : 0;
+}
+
+void host_in_kernel(int in)
+{
+	svcSetThreadPriority(CUR_THREAD_HANDLE, in ? KERNEL_PRIO : GUEST_PRIO);
+}
 
 uint64_t host_thread_self(void) { return threadGetCurHandle(); }
 
@@ -1015,9 +1202,29 @@ static void *gl_screen(void *dpy, void *config)
 	return window_surface == EGL_NO_SURFACE ? NULL : window_surface;
 }
 
+/* How smooth the pictures came: gaps between two of them over 50 and 100 ms,
+ * and the longest, since the watchdog last said. */
+static volatile unsigned gl_gaps50, gl_gaps100;
+static volatile uint64_t gl_gap_max, gl_last_ns;
+
+static int profiling;   /* -p: see profiler() */
+
 static void gl_presented(void *dpy, void *screen)
 {
+	uint64_t now = host_now_ns(), gap = gl_last_ns ? now - gl_last_ns : 0;
+
+	gl_last_ns = now;
 	gl_swaps++;
+	if (gap > 50000000ULL)
+		gl_gaps50++;
+	if (gap > 100000000ULL) {
+		gl_gaps100++;
+		/* When, to be set against what else happened then. */
+		if (profiling)
+			host_log("gx: gl: no picture for %lu ms\n", (unsigned long)(gap / 1000000));
+	}
+	if (gap > gl_gap_max)
+		gl_gap_max = gap;
 }
 
 static const struct glwin_host gl_host = { gl_raw, gl_screen, gl_presented };
@@ -1163,6 +1370,35 @@ static EGLBoolean gl_make_current(EGLDisplay dpy, EGLSurface draw, EGLSurface re
  * which cannot be done (see gx_hostcall): it gets no messages. */
 static void gl_debug_message_callback(void *callback, const void *param)
 {
+}
+
+/* Textures of 32 MB or more: the GPU's memory comes out of the host's heap
+ * in one piece, which a heap in pieces may not have although it has as much
+ * in all; when the driver refuses one, the browser's GPU context is lost and
+ * it dies. Said, to know what asked. */
+void glTexStorage2D(GLenum, GLsizei, GLenum, GLsizei, GLsizei);
+
+static void big_texture(const char *what, int w, int h)
+{
+	static int said;
+
+	if ((uint64_t)w * h * 4 >= (32UL << 20) && said < 20 && ++said)
+		host_log("gx: gl: %s of %dx%d (%lu MB)\n", what, w, h,
+			 (unsigned long)((uint64_t)w * h * 4 >> 20));
+}
+
+static void gl_tex_storage_2d(GLenum target, GLsizei levels, GLenum format, GLsizei w, GLsizei h)
+{
+	big_texture("texture", w, h);
+	glTexStorage2D(target, levels, format, w, h);
+}
+
+static void gl_tex_image_2d(GLenum target, GLint level, GLint internal, GLsizei w, GLsizei h,
+			    GLint border, GLenum format, GLenum type, const void *pixels)
+{
+	if (!level)
+		big_texture("image", w, h);
+	glTexImage2D(target, level, internal, w, h, border, format, type, pixels);
 }
 
 /* ---------- host functions for the guest: sound ---------- */
@@ -1334,6 +1570,8 @@ void *host_symbol(const char *name)
 		{ "eglMakeCurrent", gl_make_current },
 		{ "glDebugMessageCallback", gl_debug_message_callback },
 		{ "glDebugMessageCallbackKHR", gl_debug_message_callback },
+		{ "glTexStorage2D", gl_tex_storage_2d },
+		{ "glTexImage2D", gl_tex_image_2d },
 	};
 
 	if (!strcmp(name, "gx_audio_open"))
@@ -1452,10 +1690,56 @@ static void report_address(const char *label, uint64_t addr)
 /* Called by the exception entry (nx/exception.S) for memory that refused a
  * jump or an access, on the stack of the thread it happened to: returns
  * whether the thread is to try again. */
+/*
+ * A fault in memory the guest may use as it did, which the kernel had out of
+ * the way for a moment: another thread was mapping it or memory next to it
+ * again (memory that turns from data to code is unmapped and mapped back, and
+ * when the kernel changes how a range is mapped it may first take away the
+ * whole larger block around it, as the processor requires). Seen on hardware
+ * as a crash at a page the kernel then said was executable, once in code just
+ * compiled and once in the browser's own. The thread waits for the page to be
+ * back and tries again; a fault that keeps coming back at the same place is a
+ * real one.
+ */
+static __thread u64 last_transient_addr;
+static __thread int transient_count;
+
+static int transient_fault(u64 addr, int exec)
+{
+	int state = gmem_page_state(addr);
+
+	/* In use and there for the guest, with what the access needs. */
+	if (state < 0 || (state & 0xc0) != 0xc0 || !(state & (exec ? GX_PROT_EXEC : GX_PROT_READ)))
+		return 0;
+	if (addr == last_transient_addr && ++transient_count > 20)
+		return 0;
+	if (addr != last_transient_addr) {
+		last_transient_addr = addr;
+		transient_count = 1;
+	}
+	for (int i = 0; i < 200; i++) {
+		MemoryInfo info = { 0 };
+		u32 page_info;
+
+		if (R_SUCCEEDED(svcQueryMemory(&info, &page_info, addr)) &&
+		    (info.perm & (exec ? Perm_X : Perm_R)))
+			return 1;
+		svcSleepThread(100000ULL);
+	}
+	return 0;
+}
+
 int gx_nx_fault(u64 addr, int exec)
 {
-	static int said;
+	static int said, said_transient;
 	int fixed = gmem_fault(addr, exec);
+
+	if (!fixed && transient_fault(addr, exec)) {
+		if (said_transient < 8 && __atomic_fetch_add(&said_transient, 1, __ATOMIC_SEQ_CST) < 8)
+			host_log("gx: a %s at %#lx found the page being mapped again; tried again\n",
+				 exec ? "jump" : "read or write", (unsigned long)addr);
+		return 1;
+	}
 
 	/* The first ones, to tell in the log how far this got. */
 	if (fixed && said < 4 && __atomic_fetch_add(&said, 1, __ATOMIC_SEQ_CST) < 4) {
@@ -1470,7 +1754,8 @@ void __libnx_exception_handler(ThreadExceptionDump *ctx)
 {
 	static int reported;
 
-	if (!__atomic_exchange_n(&reported, 1, __ATOMIC_SEQ_CST)) {
+	/* The first few: one fault can hide another that came after it. */
+	if (__atomic_fetch_add(&reported, 1, __ATOMIC_SEQ_CST) < 3) {
 		/* The thread may have died holding the lock; do without it then. */
 		if (!mutexTryLock(&print_lock))
 			mutexInit(&print_lock);
@@ -1482,7 +1767,9 @@ void __libnx_exception_handler(ThreadExceptionDump *ctx)
 		host_log("  gx is loaded at %p\n", _start);
 		report_address("pc ", ctx->pc.x);
 		report_address("lr ", ctx->lr.x);
-		host_log("  far %#lx\n  sp  %#lx\n", (unsigned long)ctx->far.x, (unsigned long)ctx->sp.x);
+		host_log("  far %#lx\n  sp  %#lx\n  esr %#x (tried %d times at this address)\n",
+			 (unsigned long)ctx->far.x, (unsigned long)ctx->sp.x, ctx->esr,
+			 ctx->far.x == last_transient_addr ? transient_count : 0);
 		{
 			/* What the guest's memory and the kernel each say of the
 			 * page: a fault in memory that is writable and executable
@@ -1497,9 +1784,40 @@ void __libnx_exception_handler(ThreadExceptionDump *ctx)
 		}
 		for (int i = 0; i < 9; i++)
 			host_log("  x%d  %#lx\n", i, (unsigned long)ctx->cpu_gprs[i].x);
+		{
+			/* Whose thread: a guest's (its name), or the host's own
+			 * (the kernel's, the disk's, the display's...). */
+			Handle me = threadGetCurHandle();
+			const char *name = "the host's";
+			Thread *self_thread = threadGetSelf();
+
+			for (int i = 0; i < GX_MAX_THREADS; i++)
+				if (gx_tp_tab[i].guest_tp != ~0UL && gx_tp_tab[i].thread &&
+				    gx_tp_tab[i].thread->host_id == me)
+					name = gx_tp_tab[i].thread->name;
+			for (int i = 0; i < known_count && i < MAX_KNOWN; i++)
+				if (known[i].handle == me && name[0] == 't')
+					name = known[i].what;
+			if (self_thread)
+				host_log("  stack %p+%#lx\n", self_thread->stack_mirror,
+					 (unsigned long)self_thread->stack_sz);
+			uint64_t fp = ctx->fp.x;
+
+			host_log("  thread %#x (%s); called from:", me, name);
+			/* The frames, as far as they look like frames: offsets
+			 * in gx.map for the host's code. */
+			for (int i = 0; i < 8 && fp && !(fp & 7) && fp - ctx->sp.x < (1UL << 20); i++) {
+				uint64_t lr = ((uint64_t *)fp)[1];
+
+				host_log(" %#lx", (unsigned long)(lr - (uint64_t)_start));
+				fp = ((uint64_t *)fp)[0];
+			}
+			host_log("\n");
+		}
 		host_log("Press + to quit.\n");
 		sync_log();
 		finished = 1;
+		crashed = 1;
 	}
 	for (;;)
 		svcSleepThread(1000000000ULL);
@@ -1515,12 +1833,21 @@ struct image {
 	FILE *file;
 	Mutex lock;
 	int written;       /* since it was last committed to the card */
+	/* The root, which is only read, is read with the file system's own
+	 * calls: no stdio buffer to copy through and to seek in, and no lock,
+	 * so that the kernel's requests do not wait on each other. */
+	FsFile direct;
+	int has_direct;
 };
 
 static struct image root_image, profile_image;
 static struct lkl_disk root_disk = { .handle = &root_image };
 static struct lkl_disk profile_disk = { .handle = &profile_image };
 static int profile_mounted;
+/* Once the kernel has started: nothing may ask it anything before (the
+ * watchdog did, while a first profile was being unpacked, and crashed on the
+ * kernel's lock, which did not exist yet). */
+static volatile int kernel_running;
 
 static int image_capacity(struct lkl_disk disk, unsigned long long *res)
 {
@@ -1532,6 +1859,9 @@ static int image_capacity(struct lkl_disk disk, unsigned long long *res)
 	mutexUnlock(&image->lock);
 	return 0;
 }
+
+/* What the card costs: bytes read and the time spent reading them. */
+static uint64_t disk_read_ns, disk_read_bytes;
 
 static int image_request(struct lkl_disk disk, struct lkl_blk_req *req)
 {
@@ -1553,6 +1883,22 @@ static int image_request(struct lkl_disk disk, struct lkl_blk_req *req)
 	if (req->type != LKL_DEV_BLK_TYPE_READ &&
 	    (req->type != LKL_DEV_BLK_TYPE_WRITE || image != &profile_image))
 		return LKL_DEV_BLK_STATUS_UNSUP;
+	if (req->type == LKL_DEV_BLK_TYPE_READ && image->has_direct) {
+		uint64_t at = req->sector * 512, t0 = host_now_ns();
+
+		for (int i = 0; i < req->count && status == LKL_DEV_BLK_STATUS_OK; i++) {
+			u64 done = 0;
+			size_t len = req->buf[i].iov_len;
+
+			if (R_FAILED(fsFileRead(&image->direct, at, req->buf[i].iov_base, len,
+						FsReadOption_None, &done)) || done != len)
+				status = LKL_DEV_BLK_STATUS_IOERR;
+			at += len;
+			__atomic_add_fetch(&disk_read_bytes, done, __ATOMIC_RELAXED);
+		}
+		__atomic_add_fetch(&disk_read_ns, host_now_ns() - t0, __ATOMIC_RELAXED);
+		return status;
+	}
 	mutexLock(&image->lock);
 	if (fseeko(image->file, req->sector * 512, SEEK_SET))
 		status = LKL_DEV_BLK_STATUS_IOERR;
@@ -1560,7 +1906,11 @@ static int image_request(struct lkl_disk disk, struct lkl_blk_req *req)
 		size_t len = req->buf[i].iov_len, done;
 
 		if (req->type == LKL_DEV_BLK_TYPE_READ) {
+			uint64_t t0 = host_now_ns();
+
 			done = fread(req->buf[i].iov_base, 1, len, image->file);
+			disk_read_ns += host_now_ns() - t0;
+			disk_read_bytes += done;
 		} else {
 			done = fwrite(req->buf[i].iov_base, 1, len, image->file);
 			image->written = 1;
@@ -1572,37 +1922,89 @@ static int image_request(struct lkl_disk disk, struct lkl_blk_req *req)
 	return status;
 }
 
-/* The profile, the first time: an empty filesystem cannot be made here, so one
- * comes packed next to the program (it packs to nothing) and is unpacked. */
+/* The guest's home: /root is the profile's image, and in it the downloads are
+ * a folder of the card (hostfs_nx.c), seen and copied from it as they are. */
+#define SD_DIR "/switch/chromium-nx"
+static char old_profile_path[512];
+
+/* The profile, the first time: an empty filesystem cannot be made here, so
+ * one is in the program, packed (it packs to nothing: build-nx.sh), and is
+ * unpacked next to it. */
+extern const unsigned char gx_profile_gz[];
+extern const unsigned int gx_profile_gz_len;
+
 static void unpack_profile(const char *path)
 {
 	static u8 buffer[1 << 20];
-	char packed[520];
-	gzFile in;
+	z_stream z = { 0 };
 	FILE *out;
-	int n, ok = 1;
+	int rc = Z_OK, ok = 1;
 	long total = 0;
 
-	snprintf(packed, sizeof(packed), "%s.gz", path);
-	in = gzopen(packed, "rb");
-	if (!in)
+	if (inflateInit2(&z, 16 + MAX_WBITS) != Z_OK)
 		return;
 	out = fopen(path, "wb");
 	host_log("gx: making %s, where the browser keeps what is to last (once, a moment)\n", path);
-	while (out && (n = gzread(in, buffer, sizeof(buffer))) > 0) {
-		if (fwrite(buffer, 1, n, out) != (size_t)n) {
+	z.next_in = (Bytef *)gx_profile_gz;
+	z.avail_in = gx_profile_gz_len;
+	while (out && rc == Z_OK) {
+		z.next_out = buffer;
+		z.avail_out = sizeof(buffer);
+		rc = inflate(&z, Z_NO_FLUSH);
+		if (rc != Z_OK && rc != Z_STREAM_END)
+			break;
+		if (fwrite(buffer, 1, sizeof(buffer) - z.avail_out, out) != sizeof(buffer) - z.avail_out) {
 			ok = 0;
 			break;
 		}
-		total += n;
+		total += sizeof(buffer) - z.avail_out;
 	}
-	gzclose(in);
+	inflateEnd(&z);
 	if (out && fclose(out))
 		ok = 0;
-	if (!out || !ok || !total) {
+	if (!out || !ok || rc != Z_STREAM_END || !total) {
 		host_log("gx: could not make it (is the card full?)\n");
 		remove(path);
 	}
+}
+
+static void mount_home(int disk)
+{
+	int err = -1;
+
+	if (disk >= 0) {
+		/* Before the root is the root: its /root is where the profile
+		 * goes, and the device's name cannot be made on a root that is
+		 * read-only. */
+		static const char profile_node[] = "/gx-profile-disk";
+		long args[6] = { LKL_AT_FDCWD, (long)profile_node, LKL_S_IFBLK | 0600 };
+		uint32_t dev = 0;
+
+		err = lkl_get_virtio_blkdev(disk, 0, &dev);
+		args[3] = dev;
+		if (!err)
+			err = lkl_syscall(__lkl__NR_mknodat, args);
+		if (!err)
+			err = lkl_sys_mount((char *)profile_node, "/gx-root/root", "ext4", 0, NULL);
+		if (err)
+			host_log("gx: cannot mount %s (%d): nothing will be kept\n", old_profile_path, err);
+		else
+			host_log("gx: what is to last is kept in %s\n", old_profile_path);
+	}
+	profile_mounted = !err;
+	if (err && lkl_sys_mount("tmpfs", "/gx-root/root", "tmpfs", 0, "size=32m,mode=0755"))
+		host_log("gx: no /root in memory either\n");
+
+	/* The downloads: a folder of the card (hostfs_nx.c), over the image. */
+	hostfs_nx_mkdirs(SD_DIR "/Downloads");
+	lkl_sys_mkdir("/gx-root/root/Downloads", 0755);
+	err = lkl_sys_mount("none", "/gx-root/root/Downloads", "hostfs", 0,
+			    (void *)(SD_DIR "/Downloads" + 1));
+	if (err)
+		host_log("gx: cannot mount the downloads folder (%d)\n", err);
+	else
+		host_log("gx: downloads go to sdmc:" SD_DIR "/Downloads\n");
+
 }
 
 /* A browser leaves these in its profile to say it is running, and takes them
@@ -2016,6 +2418,7 @@ static void stop_here(void)
 	report_kernel_use();
 	host_log("This thread stops here. Press + to quit.\n");
 	sync_log();
+	crashed = 1;
 	for (;;)
 		svcSleepThread(1000000000ULL);
 }
@@ -2089,21 +2492,38 @@ static int import_tree(const char *host, const char *guest)
 /* ---------- the menu and the run ---------- */
 
 #define MAX_COMMANDS 24
-#define MAX_ARGS 32
+#define MAX_ARGS 64
 
-static char commands[MAX_COMMANDS][1024];
+static char commands[MAX_COMMANDS][4096];
 static const char *root_image_name;   /* @<image>: an ext4 image next to the program as the root */
 static const char *profile_name;      /* =<image>: one that is the guest's /root, and written */
 static int browser;                   /* -b: the program is a Chromium to drive (cdp.c) */
 static int cpu_count;                 /* -c<n>: processors the guest is told about */
+static int profiling;                 /* -p: see profiler() */
+static const char *experiment = "";   /* -x<letters>: b no kernel priority, h the kernel tickless */
 static int command_count;
 static char *guest_argv[MAX_ARGS + 1];
 static int guest_argc;
 
 static void read_commands(void)
 {
-	FILE *f = fopen(GX_DIR "/programs.txt", "r");
-	char line[1024];
+	FILE *f = fopen(GX_DIR "/launch.txt", "r");
+	char line[4096];
+
+	/* What the launcher (gx/launcher) chose, once: it then loaded us in its
+	 * place. Started otherwise, programs.txt as before. */
+	if (f) {
+		if (fgets(line, sizeof(line), f)) {
+			line[strcspn(line, "\r\n")] = 0;
+			if (line[0])
+				strcpy(commands[command_count++], line);
+		}
+		fclose(f);
+		remove(GX_DIR "/launch.txt");
+		if (command_count)
+			return;
+	}
+	f = fopen(GX_DIR "/programs.txt", "r");
 
 	while (f && command_count < MAX_COMMANDS && fgets(line, sizeof(line), f)) {
 		line[strcspn(line, "\r\n")] = 0;
@@ -2112,9 +2532,26 @@ static void read_commands(void)
 	}
 	if (f)
 		fclose(f);
-	/* No list: no menu either, see main(). */
-	if (!command_count)
+	/* No list: the default, without a menu (see main()). */
+	if (!command_count) {
 		strcpy(commands[0], DEFAULT_COMMAND);
+		command_count = 1;
+	}
+}
+
+/* The system's error dialog, over the browser's last picture. */
+static void say_crashed(void)
+{
+	ErrorApplicationConfig c;
+
+	if (R_FAILED(errorApplicationCreate(&c,
+			ran_out ? "Chromium NX ran out of memory and has to close."
+				: "Chromium NX stopped working and has to close.",
+			ran_out ? "The page needed more memory than Chromium NX has.\n\n"
+				  "The log is sdmc:/switch/chromium-nx/chromium-nx.log."
+				: "The log is sdmc:/switch/chromium-nx/chromium-nx.log.")))
+		return;
+	errorApplicationShow(&c);
 }
 
 /* Returns the command chosen with the d-pad and A, or -1 if + was pressed. */
@@ -2187,6 +2624,119 @@ static lkl_thread_t create_kernel_thread(void (*fn)(void *), void *arg)
 	return t;
 }
 
+/* What a syscall of the kernel costs here, alone and with a second thread
+ * making them at the same time: the floor under everything the guest does. */
+static volatile int bench_other_run;
+
+static void bench_other(void *arg)
+{
+	host_in_kernel(1);
+	while (bench_other_run)
+		lkl_sys_getppid();
+	bench_other_run = -1;
+	host_thread_exit();
+}
+
+/* The floor: two threads that wake each other in turn, with what LKL's
+ * semaphores are made of (a mutex and a condition variable). */
+static struct { Mutex m; CondVar cv; int turn; } pingpong;
+
+static void bench_pong(void *arg)
+{
+	int n = (int)(long)arg;
+
+	for (int i = 0; i < n; i++) {
+		mutexLock(&pingpong.m);
+		while (pingpong.turn != 1)
+			condvarWait(&pingpong.cv, &pingpong.m);
+		pingpong.turn = 0;
+		condvarWakeAll(&pingpong.cv);
+		mutexUnlock(&pingpong.m);
+	}
+	host_thread_exit();
+}
+
+static void bench_pingpong(void)
+{
+	int n = 1000;
+	uint64_t t0;
+
+	mutexInit(&pingpong.m);
+	condvarInit(&pingpong.cv);
+	if (host_thread_start(bench_pong, (void *)(long)n))
+		return;
+	t0 = host_now_ns();
+	for (int i = 0; i < n; i++) {
+		mutexLock(&pingpong.m);
+		pingpong.turn = 1;
+		condvarWakeAll(&pingpong.cv);
+		while (pingpong.turn != 0)
+			condvarWait(&pingpong.cv, &pingpong.m);
+		mutexUnlock(&pingpong.m);
+	}
+	host_log("gx: a thread wakes another in %lu ns\n",
+		 (unsigned long)((host_now_ns() - t0) / n / 2));
+}
+
+/* How fast the processor goes: a chain of dependent additions is one a
+ * cycle on a Cortex-A57. */
+static void bench_clock(const char *where)
+{
+	uint64_t t0 = host_now_ns(), x = 0;
+
+	for (int i = 0; i < 10000000; i++)
+		__asm__ volatile("add %0, %0, #1\n\tadd %0, %0, #1\n\tadd %0, %0, #1\n\tadd %0, %0, #1\n\t"
+				 "add %0, %0, #1\n\tadd %0, %0, #1\n\tadd %0, %0, #1\n\tadd %0, %0, #1"
+				 : "+r"(x));
+	host_log("gx: %s: the processor runs at about %lu MHz\n", where,
+		 (unsigned long)(80000000ULL * 1000 / (host_now_ns() - t0)));
+}
+
+static void bench_syscalls(void)
+{
+	uint64_t t0;
+	int n = 2000;
+
+	bench_clock("one thread");
+	bench_pingpong();
+	host_in_kernel(1);
+	lkl_sys_getppid();
+	t0 = host_now_ns();
+	for (int i = 0; i < n; i++)
+		lkl_sys_getppid();
+	host_log("gx: a syscall of the kernel takes %lu ns alone\n",
+		 (unsigned long)((host_now_ns() - t0) / n));
+	bench_other_run = 1;
+	if (host_thread_start(bench_other, NULL))
+		return;
+	svcSleepThread(20000000ULL);
+	{
+		extern unsigned long nx_counts[6];
+		unsigned long before[6], calls = 0;
+
+		memcpy(before, nx_counts, sizeof(before));
+		t0 = host_now_ns();
+		for (int i = 0; i < n; i++)
+			lkl_sys_getppid();
+		host_log("gx: and %lu ns with another thread making them too\n",
+			 (unsigned long)((host_now_ns() - t0) / n));
+		/* Both threads' calls: about twice ours. */
+		calls = 2 * n;
+		host_log("gx: per syscall then: %lu.%02lu sem_up, %lu.%02lu sem_down (%lu.%02lu waited), "
+			 "%lu.%02lu timer_set, %lu.%02lu mutex_lock, %lu thread_create\n",
+			 (nx_counts[0] - before[0]) / calls, (nx_counts[0] - before[0]) * 100 / calls % 100,
+			 (nx_counts[1] - before[1]) / calls, (nx_counts[1] - before[1]) * 100 / calls % 100,
+			 (nx_counts[2] - before[2]) / calls, (nx_counts[2] - before[2]) * 100 / calls % 100,
+			 (nx_counts[3] - before[3]) / calls, (nx_counts[3] - before[3]) * 100 / calls % 100,
+			 (nx_counts[4] - before[4]) / calls, (nx_counts[4] - before[4]) * 100 / calls % 100,
+			 nx_counts[5] - before[5]);
+	}
+	bench_other_run = 0;
+	while (bench_other_run != -1)
+		svcSleepThread(1000000ULL);
+	host_in_kernel(0);
+}
+
 static void run(void *arg)
 {
 	static char *guest_env[] = {
@@ -2201,7 +2751,7 @@ static void run(void *arg)
 	long params[6] = { LKL_CLOCK_REALTIME, (long)&now };
 	int ret, net_id = -1, disk_id = -1, profile_id = -1;
 
-	host_log("gx: starting the kernel (%s)\n", KERNEL_ARGS);
+	host_log("gx: starting the kernel (%s)\n", strchr(experiment, 'h') ? KERNEL_ARGS_NOHZ : KERNEL_ARGS);
 	/* Where LKL's virtio devices tell the kernel they exist. */
 	lkl_host_ops.virtio_devices = lkl_virtio_devs;
 	/* The kernel's messages go where ours do. The function nx_host.c has
@@ -2220,6 +2770,11 @@ static void run(void *arg)
 		snprintf(path, sizeof(path), GX_DIR "/%s", root_image_name);
 		root_image.file = fopen(path, "rb");
 		if (root_image.file) {
+			FsFileSystem *sd = fsdevGetDeviceFileSystem("sdmc");
+
+			if (sd && R_SUCCEEDED(fsFsOpenFile(sd, path + strlen("sdmc:"), FsOpenMode_Read,
+							   &root_image.direct)))
+				root_image.has_direct = 1;
 			/* The SD card is slow by small pieces. */
 			setvbuf(root_image.file, NULL, _IOFBF, 1 << 20);
 			disk_id = lkl_disk_add(&root_disk);
@@ -2229,28 +2784,31 @@ static void run(void *arg)
 			host_exit(1);
 		}
 	}
+	/* The profile is an image, made the first time from the one in the
+	 * program; the downloads are a folder of the card (hostfs_nx.c). */
+	if (hostfs_nx_init())
+		host_log("gx: the SD card cannot be shared with the kernel: no downloads folder\n");
 	if (!ret && profile_name && disk_id >= 0) {
-		char path[512];
-
-		snprintf(path, sizeof(path), GX_DIR "/%s", profile_name);
-		profile_image.file = fopen(path, "r+b");
+		snprintf(old_profile_path, sizeof(old_profile_path), GX_DIR "/%s", profile_name);
+		profile_image.file = fopen(old_profile_path, "r+b");
 		if (!profile_image.file) {
-			unpack_profile(path);
-			profile_image.file = fopen(path, "r+b");
+			unpack_profile(old_profile_path);
+			profile_image.file = fopen(old_profile_path, "r+b");
 		}
 		if (profile_image.file) {
 			setvbuf(profile_image.file, NULL, _IOFBF, 1 << 16);
 			profile_id = lkl_disk_add(&profile_disk);
 		}
 		if (profile_id < 0)
-			host_log("gx: cannot use %s as a disk: nothing will be kept\n", path);
+			host_log("gx: cannot use %s as a disk: nothing will be kept\n", old_profile_path);
 	}
 	if (!ret)
-		ret = lkl_start_kernel(KERNEL_ARGS);
+		ret = lkl_start_kernel(strchr(experiment, 'h') ? KERNEL_ARGS_NOHZ : KERNEL_ARGS);
 	if (ret) {
 		host_log("gx: the kernel did not start (%d)\n", ret);
 		host_exit(1);
 	}
+	kernel_running = 1;
 	/* The kernel has no clock to read the date from and starts in 1970. */
 	lkl_syscall(__lkl__NR_clock_settime, params);
 	if (net_id >= 0)
@@ -2272,25 +2830,10 @@ static void run(void *arg)
 			ret = lkl_sys_mkdir(mnt, 0755);
 		if (!ret)
 			ret = lkl_sys_mount((char *)node, (char *)mnt, "ext4", LKL_MS_RDONLY, NULL);
-		if (!ret && profile_id >= 0) {
-			/* Before the root is the root: its /root is where the
-			 * profile goes, and the device's name cannot be made on a
-			 * root that is read-only. */
-			static const char profile_node[] = "/gx-profile-disk";
-			long args[6] = { LKL_AT_FDCWD, (long)profile_node, LKL_S_IFBLK | 0600 };
-			int err = lkl_get_virtio_blkdev(profile_id, 0, &dev);
-
-			args[3] = dev;
-			if (!err)
-				err = lkl_syscall(__lkl__NR_mknodat, args);
-			if (!err)
-				err = lkl_sys_mount((char *)profile_node, "/gx-root/root", "ext4", 0, NULL);
-			if (err)
-				host_log("gx: cannot mount %s (%d): nothing will be kept\n", profile_name, err);
-			else
-				host_log("gx: what is to last is kept in %s\n", profile_name);
-			profile_mounted = !err;
-		}
+		/* Before the root is the root: its /root is where the profile
+		 * goes, and nothing can be made on a root that is read-only. */
+		if (!ret)
+			mount_home(profile_id);
 		if (!ret)
 			ret = lkl_sys_chroot(mnt);
 		if (!ret)
@@ -2306,10 +2849,22 @@ static void run(void *arg)
 			host_exit(1);
 	}
 	populate_root();
+	if (disk_id >= 0) {
+		/* The card reads large pieces far faster than small ones, and what
+		 * is read of the root is mostly whole programs and libraries. */
+		int fd = lkl_sys_open("/sys/block/vda/queue/read_ahead_kb", LKL_O_WRONLY, 0);
+
+		if (fd >= 0) {
+			lkl_sys_write(fd, "2048\n", 5);
+			lkl_sys_close(fd);
+		}
+	}
 	if (profile_mounted)
 		unlock_profile();
 	if (cpu_count)
 		gx_set_cpus(cpu_count);
+	if (profiling)
+		bench_syscalls();
 	/* Descriptors 0-2 are the console; keep the kernel from handing those
 	 * numbers out. */
 	for (int i = 0; i < 3; i++)
@@ -2372,6 +2927,18 @@ static void report_kernel_use(void)
 	host_log("gx: guest blocks by size: %lu up to 16 KB, %lu to 256 KB, %lu to 2 MB, %lu larger; "
 		 "by use: %lu nothing, %lu read, %lu write, %lu run\n",
 		 sizes[0], sizes[1], sizes[2], sizes[3], perms[0], perms[1], perms[2], perms[3]);
+	{
+		/* What the host itself uses of the heap it kept (HEAP_KEPT):
+		 * all in use but the pool and the kernel's memory. */
+		struct mallinfo mi = mallinfo();
+		size_t used = mi.uordblks - pool_pages * GX_PAGE - kernel_mem;
+
+		if (used > peak_host_heap)
+			peak_host_heap = used;
+		host_log("gx: host heap: %lu MB in use (at most %lu MB), %lu MB free in it\n",
+			 (unsigned long)(used >> 20), (unsigned long)(peak_host_heap >> 20),
+			 (unsigned long)(mi.fordblks >> 20));
+	}
 }
 
 /* Where one thread is: paused for the time it takes to read its registers. */
@@ -2439,7 +3006,8 @@ static void kernel_probe(void *arg)
 {
 	for (;;) {
 		if (kernel_asked) {
-			gx_report_kernel_memory();
+			if (kernel_running)
+				gx_report_kernel_memory();
 			kernel_asked = 0;
 		}
 		if (leaving && !left) {
@@ -2448,11 +3016,112 @@ static void kernel_probe(void *arg)
 			 * the main thread cannot ask the kernel anything. */
 			long none[6] = { 0 };
 
-			if (profile_mounted)
+			if (profile_mounted && kernel_running)
 				lkl_syscall(__lkl__NR_sync, none);
+			hostfs_nx_flush();
 			left = 1;
 		}
 		svcSleepThread(100000000ULL);
+	}
+}
+
+/*
+ * -p: where the processor goes. Every few milliseconds each guest thread that
+ * is not in a syscall is paused for as long as it takes to read where it is;
+ * every ten seconds the places seen most, by 4 KB page of code, go to the log.
+ * Guest addresses are found in the "code of" lines gmem.c writes, the host's
+ * in gx.map (counted from where gx is loaded).
+ */
+#define PROF_SLOTS 8192
+static struct { uint64_t page; unsigned count; } prof[PROF_SLOTS];
+static unsigned prof_samples, prof_in_syscall;
+
+static int prof_in_host(uint64_t pc)
+{
+	return pc >= (uint64_t)_start && pc < (uint64_t)_start + (64UL << 20);
+}
+
+/* By page in the guest; in the host, by instruction, and who called it (an
+ * address with its lowest bit set). */
+static void prof_count(uint64_t pc)
+{
+	uint64_t page = prof_in_host(pc & ~1UL) ? pc : pc & ~0xfffUL;
+	unsigned h = (unsigned)((page >> 12) * 2654435761u) % PROF_SLOTS;
+
+	for (int i = 0; i < 64; i++, h = (h + 1) % PROF_SLOTS) {
+		if (prof[h].page == page || !prof[h].page) {
+			prof[h].page = page;
+			prof[h].count++;
+			return;
+		}
+	}
+}
+
+static void prof_sample(struct gx_thread *t)
+{
+	ThreadContext ctx;
+	Result rc;
+
+	if (!t || !t->host_id)
+		return;
+	if (t->nr >= 0) {
+		prof_in_syscall++;
+		return;
+	}
+	if (R_FAILED(svcSetThreadActivity((Handle)t->host_id, ThreadActivity_Paused)))
+		return;
+	rc = svcGetThreadContext3(&ctx, (Handle)t->host_id);
+	svcSetThreadActivity((Handle)t->host_id, ThreadActivity_Runnable);
+	if (R_SUCCEEDED(rc)) {
+		prof_count(ctx.pc.x);
+		if (prof_in_host(ctx.pc.x))
+			prof_count(ctx.lr | 1);
+		prof_samples++;
+	}
+}
+
+static void prof_report(void)
+{
+	uint64_t self = (uint64_t)_start;
+
+	host_log("gx: profile: %u samples in code, %u in syscalls; the busiest pages:\n",
+		 prof_samples, prof_in_syscall);
+	for (int n = 0; n < 30; n++) {
+		int best = -1;
+
+		for (int i = 0; i < PROF_SLOTS; i++)
+			if (prof[i].count && (best < 0 || prof[i].count > prof[best].count))
+				best = i;
+		if (best < 0 || prof[best].count * 200 < prof_samples)
+			break;
+		if (prof_in_host(prof[best].page & ~1UL))
+			host_log("  %5u  host %s+%#lx\n", prof[best].count,
+				 (prof[best].page & 1) ? "called from " : "",
+				 (unsigned long)((prof[best].page & ~1UL) - self));
+		else if (prof[best].page & 1)
+			host_log("  %5u  called from %#lx\n", prof[best].count,
+				 (unsigned long)(prof[best].page & ~1UL));
+		else
+			host_log("  %5u  %#lx\n", prof[best].count, (unsigned long)prof[best].page);
+		prof[best].count = 0;
+	}
+	memset(prof, 0, sizeof(prof));
+	prof_samples = prof_in_syscall = 0;
+}
+
+static void profiler(void *arg)
+{
+	for (uint64_t next = host_now_ns() + 10000000000ULL;;) {
+		svcSleepThread(3000000ULL);
+		if (gx_main_thread)
+			prof_sample(gx_main_thread);
+		for (int i = 0; i < GX_MAX_THREADS; i++)
+			if (gx_tp_tab[i].guest_tp != ~0UL && gx_tp_tab[i].thread != gx_main_thread)
+				prof_sample(gx_tp_tab[i].thread);
+		if (host_now_ns() >= next) {
+			prof_report();
+			next += 10000000000ULL;
+		}
 	}
 }
 
@@ -2489,13 +3158,22 @@ static void watchdog(void *arg)
 		bury_threads();
 		video_report();
 		gmem_report();
+		host_log("gx: disk: %lu MB read in %lu ms\n", (unsigned long)(disk_read_bytes >> 20),
+			 (unsigned long)(disk_read_ns / 1000000));
 		if (gl_swaps != swaps) {
-			host_log("gx: gl: %u pictures in 10 s\n", gl_swaps - swaps);
+			host_log("gx: gl: %u pictures in 10 s; %u gaps over 50 ms, %u over 100, "
+				 "the longest %lu ms\n", gl_swaps - swaps, gl_gaps50, gl_gaps100,
+				 (unsigned long)(gl_gap_max / 1000000));
 			swaps = gl_swaps;
+			gl_gaps50 = gl_gaps100 = 0;
+			gl_gap_max = 0;
 		}
 		report_kernel_use();
 		host_log("gx: host threads: %d\n", count_threads() + 1);   /* and this one */
 		gx_report_threads();
+		gx_report_syscall_cost();
+		hostfs_nx_report();
+		hostfs_nx_flush();   /* what the profile gathered: on the card within 10 s */
 		if (kernel_asked) {
 			host_log("gx: the kernel has not answered for 10 s\n");
 			if (!told++)
@@ -2518,6 +3196,25 @@ static void display(void *arg)
 		mutexUnlock(&screen_lock);
 		svcSleepThread(16666666ULL);
 	}
+}
+
+/* Ends the process. An application (Chromium NX installed as a forwarder) has
+ * to tell AM it is leaving, as the Homebrew Loader does when a program
+ * returns: ended with svcExitProcess() alone, the HOME menu says "the
+ * software was closed because an error occurred". AM then ends us. */
+static void NX_NORETURN leave(void)
+{
+	AppletType type = appletGetAppletType();
+
+	if (type == AppletType_Application || type == AppletType_SystemApplication) {
+		Service *self = appletGetServiceSession_SelfController();
+
+		if (self && serviceIsActive(self) && R_SUCCEEDED(serviceDispatch(self, 0)))
+			for (int i = 0; i < 500; i++)
+				svcSleepThread(10000000ULL);
+	}
+	svcExitProcess();
+	__builtin_unreachable();
 }
 
 /* Chromium reserves more addresses than a program started the usual way has:
@@ -2558,17 +3255,22 @@ int main(int argc, char **argv)
 	padInitializeDefault(&pad);
 	if (!enough_addresses(&pad)) {
 		consoleExit(NULL);
-		svcExitProcess();   /* see __libnx_initheap() */
+		leave();   /* not a return: see __libnx_initheap() */
 	}
 	mkdir(GX_DIR, 0777);
 	read_commands();
-	choice = command_count ? menu(&pad) : 0;
+	/* A menu only when there is something to choose, or when L is held. */
+	padUpdate(&pad);
+	choice = command_count > 1 || (padGetButtons(&pad) & HidNpadButton_L) ? menu(&pad) : 0;
 	if (choice < 0) {
 		consoleExit(NULL);
-		svcExitProcess();   /* see __libnx_initheap() */
+		leave();   /* not a return: see __libnx_initheap() */
 	}
 	consoleClear();
 	log_file = fopen(GX_DIR "/chromium-nx.log", "w");
+	/* Written in large pieces once things run: see host_console_write(). */
+	if (log_file)
+		setvbuf(log_file, NULL, _IOFBF, 64 << 10);
 
 	if (commands[choice][0] == '[' && strchr(commands[choice], ']'))
 		memmove(commands[choice], strchr(commands[choice], ']') + 1,
@@ -2582,6 +3284,14 @@ int main(int argc, char **argv)
 			browser = 1;
 		else if (!guest_argc && !strcmp(word, "-w"))
 			wayland = 1;
+		else if (!guest_argc && !strcmp(word, "-p"))
+			profiling = cdp_network_log = 1;
+		else if (!guest_argc && !strncmp(word, "-x", 2)) {
+			experiment = word + 2;
+			no_kernel_prio = !!strchr(experiment, 'b');
+			gx_no_priorities = !!strchr(experiment, 'p');
+			lkl_blk_sync = !!strchr(experiment, 'd');
+		}
 		else if (!guest_argc && !strncmp(word, "-A", 2)) {
 			int l, t, r, b;   /* -A<left>,<top>,<right>,<bottom>: the address bar */
 
@@ -2617,12 +3327,23 @@ int main(int argc, char **argv)
 	 * long, and a video being played stopped for a moment each time. */
 	if (R_SUCCEEDED(threadCreate(&watchdog_thread, watchdog, NULL, NULL, 0x10000, GUEST_PRIO, -2))) {
 		free_cores(watchdog_thread.handle);
+		know_thread(watchdog_thread.handle, "watchdog");
 		threadStart(&watchdog_thread);
 	}
 	if (R_SUCCEEDED(threadCreate(&probe_thread, kernel_probe, NULL, NULL, 0x10000, GUEST_PRIO, -2))) {
 		free_cores(probe_thread.handle);
 		know_thread(probe_thread.handle, "probe");
 		threadStart(&probe_thread);
+	}
+	if (profiling) {
+		static Thread profiler_thread;
+
+		/* Above the guest, to catch it where it is. */
+		if (R_SUCCEEDED(threadCreate(&profiler_thread, profiler, NULL, NULL, 0x10000, 0x2C, -2))) {
+			free_cores(profiler_thread.handle);
+			know_thread(profiler_thread.handle, "profiler");
+			threadStart(&profiler_thread);
+		}
 	}
 	if (start_thread(run, NULL, MAIN_STACK))
 		printf("gx: cannot start\n");
@@ -2631,6 +3352,14 @@ int main(int argc, char **argv)
 		padUpdate(&pad);
 		if (padGetButtonsDown(&pad) & HidNpadButton_Plus)
 			break;
+		if (crashed) {
+			svcSleepThread(1000000000ULL);   /* what the others have to say */
+			say_crashed();
+			/* Straight out: the way below asks the browser to close
+			 * and waits on locks the dead thread may hold. The log
+			 * was written when it died. */
+			leave();
+		}
 		svcSleepThread(16666666ULL);
 	}
 	/* Kernel and guest threads cannot be stopped one by one; ending the
@@ -2652,6 +3381,6 @@ int main(int argc, char **argv)
 		fclose(log_file);
 	if (profile_image.file && mutexTryLock(&profile_image.lock))
 		fclose(profile_image.file);
-	svcExitProcess();
+	leave();
 	return 0;
 }

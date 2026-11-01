@@ -32,7 +32,7 @@ static int ask, wanted, page_action;   /* between wl.c's thread and ours */
 #define MAX_PAGES 16
 static char pages[MAX_PAGES][128];
 static int page_count;
-static uint64_t ask_deadline;
+static uint64_t ask_deadline, load_started;
 
 /*
  * What every page is given when Chromium has a window: a way to tell whether
@@ -41,13 +41,22 @@ static uint64_t ask_deadline;
  * without being asked for.
  */
 static const char page_script[] =
-	"(function(){if(window.__gx)return;window.__gx=1;"
+	/* What is added to the page does not show: names that are not
+	 * enumerated, and functions put in place of the browser's own that say
+	 * they are its own when asked (Function.prototype.toString). Sites that
+	 * look for a robot (YouTube) look for such things. */
+	"(function(){if(window.__gx)return;"
+	"Object.defineProperty(window,'__gx',{value:1});"
+	"var nat=new WeakMap(),fts=Function.prototype.toString;"
+	"function hide(w,g){nat.set(w,g);try{Object.defineProperty(w,'name',{value:g.name});"
+	"Object.defineProperty(w,'length',{value:g.length})}catch(e){}return w}"
+	"Function.prototype.toString=hide(function toString(){return fts.call(nat.get(this)||this)},fts);"
 	"function ed(e){if(!e)return false;if(e.isContentEditable)return true;"
 	"if(e.readOnly||e.disabled)return false;if(e.tagName=='TEXTAREA')return true;"
 	"if(e.tagName!='INPUT')return false;"
 	"return['text','search','url','email','password','tel','number'].indexOf(e.type)>=0}"
-	"window.__gxText=function(){var a=document.activeElement;"
-	"while(a&&a.shadowRoot&&a.shadowRoot.activeElement)a=a.shadowRoot.activeElement;return ed(a)};"
+	"Object.defineProperty(window,'__gxText',{value:function(){var a=document.activeElement;"
+	"while(a&&a.shadowRoot&&a.shadowRoot.activeElement)a=a.shadowRoot.activeElement;return ed(a)}});"
 	"document.addEventListener('click',function(v){"
 	"if(v.isTrusted&&v.pointerType=='touch'&&window.__gxText()&&window.gxEdit)gxEdit('touch')},true);"
 	/* Video is decoded by the processor here, and VP9 and AV1 cost it far
@@ -57,15 +66,15 @@ static const char page_script[] =
 	/* Nor anything taller than the screen: every picture is copied out of
 	 * the decoder and into the GPU, for nothing if it is then shrunk. */
 	"function tall(t){var m=/height=(\\d+)/.exec(t);return m&&+m[1]>720}"
-	"function not(o,f){var g=o&&o[f];if(g)o[f]=function(t){return no.test(t)||tall(t)?"
-	"(f=='canPlayType'?'':false):g.apply(this,arguments)}}"
+	"function not(o,f){var g=o&&o[f];if(g)o[f]=hide(function(t){return no.test(t)||tall(t)?"
+	"(f=='canPlayType'?'':false):g.apply(this,arguments)},g)}"
 	"not(window.MediaSource,'isTypeSupported');not(window.ManagedMediaSource,'isTypeSupported');"
 	"not(HTMLMediaElement.prototype,'canPlayType');"
 	"var mc=navigator.mediaCapabilities,di=mc&&mc.decodingInfo;"
-	"if(di)mc.decodingInfo=function(c){var v=c&&c.video;"
+	"if(di)mc.decodingInfo=hide(function(c){var v=c&&c.video;"
 	"if(v&&(no.test(v.contentType)||v.height>720))"
 	"return Promise.resolve({supported:false,smooth:false,powerEfficient:false});"
-	"return di.apply(this,arguments)}"
+	"return di.apply(this,arguments)},di)"
 	"})()";
 static char session[128];   /* the page we are attached to, once we are */
 
@@ -81,6 +90,7 @@ static char session[128];   /* the page we are attached to, once we are */
 #define STATS_PERIOD_NS 5000000000ULL
 
 int cdp_frames_per_second;
+int cdp_network_log;
 
 static struct {
 	uint64_t since, second_since;
@@ -285,9 +295,18 @@ static void handle_window_message(const char *message)
 			return;
 		strcpy(pages[slot], id);
 		json_escape(script, sizeof(script), page_script);
-		send_command(id, "Runtime.enable", "{}");
+		/* No Runtime.enable: bindings and evaluations work without it, and
+		 * sites that look for a robot (YouTube) can tell it is on. */
 		send_command(id, "Runtime.addBinding", "{\"name\":\"gxEdit\"}");
 		send_command(id, "Page.enable", "{}");
+		/* For the log: requests that fail or are refused (a video that
+		 * stops is a server saying no, or a connection that broke). */
+		if (cdp_network_log) {
+			send_command(id, "Network.enable",
+				     "{\"maxTotalBufferSize\":0,\"maxResourceBufferSize\":0}");
+			/* And what media players say (chrome://media-internals). */
+			send_command(id, "Media.enable", "{}");
+		}
 		snprintf(params, sizeof(params), "{\"source\":\"%s\"}", script);
 		send_command(id, "Page.addScriptToEvaluateOnNewDocument", params);
 		snprintf(params, sizeof(params), "{\"expression\":\"%s\"}", script);
@@ -302,6 +321,50 @@ static void handle_window_message(const char *message)
 		for (int i = 0; i < MAX_PAGES; i++)
 			if (!strcmp(pages[i], id))
 				pages[i][0] = 0;
+	} else if (strstr(message, "\"method\":\"Network.responseReceived\"")) {
+		const char *status = strstr(message, "\"status\":");
+		char url[160];
+
+		if (status && atoi(status + 9) >= 400 &&
+		    string_value(message, "url", url, sizeof(url)) > 0)
+			host_log("gx: http %d: %.120s\n", atoi(status + 9), url);
+		else if (status && atoi(status + 9) >= 400)
+			host_log("gx: http %d\n", atoi(status + 9));
+	} else if (strstr(message, "\"method\":\"Media.playerErrorsRaised\"") ||
+		   (strstr(message, "\"method\":\"Media.playerMessages\"") &&
+		    strstr(message, "\"level\":\"error\""))) {
+		const char *params = strstr(message, "\"params\":");
+
+		host_log("gx: media: %.400s\n", params ? params + 9 : message);
+	} else if (strstr(message, "\"method\":\"Media.playerPropertiesChanged\"") &&
+		   (strstr(message, "kVideoDecoderName") || strstr(message, "kResolution") ||
+		    strstr(message, "kIsVideoDecryptingDemuxerStream") || strstr(message, "kVideoTracks"))) {
+		const char *params = strstr(message, "\"properties\":");
+
+		host_log("gx: media: %.300s\n", params ? params + 13 : message);
+	} else if (strstr(message, "\"method\":\"Network.loadingFailed\"")) {
+		char error[96];
+
+		if (string_value(message, "errorText", error, sizeof(error)) > 0 &&
+		    !strstr(message, "\"canceled\":true"))
+			host_log("gx: a request failed: %s (%s)\n", error,
+				 strstr(message, "\"type\":\"Media\"") ? "media" :
+				 strstr(message, "\"type\":\"XHR\"") ? "xhr" :
+				 strstr(message, "\"type\":\"Fetch\"") ? "fetch" : "other");
+	} else if (strstr(message, "\"method\":\"Page.frameStartedLoading\"")) {
+		/* How long pages take to load, for the log: from the first frame
+		 * that starts loading to the page's load event. */
+		if (!load_started)
+			load_started = host_now_ns();
+	} else if (strstr(message, "\"method\":\"Page.domContentEventFired\"")) {
+		if (load_started)
+			host_log("gx: page: DOM ready after %lu ms\n",
+				 (unsigned long)((host_now_ns() - load_started) / 1000000));
+	} else if (strstr(message, "\"method\":\"Page.loadEventFired\"")) {
+		if (load_started)
+			host_log("gx: page: loaded in %lu ms\n",
+				 (unsigned long)((host_now_ns() - load_started) / 1000000));
+		load_started = 0;
 	} else if (strstr(message, "\"method\":\"Runtime.bindingCalled\"") &&
 		   strstr(message, "\"name\":\"gxEdit\"")) {
 		__atomic_store_n(&wanted, CDP_KEYBOARD, __ATOMIC_SEQ_CST);

@@ -17,6 +17,7 @@
 #include <libavcodec/avcodec.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/pixdesc.h>
+#include <malloc.h>
 #include "gx.h"
 #include "video.h"
 
@@ -40,6 +41,18 @@ static struct host_lock *lock;
  * the time spent decoding them (waiting for the hardware included) and
  * copying them out. */
 static uint64_t copied, decode_ns, copy_ns, slowest_decode_ns, slowest_copy_ns;
+
+/* Decoders open, and what the host's heap had when one opened or closed: a
+ * browser's heap was seen to grow with every video it opened. */
+static int live_decoders;
+
+static void say_decoders(const char *what, long handle)
+{
+	struct mallinfo mi = mallinfo();
+
+	host_log("gx: video: decoder %ld %s, %d open; the heap has %lu MB in use\n", handle, what,
+		 live_decoders, (unsigned long)(mi.uordblks >> 20));
+}
 
 static void complain(const char *what, int error)
 {
@@ -116,6 +129,7 @@ long gx_video_open(const uint8_t *extradata, long size)
 	host_lock_release(lock);
 	if (!d || !d->ctx)
 		return -1;
+	live_decoders++;   /* until gx_video_close(), even if it fails below */
 	if (size > 0) {
 		d->ctx->extradata = av_mallocz(size + AV_INPUT_BUFFER_PADDING_SIZE);
 		if (d->ctx->extradata) {
@@ -145,6 +159,7 @@ long gx_video_open(const uint8_t *extradata, long size)
 		return -1;
 	}
 	host_log("gx: video: H.264 is decoded by the host%s\n", d->hardware ? ", in hardware" : "");
+	say_decoders("opened", handle);
 	return handle;
 }
 
@@ -320,6 +335,8 @@ void gx_video_close(long handle)
 	av_frame_free(&d->plain);
 	av_packet_free(&d->packet);
 	avcodec_free_context(&d->ctx);
+	live_decoders--;
+	say_decoders("closed", handle);
 }
 
 void *video_symbol(const char *name)

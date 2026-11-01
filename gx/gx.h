@@ -126,6 +126,7 @@ long gx_do_syscall(struct gx_frame *frame);
 /* Says where every guest thread is: what a host shows when the guest seems
  * stuck. */
 void gx_report_threads(void);
+void gx_report_syscall_cost(void);
 /* Says how the kernel's own memory is doing (its /proc/meminfo, in short):
  * files of its memory filesystems and its network buffers all come out of
  * what it was started with, and it panics when that is gone. */
@@ -147,6 +148,9 @@ int host_reserved_hole(int index, void **addr, size_t *len);
 int host_commit(void *addr, size_t len, int prot);   /* zero-filled */
 int host_protect(void *addr, size_t len, int prot);
 int host_decommit(void *addr, size_t len);
+/* Whether the memory left to commit is getting short: what the guest lets go
+ * is then given back to the host rather than kept for it. */
+int host_memory_low(void);
 void host_flush_icache(void *addr, size_t len);
 /* Memory that can be mapped at several addresses of the arena at once, for
  * shared file mappings; always all of it (len is its size), which is the only
@@ -162,6 +166,21 @@ void host_shared_free(int handle);
 int host_thread_start(void (*fn)(void *), void *arg);
 void host_thread_exit(void) __attribute__((noreturn));
 void host_yield(void);
+/* Makes the calling thread one of the kernel's for as long as it is in a
+ * syscall of the kernel (1), or one of the guest's again (0). */
+void host_in_kernel(int in);
+/* 0: as every guest thread; 1: before them; 2: before those too. */
+int host_thread_priority(uint64_t thread, int level);
+/* Folders of the SD card as filesystems of the kernel (hostfs_nx.c): before
+ * the kernel starts, then "hostfs" mounts with a path of the card. */
+int hostfs_nx_init(void);
+int hostfs_nx_mkdirs(const char *path);
+int hostfs_nx_exists(const char *path);
+int hostfs_nx_remove_tree(const char *path);
+void hostfs_nx_report(void);   /* every 10 s, from the watchdog */
+void hostfs_nx_flush(void);    /* what was gathered for writing, to the card */
+/* -xp in programs.txt: what the guest asks of priorities is not done. */
+extern int gx_no_priorities;
 /* The calling thread, as something host_thread_cpu_ns() takes from any
  * thread: the processor time the thread has used. */
 uint64_t host_thread_self(void);

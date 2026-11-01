@@ -106,6 +106,15 @@ int host_decommit(void *addr, size_t len)
 	return p == MAP_FAILED ? -1 : 0;
 }
 
+/* Linux takes back what is let go by itself; GX_MEMORY_LOW=1 tries the
+ * Switch's way. */
+int host_memory_low(void)
+{
+	const char *low = getenv("GX_MEMORY_LOW");
+
+	return low && *low == '1';
+}
+
 /* Linux has no need of them, but the Switch does and what runs here should
  * run there: the same size, unless GX_SHARED_CHUNK_MB says otherwise (0 gives
  * each file its own piece). */
@@ -177,6 +186,9 @@ int host_thread_start(void (*fn)(void *), void *arg)
 
 void host_thread_exit(void) { pthread_exit(NULL); }
 void host_yield(void) { sched_yield(); }
+
+void host_in_kernel(int in) { (void)in; }
+int host_thread_priority(uint64_t thread, int level) { (void)thread; (void)level; return 0; }
 
 uint64_t host_thread_self(void) { return (uint64_t)pthread_self(); }
 

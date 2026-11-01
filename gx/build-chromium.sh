@@ -129,21 +129,12 @@ EOF
 	mke2fs -q -t ext4 -O ^has_journal -d "$ROOT" "$IMAGE" "${size}M" || exit 1
 	echo "$IMAGE: ${size} MB"
 
-	# The same for the console, without what only the tests here use: the
-	# Chromium without a window, and the graphics drivers that draw with the
-	# processor (the console has its own, or none is used).
+	# The image for the console: the whole browser, without what only the
+	# tests here use (the shells, and the graphics drivers that draw with the
+	# processor: the console has its own). chromium-shell no longer has an
+	# image of its own there.
 	SLIM=$OUT/chromium-switch-root
-	rm -rf "$SLIM"
-	cp -al "$ROOT" "$SLIM" || exit 1
-	rm -f "$SLIM"/usr/lib/chromium/{chromium-headless-shell,libvk_swiftshader.so,vk_swiftshader_icd.json} \
-		"$SLIM"/usr/lib/chromium/{libVkLayer_khronos_validation.so,libtest_trace_processor.so,libvulkan.so.1} \
-		"$SLIM"/usr/lib/chromium/{chromium,chrome_crashpad_handler}
-	size=$(( $(du -sm "$SLIM" | cut -f1) * 21 / 20 + 16 ))
-	rm -f "$OUT/chromium-switch.ext4"
-	mke2fs -q -t ext4 -O ^has_journal -d "$SLIM" "$OUT/chromium-switch.ext4" "${size}M" || exit 1
-	rm -rf "$SLIM"
-	echo "$OUT/chromium-switch.ext4: ${size} MB"
-	# And one with the whole browser in place of chromium-shell.
+	rm -rf "$SLIM" "$OUT/chromium-switch.ext4"
 	if [ -n "$FULL_BIN" ]; then
 		cp -al "$ROOT" "$SLIM" || exit 1
 		rm -f "$SLIM"/usr/lib/chromium/{chromium-headless-shell,chromium-shell,chrome_crashpad_handler} \
@@ -167,6 +158,9 @@ EOF
 		echo "-A$FULL_ADDRESS /usr/lib/chromium/chromium $FULL_FLAGS" >"$OUT/chromium-full.cmd"
 	fi
 fi
+
+# NO_TESTS=1: the images only, nothing run here.
+[ -z "${NO_TESTS:-}" ] || exit 0
 
 echo "== chromium"
 export_arg=
