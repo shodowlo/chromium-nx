@@ -33,6 +33,7 @@ enum {
 	T_REGION, T_SEAT, T_TOUCH, T_POINTER, T_KEYBOARD, T_OUTPUT, T_SUBCOMPOSITOR,
 	T_SUBSURFACE, T_WM_BASE, T_POSITIONER, T_XDG_SURFACE, T_TOPLEVEL, T_POPUP,
 	T_DECORATION_MANAGER, T_DECORATION, T_DATA_MANAGER, T_DATA_SOURCE, T_DATA_DEVICE,
+	T_RELATIVE_MANAGER, T_RELATIVE_POINTER, T_CONSTRAINTS, T_LOCKED, T_CONFINED,
 };
 
 static const char *const type_names[] = {
@@ -41,6 +42,8 @@ static const char *const type_names[] = {
 	"wl_subcompositor", "wl_subsurface", "xdg_wm_base", "xdg_positioner", "xdg_surface",
 	"xdg_toplevel", "xdg_popup", "zxdg_decoration_manager_v1", "zxdg_toplevel_decoration_v1",
 	"wl_data_device_manager", "wl_data_source", "wl_data_device",
+	"zwp_relative_pointer_manager_v1", "zwp_relative_pointer_v1", "zwp_pointer_constraints_v1",
+	"zwp_locked_pointer_v1", "zwp_confined_pointer_v1",
 };
 
 /* What the registry announces; the name of a global is its place here + 1. */
@@ -62,6 +65,11 @@ static const struct {
 	 * how the text of a field gets to the on-screen keyboard to be edited
 	 * (see edit_step()). */
 	{ "wl_data_device_manager", 3, T_DATA_MANAGER },
+	/* A pointer that stays where it is and says how far it would have
+	 * moved: what a page gets with requestPointerLock() (a game that looks
+	 * around with the mouse). The pad moves it in game mode. */
+	{ "zwp_relative_pointer_manager_v1", 1, T_RELATIVE_MANAGER },
+	{ "zwp_pointer_constraints_v1", 1, T_CONSTRAINTS },
 };
 
 struct object {
@@ -86,6 +94,10 @@ static int client = -1;
 static uint32_t serial = 1;
 static uint32_t main_surface, output_id, touch_id, pointer_id, pointer_inside;
 static uint32_t keyboard_id, keyboard_inside;
+/* The pointer lock: the relative pointer told of moves, and the lock that is
+ * on (0: none); where the pointer is when it is not locked. */
+static uint32_t relative_id, locked_id;
+static int pointer_x = WL_SCREEN_WIDTH / 2, pointer_y = WL_SCREEN_HEIGHT / 2;
 static int has_keymap;
 /* The client's clipboard: the wl_data_source it last set as the selection,
  * the kind of text it offers (0: none), and a count of the times it changed. */
@@ -926,6 +938,41 @@ static void request(uint32_t id, uint16_t opcode, const uint32_t *w, uint32_t wo
 				event(objects[o->surface].xdg, 0, "u", serial++);
 		}
 		break;
+	case T_RELATIVE_MANAGER:
+		if (opcode == 0) {
+			delete_id(id);
+		} else if (opcode == 1) {     /* get_relative_pointer */
+			create(w[0], T_RELATIVE_POINTER, 1);
+			relative_id = w[0];
+		}
+		break;
+	case T_RELATIVE_POINTER:
+		if (opcode == 0) {
+			if (id == relative_id)
+				relative_id = 0;
+			delete_id(id);
+		}
+		break;
+	case T_CONSTRAINTS:
+		if (opcode == 0) {
+			delete_id(id);
+		} else if (opcode == 1) {     /* lock_pointer: granted at once */
+			create(w[0], T_LOCKED, 1);
+			locked_id = w[0];
+			event(w[0], 0, "");       /* locked */
+		} else if (opcode == 2) {     /* confine_pointer: it cannot leave the screen anyway */
+			create(w[0], T_CONFINED, 1);
+			event(w[0], 0, "");       /* confined */
+		}
+		break;
+	case T_LOCKED:
+	case T_CONFINED:
+		if (opcode == 0) {
+			if (id == locked_id)
+				locked_id = 0;
+			delete_id(id);
+		}
+		break;
 	}
 }
 
@@ -955,6 +1002,26 @@ static void press_key(uint32_t key, int shift, uint32_t ms)
 		event(keyboard_id, 3, "uuuu", serial++, ms, 42, 0);
 		event(keyboard_id, 4, "uuuuu", serial++, 0, 0, 0, 0);
 	}
+}
+
+/* The pointer on the window, as a mouse would come onto it. */
+static void pointer_enter(void)
+{
+	if (pointer_id && !pointer_inside) {
+		pointer_inside = 1;
+		event(pointer_id, 0, "uuff", serial++, main_surface, pointer_x, pointer_y);
+	}
+}
+
+static void pointer_frame(void)
+{
+	if (pointer_id && objects[pointer_id].version >= 5)
+		event(pointer_id, 5, "");
+}
+
+int wl_full_screen(void)
+{
+	return main_surface < MAX_OBJECTS && objects[main_surface].full_screen;
 }
 
 /* A key with Control held. */
@@ -1058,15 +1125,40 @@ static void input(const struct cdp_input *in, uint32_t ms)
 		break;
 	case CDP_SCROLL:
 		if (pointer_id) {
-			if (!pointer_inside) {
-				pointer_inside = 1;
-				event(pointer_id, 0, "uuff", serial++, main_surface,
-				      WL_SCREEN_WIDTH / 2, WL_SCREEN_HEIGHT / 2);
-			}
+			pointer_enter();
 			event(pointer_id, 4, "uuf", ms, 0, in->y);   /* axis: vertical */
-			if (objects[pointer_id].version >= 5)
-				event(pointer_id, 5, "");                /* frame */
+			pointer_frame();
 		}
+		break;
+	case CDP_KEY_DOWN:
+	case CDP_KEY_UP:
+		if (keyboard_id && keyboard_inside && has_keymap)
+			event(keyboard_id, 3, "uuuu", serial++, ms, in->x, in->type == CDP_KEY_DOWN);
+		break;
+	case CDP_BUTTON:
+		if (pointer_id) {
+			pointer_enter();
+			event(pointer_id, 3, "uuuu", serial++, ms, in->x, in->y);
+			pointer_frame();
+		}
+		break;
+	case CDP_MOTION:
+		if (!pointer_id)
+			break;
+		pointer_enter();
+		if (locked_id && relative_id) {
+			uint64_t us = host_now_ns() / 1000;
+
+			event(relative_id, 0, "uuffff", (uint32_t)(us >> 32), (uint32_t)us, in->x, in->y,
+			      in->x, in->y);
+		} else {
+			pointer_x += in->x;
+			pointer_y += in->y;
+			pointer_x = pointer_x < 0 ? 0 : pointer_x >= WL_SCREEN_WIDTH ? WL_SCREEN_WIDTH - 1 : pointer_x;
+			pointer_y = pointer_y < 0 ? 0 : pointer_y >= WL_SCREEN_HEIGHT ? WL_SCREEN_HEIGHT - 1 : pointer_y;
+			event(pointer_id, 2, "uff", ms, pointer_x, pointer_y);
+		}
+		pointer_frame();
 		break;
 	case CDP_TEXT:
 		type_text(in->text, ms);

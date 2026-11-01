@@ -42,6 +42,7 @@
 #define GL_ONE_MINUS_SRC_ALPHA 0x0303
 #define GL_BLEND 0x0BE2
 #define GL_TEXTURE_2D 0x0DE1
+#define GL_UNSIGNED_BYTE 0x1401
 #define GL_FLOAT 0x1406
 #define GL_RGB 0x1907
 #define GL_RGBA 0x1908
@@ -104,6 +105,7 @@ static void (*DeleteTextures)(int32_t, const unsigned *);
 static void (*BindTexture)(unsigned, unsigned);
 static void (*TexParameteri)(unsigned, unsigned, int32_t);
 static void (*CopyTexImage2D)(unsigned, int32_t, unsigned, int32_t, int32_t, int32_t, int32_t, int32_t);
+static void (*TexImage2D)(unsigned, int32_t, int32_t, int32_t, int32_t, int32_t, unsigned, unsigned, const void *);
 static void (*Enable)(unsigned);
 static void (*Disable)(unsigned);
 static void (*BlendFunc)(unsigned, unsigned);
@@ -136,7 +138,7 @@ static int find_functions(void)
 		{ "glViewport", &Viewport }, { "glClearColor", &ClearColor }, { "glClear", &Clear },
 		{ "glGenTextures", &GenTextures }, { "glDeleteTextures", &DeleteTextures },
 		{ "glBindTexture", &BindTexture }, { "glTexParameteri", &TexParameteri },
-		{ "glCopyTexImage2D", &CopyTexImage2D }, { "glEnable", &Enable }, { "glDisable", &Disable },
+		{ "glCopyTexImage2D", &CopyTexImage2D }, { "glTexImage2D", &TexImage2D }, { "glEnable", &Enable }, { "glDisable", &Disable },
 		{ "glBlendFunc", &BlendFunc }, { "glCreateProgram", &CreateProgram },
 		{ "glCreateShader", &CreateShader }, { "glShaderSource", &ShaderSource },
 		{ "glCompileShader", &CompileShader }, { "glAttachShader", &AttachShader },
@@ -278,6 +280,41 @@ static void draw(const struct window *w, int32_t x, int32_t y, int blend)
 	DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 }
 
+/* What the host lays over the windows (its overlay), if anything: its
+ * picture goes into a texture of ours when it has changed. */
+static void draw_overlay(void)
+{
+	static unsigned texture, serial = ~0u;
+	const uint32_t *picture;
+	int x, y, width, height;
+	unsigned now;
+	float left, right, top, bottom;
+
+	if (!host->overlay || !(picture = host->overlay(&x, &y, &width, &height, &now)))
+		return;
+	if (!texture) {
+		GenTextures(1, &texture);
+		BindTexture(GL_TEXTURE_2D, texture);
+		TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	}
+	BindTexture(GL_TEXTURE_2D, texture);
+	if (now != serial) {
+		TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, picture);
+		serial = now;
+	}
+	/* Its rows go from the top, where the windows' go from the bottom. */
+	left = 2.0f * x / WL_SCREEN_WIDTH - 1.0f;
+	right = 2.0f * (x + width) / WL_SCREEN_WIDTH - 1.0f;
+	top = 1.0f - 2.0f * y / WL_SCREEN_HEIGHT;
+	bottom = 1.0f - 2.0f * (y + height) / WL_SCREEN_HEIGHT;
+	Enable(GL_BLEND);
+	Uniform4f(where, left, top, right, bottom);
+	DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+}
+
 /* The screen, from all the windows there are; keeping first what was just
  * drawn for one of them, if any. In our context, and what the guest had
  * current is put back. */
@@ -304,7 +341,8 @@ static void present(void *dpy, struct window *presented, unsigned gone)
 			for (int i = 0; i < MAX_WINDOWS; i++)
 				if (windows[i].used && windows[i].drawn && windows[i].guest &&
 				    wl_surface_place(windows[i].id, &x, &y) == 2 + order)
-					draw(&windows[i], x, y, 1);
+						draw(&windows[i], x, y, 1);
+		draw_overlay();
 		if (host->presented)
 			host->presented(dpy, screen);
 		SwapBuffers(dpy, screen);

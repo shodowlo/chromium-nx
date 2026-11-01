@@ -24,6 +24,11 @@ enum {
 	CDP_KEY,          /* x: a key pressed and let go, by the number Linux gives it */
 	CDP_ACTIVATE,     /* what has the focus is chosen: edited if it is text, pressed otherwise */
 	CDP_QUIT,
+	/* The pad as a keyboard and a mouse (game mode, with a window): */
+	CDP_KEY_DOWN,     /* x: a key held, by its Linux number */
+	CDP_KEY_UP,       /* x: a key let go */
+	CDP_BUTTON,       /* x: a mouse button (Linux's BTN_*), y: 1 pressed, 0 let go */
+	CDP_MOTION,       /* x, y: how far the mouse moves, in pixels */
 };
 
 struct cdp_input {
@@ -52,6 +57,9 @@ int cdp_wanted(void);
  * keyboard back from the address above it (CDP_NAVIGATE); returns 0 if there
  * is no one to tell. */
 int cdp_page(int what);
+/* The page drawn again at every frame (on), so that what glwin.c lays over it
+ * is seen even when the page does not change; or no longer. */
+void cdp_repaint(int on);
 
 /* Pictures shown during the last whole second, for a host that wants to
  * display it. */

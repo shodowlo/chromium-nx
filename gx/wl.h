@@ -33,6 +33,9 @@ void wl_surface_size(uint32_t surface, int width, int height);
  * when it is touched or asked for: chromium-shell's if this is not called. */
 void wl_address_bar(int left, int top, int right, int bottom);
 
+/* Whether the window has asked to fill the screen and not undone it. */
+int wl_full_screen(void);
+
 /* What the host provides, called from the one thread of wl.c, together with
  * host_input() of cdp.h for what the user does. */
 

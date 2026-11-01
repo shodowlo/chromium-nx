@@ -27,6 +27,7 @@
 static int next_id = 1;
 static int window;          /* Chromium shows itself: see cdp_start() */
 static int ask, wanted, page_action;   /* between wl.c's thread and ours */
+static int repaint = -1;               /* cdp_repaint(): 1 on, 0 off, -1 nothing to do */
 /* With a window there may be several pages, one per tab, each with a session
  * of its own; they come and go as tabs do. */
 #define MAX_PAGES 16
@@ -534,7 +535,7 @@ static void cdp_thread(void *arg)
 			/* The page that is on the screen is the one that acts:
 			 * the others are told the same and know they are not it. */
 			static const char seen[] = "document.visibilityState=='visible'";
-			char params[512];
+			char params[1024];
 
 			/* Pages are handed to us as they appear, once the browser
 			 * has heard that we want them. */
@@ -554,6 +555,25 @@ static void cdp_thread(void *arg)
 				snprintf(params, sizeof(params), "{\"expression\":\"if(%s)window.focus()\"}", seen);
 				page_command("Runtime.evaluate", params);
 				page_command("Page.bringToFront", "{}");
+				break;
+			}
+			switch (__atomic_exchange_n(&repaint, -1, __ATOMIC_SEQ_CST)) {
+			case 1:
+				/* A speck that never stops changing: the page is
+				 * drawn and shown at every frame, and the overlay
+				 * with it (glwin.c). Black at 1%, two pixels. */
+				snprintf(params, sizeof(params), "{\"expression\":\"if(%s&&!document.getElementById('__gxr'))"
+					 "{var d=document.createElement('div');d.id='__gxr';d.style.cssText="
+					 "'position:fixed;left:0;top:0;width:2px;height:2px;background:#000;"
+					 "pointer-events:none;z-index:2147483647;opacity:.01';"
+					 "document.documentElement.appendChild(d);d.animate([{opacity:.01},"
+					 "{opacity:.02}],{duration:300,iterations:Infinity,direction:'alternate'})}\"}",
+					 seen);
+				page_command("Runtime.evaluate", params);
+				break;
+			case 0:
+				page_command("Runtime.evaluate", "{\"expression\":\"var d=document."
+					     "getElementById('__gxr');if(d)d.remove()\"}");
 				break;
 			}
 			if (__atomic_exchange_n(&ask, 0, __ATOMIC_SEQ_CST)) {
@@ -601,6 +621,11 @@ int cdp_page(int what)
 		return 0;
 	__atomic_store_n(&page_action, what, __ATOMIC_SEQ_CST);
 	return 1;
+}
+
+void cdp_repaint(int on)
+{
+	__atomic_store_n(&repaint, !!on, __ATOMIC_SEQ_CST);
 }
 
 int cdp_wanted(void)

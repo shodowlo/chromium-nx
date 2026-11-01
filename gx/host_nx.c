@@ -54,6 +54,9 @@
 #include "wl.h"
 #include "glwin.h"
 #include "video.h"
+#include "overlay.h"
+#include "keys.h"
+#include <math.h>
 
 /* Where everything is on the SD card: the root image next to the program, the
  * log, and programs.txt if there is to be a menu. */
@@ -851,13 +854,30 @@ void host_shared_free(int handle)
 #define SHARED_BUDGET (384UL << 20)
 #define HEAP_WORTH_SHARING (1UL << 30)
 
+/* The program is the launcher too (gx/launcher/main.c), which loads it again
+ * as the browser with --browser. The launcher hands the process back to the
+ * Homebrew loader, so its heap is left as the loader gave it. */
+static int browser_mode;
+
+const char *gx_default_command(void)
+{
+	return DEFAULT_COMMAND;
+}
+
 void __libnx_initheap(void)
 {
 	extern char *fake_heap_start, *fake_heap_end;
 	u64 region = 0, total;
 	void *addr = NULL;
 	size_t size;
+	const char *args = envGetArgv();
 
+	browser_mode = args && strstr(args, "--browser");
+	if (envHasHeapOverride() && !browser_mode) {
+		fake_heap_start = envGetHeapOverrideAddr();
+		fake_heap_end = (char *)envGetHeapOverrideAddr() + envGetHeapOverrideSize();
+		return;
+	}
 	if (envHasHeapOverride()) {
 		addr = envGetHeapOverrideAddr();
 		size = envGetHeapOverrideSize();
@@ -1227,7 +1247,7 @@ static void gl_presented(void *dpy, void *screen)
 		gl_gap_max = gap;
 }
 
-static const struct glwin_host gl_host = { gl_raw, gl_screen, gl_presented };
+static const struct glwin_host gl_host = { gl_raw, gl_screen, gl_presented, overlay_picture };
 
 /* The guest's windows are glwin.c's: it puts them together on the screen. */
 static EGLSurface gl_create_window_surface(EGLDisplay dpy, EGLConfig config, void *window,
@@ -2278,6 +2298,12 @@ static int ask_text(const char *guide, const char *initial, char *out, size_t ro
 }
 
 static int wayland;   /* -w: the program wants a Wayland display (wl.c) */
+/* -T: YouTube's TV page. It sends other browsers to the desktop site, so the
+ * browser says it is the Switch's own; it fills the screen, and B is its Back
+ * key (Escape) rather than the page history. */
+static int tv_mode;
+#define TV_USER_AGENT "Mozilla/5.0 (Nintendo Switch; WebApplet) AppleWebKit/609.4 (KHTML, like Gecko) " \
+	"NF/6.0.2.20.5 NintendoBrowser/5.1.0.22023 Dalvik/2.1.0 (Linux; U; Android 5.1.1; AEOBC Build/LVY48f)"
 
 int host_ask_text(char *text, size_t room)
 {
@@ -2287,10 +2313,346 @@ int host_ask_text(char *text, size_t room)
 	return ask_text("Text", initial, text, room);
 }
 
-int host_input(struct cdp_input *in)
+/* What host_input() still has to give, when one look at the pad makes more
+ * than one thing. */
+#define QUEUED 64
+static struct cdp_input queued[QUEUED];
+static int queue_head, queue_count;
+static int quit_wanted;   /* Quit, chosen in the overlay */
+
+static void push(int type, int x, int y)
+{
+	struct cdp_input *q;
+
+	if (queue_count == QUEUED)
+		return;
+	q = &queued[(queue_head + queue_count++) % QUEUED];
+	q->type = type;
+	q->x = x;
+	q->y = y;
+	q->text[0] = 0;
+}
+
+/* Keyboard and mouse mode (chosen in the overlay): the pad is a keyboard and
+ * a mouse, for games made for them. What each input gives (keys.h) is the
+ * launcher's to change: -K<key>,<key>,... in the order of keys.h. */
+static const u64 game_buttons[GX_INPUTS] = {
+	HidNpadButton_StickLUp, HidNpadButton_StickLDown, HidNpadButton_StickLLeft, HidNpadButton_StickLRight,
+	HidNpadButton_A, HidNpadButton_B, HidNpadButton_X, HidNpadButton_Y,
+	HidNpadButton_L, HidNpadButton_R, HidNpadButton_ZL, HidNpadButton_ZR,
+	HidNpadButton_Up, HidNpadButton_Down, HidNpadButton_Left, HidNpadButton_Right,
+	HidNpadButton_Minus, HidNpadButton_StickL, HidNpadButton_StickR,
+};
+static int game_bindings[GX_INPUTS];
+static u64 game_held;
+
+static void game_bindings_parse(const char *list)
+{
+	for (int i = 0; i < GX_INPUTS; i++)
+		game_bindings[i] = gx_inputs[i].default_key;
+	for (int i = 0; list && *list && i < GX_INPUTS; i++) {
+		char *end;
+		long key = strtol(list, &end, 0);
+
+		if (end == list)
+			break;
+		game_bindings[i] = (int)key;
+		list = *end == ',' ? end + 1 : end;
+	}
+}
+
+static void game_key(int key, int down)
+{
+	if (!key)
+		return;
+	if (key == GX_WHEEL_UP || key == GX_WHEEL_DOWN) {
+		/* A notch of the wheel for each press. */
+		if (down)
+			push(CDP_SCROLL, 0, key == GX_WHEEL_UP ? -53 : 53);
+	} else if (key >= 0x110) {
+		push(CDP_BUTTON, key, down);
+	} else {
+		push(down ? CDP_KEY_DOWN : CDP_KEY_UP, key, 0);
+	}
+}
+
+/* Everything held is let go: when the overlay opens, or the mode changes. */
+static void game_release(void)
+{
+	for (int i = 0; i < GX_INPUTS; i++)
+		if (game_held & game_buttons[i])
+			game_key(game_bindings[i], 0);
+	game_held = 0;
+}
+
+static void game_input(PadState *pad)
+{
+	static u64 last;
+	static float carry_x, carry_y;
+	u64 held = padGetButtons(pad), now = armGetSystemTick();
+	HidAnalogStickState stick = padGetStickPos(pad, 1);
+	float seconds = armTicksToNs(now - last) / 1e9f, v[2] = { stick.x / 32767.0f, -stick.y / 32767.0f };
+
+	for (int i = 0; i < GX_INPUTS; i++)
+		if ((held ^ game_held) & game_buttons[i])
+			game_key(game_bindings[i], !!(held & game_buttons[i]));
+	game_held = held;
+	/* The right stick moves the mouse: slowly near the middle, up to 1000
+	 * pixels a second, however often the pad is looked at. */
+	last = now;
+	if (seconds > 0.05f)
+		seconds = 0.05f;
+	for (int i = 0; i < 2; i++) {
+		float a = fabsf(v[i]);
+
+		a = a < 0.12f ? 0 : (a - 0.12f) / 0.88f;
+		v[i] = copysignf(a * a * 1000.0f * seconds, v[i]);
+	}
+	carry_x += v[0];
+	carry_y += v[1];
+	if ((int)carry_x || (int)carry_y) {
+		push(CDP_MOTION, (int)carry_x, (int)carry_y);
+		carry_x -= (int)carry_x;
+		carry_y -= (int)carry_y;
+	}
+}
+
+/*
+ * Controller mode (chosen in the overlay): pages see the pad as a game
+ * controller, through the Gamepad API. Chromium finds controllers the way it
+ * does on any Linux: devices of the input subsystem in sysfs that udev has
+ * marked as joysticks, read through joydev (/dev/input/js*). So the kernel
+ * is given one (uinput) when it starts, before Chromium looks, and what udev
+ * would have written about it is written here (there is no udev). It says it
+ * is an Xbox 360 pad, with the buttons and axes of Linux's driver for one, so
+ * that Chromium maps it as a standard controller. The buttons go by where they
+ * are: the Switch's B is the Xbox's A.
+ */
+#define UI_DEV_CREATE 0x5501
+#define UI_DEV_SETUP 0x405c5503
+#define UI_ABS_SETUP 0x401c5504
+#define UI_SET_EVBIT 0x40045564
+#define UI_SET_KEYBIT 0x40045565
+#define UI_SET_ABSBIT 0x40045567
+#define EV_SYN 0
+#define EV_KEY 1
+#define EV_ABS 3
+
+static int gamepad_fd = -1;
+
+/* Linux's buttons of an Xbox 360 pad, in the order joydev numbers them, and
+ * the Switch buttons that press them (0: none, the Xbox button). */
+static const struct {
+	int code;
+	u64 button;
+} gamepad_buttons[] = {
+	{ 0x130, HidNpadButton_B },       /* BTN_A */
+	{ 0x131, HidNpadButton_A },       /* BTN_B */
+	{ 0x133, HidNpadButton_Y },       /* BTN_X */
+	{ 0x134, HidNpadButton_X },       /* BTN_Y */
+	{ 0x136, HidNpadButton_L },       /* BTN_TL */
+	{ 0x137, HidNpadButton_R },       /* BTN_TR */
+	{ 0x13a, HidNpadButton_Minus },   /* BTN_SELECT */
+	{ 0x13b, 0 },                     /* BTN_START: + let go quickly, see gamepad_input() */
+	{ 0x13c, 0 },                     /* BTN_MODE */
+	{ 0x13d, HidNpadButton_StickL },  /* BTN_THUMBL */
+	{ 0x13e, HidNpadButton_StickR },  /* BTN_THUMBR */
+};
+/* Its axes: the sticks, the triggers (0 to 255), the d-pad (-1 to 1). */
+enum { AX_X, AX_Y, AX_Z, AX_RX, AX_RY, AX_RZ, AX_HAT_X, AX_HAT_Y, AXES };
+static const int gamepad_axis_codes[AXES] = { 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x10, 0x11 };
+static int gamepad_state[sizeof(gamepad_buttons) / sizeof(gamepad_buttons[0]) + AXES];
+
+static void read_small_file(const char *path, char *out, size_t room)
+{
+	int fd = lkl_sys_open(path, LKL_O_RDONLY, 0);
+	long n = fd >= 0 ? lkl_sys_read(fd, out, room - 1) : 0;
+
+	out[n > 0 ? n : 0] = 0;
+	if (fd >= 0)
+		lkl_sys_close(fd);
+}
+
+static void write_small_file(const char *path, const char *text)
+{
+	int fd = lkl_sys_open(path, LKL_O_WRONLY | LKL_O_CREAT | LKL_O_TRUNC, 0644);
+
+	if (fd >= 0) {
+		lkl_sys_write(fd, text, strlen(text));
+		lkl_sys_close(fd);
+	}
+}
+
+static void gamepad_create(void)
+{
+	struct {
+		uint16_t bustype, vendor, product, version;
+		char name[80];
+		uint32_t ff_effects_max;
+	} setup = { 0x03, 0x045e, 0x028e, 0x0114, "Microsoft X-Box 360 pad", 0 };
+	struct {
+		uint16_t code, pad;
+		int32_t value, minimum, maximum, fuzz, flat, resolution;
+	} axis;
+	char path[64], dev[32];
+	int fd;
+
+	lkl_sys_mknod("/dev/uinput", LKL_S_IFCHR | 0600, 10 << 8 | 223);
+	fd = lkl_sys_open("/dev/uinput", LKL_O_WRONLY | LKL_O_NONBLOCK, 0);
+	if (fd < 0) {
+		host_log("gx: no controller for pages: no uinput (%d)\n", fd);
+		return;
+	}
+	lkl_sys_ioctl(fd, UI_SET_EVBIT, EV_KEY);
+	for (size_t i = 0; i < sizeof(gamepad_buttons) / sizeof(gamepad_buttons[0]); i++)
+		lkl_sys_ioctl(fd, UI_SET_KEYBIT, gamepad_buttons[i].code);
+	lkl_sys_ioctl(fd, UI_SET_EVBIT, EV_ABS);
+	for (int i = 0; i < AXES; i++) {
+		memset(&axis, 0, sizeof(axis));
+		axis.code = gamepad_axis_codes[i];
+		axis.minimum = i == AX_Z || i == AX_RZ ? 0 : i >= AX_HAT_X ? -1 : -32768;
+		axis.maximum = i == AX_Z || i == AX_RZ ? 255 : i >= AX_HAT_X ? 1 : 32767;
+		lkl_sys_ioctl(fd, UI_SET_ABSBIT, axis.code);
+		lkl_sys_ioctl(fd, UI_ABS_SETUP, (long)&axis);
+	}
+	if (lkl_sys_ioctl(fd, UI_DEV_SETUP, (long)&setup) < 0 || lkl_sys_ioctl(fd, UI_DEV_CREATE, 0) < 0) {
+		host_log("gx: no controller for pages: uinput said no\n");
+		lkl_sys_close(fd);
+		return;
+	}
+	gamepad_fd = fd;
+	/* Its nodes in /dev, and udev's word that they are a joystick. */
+	lkl_sys_mkdir("/dev/input", 0755);
+	lkl_sys_mkdir("/run/udev", 0755);
+	lkl_sys_mkdir("/run/udev/data", 0755);
+	for (int kind = 0; kind < 2; kind++)
+		for (int n = 0; n < 8; n++) {
+			unsigned major, minor;
+
+			snprintf(path, sizeof(path), "/sys/class/input/%s%d/dev", kind ? "event" : "js", n);
+			read_small_file(path, dev, sizeof(dev));
+			if (sscanf(dev, "%u:%u", &major, &minor) != 2)
+				continue;
+			snprintf(path, sizeof(path), "/dev/input/%s%d", kind ? "event" : "js", n);
+			lkl_sys_mknod(path, LKL_S_IFCHR | 0666, major << 8 | minor);
+			snprintf(path, sizeof(path), "/run/udev/data/c%u:%u", major, minor);
+			write_small_file(path, "I:1000000\nE:ID_INPUT=1\nE:ID_INPUT_JOYSTICK=1\n"
+					       "E:ID_BUS=usb\nE:ID_VENDOR_ID=045e\nE:ID_MODEL_ID=028e\n");
+			host_log("gx: a controller for pages: /dev/input/%s%d (%u:%u)\n", kind ? "event" : "js", n,
+				 major, minor);
+		}
+}
+
+static void gamepad_send(int type, int code, int value)
+{
+	struct {
+		int64_t seconds, microseconds;
+		uint16_t type, code;
+		int32_t value;
+	} event = { 0, 0, (uint16_t)type, (uint16_t)code, value };
+
+	lkl_sys_write(gamepad_fd, (const char *)&event, sizeof(event));
+}
+
+/* The pad as it is now (neutral: nothing pressed), to Chromium. + pressed
+ * and let go within half a second is Start, held longer the overlay. */
+static u64 gamepad_start_until;   /* Start is pressed until then (gamepad_plus()) */
+
+static void gamepad_input(PadState *pad, int neutral)
+{
+	const int buttons = sizeof(gamepad_buttons) / sizeof(gamepad_buttons[0]);
+	u64 held = neutral ? 0 : padGetButtons(pad), now = armGetSystemTick();
+	HidAnalogStickState left = neutral ? (HidAnalogStickState){ 0 } : padGetStickPos(pad, 0);
+	HidAnalogStickState right = neutral ? (HidAnalogStickState){ 0 } : padGetStickPos(pad, 1);
+	int state[sizeof(gamepad_state) / sizeof(gamepad_state[0])], changed = 0;
+
+	if (gamepad_fd < 0)
+		return;
+	for (int i = 0; i < buttons; i++)
+		state[i] = gamepad_buttons[i].button && (held & gamepad_buttons[i].button);
+	state[7] = !neutral && gamepad_start_until && now < gamepad_start_until;   /* Start */
+	if (!state[7])
+		gamepad_start_until = 0;
+	state[buttons + AX_X] = left.x;
+	state[buttons + AX_Y] = -left.y;
+	state[buttons + AX_RX] = right.x;
+	state[buttons + AX_RY] = -right.y;
+	state[buttons + AX_Z] = held & HidNpadButton_ZL ? 255 : 0;
+	state[buttons + AX_RZ] = held & HidNpadButton_ZR ? 255 : 0;
+	state[buttons + AX_HAT_X] = (held & HidNpadButton_Right ? 1 : 0) - (held & HidNpadButton_Left ? 1 : 0);
+	state[buttons + AX_HAT_Y] = (held & HidNpadButton_Down ? 1 : 0) - (held & HidNpadButton_Up ? 1 : 0);
+	for (int i = 0; i < buttons + AXES; i++) {
+		if (state[i] == gamepad_state[i])
+			continue;
+		if (i < buttons)
+			gamepad_send(EV_KEY, gamepad_buttons[i].code, state[i]);
+		else
+			gamepad_send(EV_ABS, gamepad_axis_codes[i - buttons], state[i]);
+		gamepad_state[i] = state[i];
+		changed = 1;
+	}
+	if (changed)
+		gamepad_send(EV_SYN, 0, 0);
+}
+
+/* + in controller mode: 1 when it has been held long enough to open the
+ * overlay; let go sooner, it presses Start for a tenth of a second. */
+static int gamepad_plus(PadState *pad, u64 down)
+{
+	static u64 since;
+	static int used;
+	u64 now = armGetSystemTick();
+
+	if (padGetButtons(pad) & HidNpadButton_Plus) {
+		/* Only a press seen from its start: not the + that closed the
+		 * overlay, still held. */
+		if (!since && !(down & HidNpadButton_Plus))
+			return 0;
+		if (!since) {
+			since = now;
+			used = 0;
+		}
+		if (!used && armTicksToNs(now - since) > 500000000ULL) {
+			used = 1;
+			return 1;
+		}
+		return 0;
+	}
+	if (since && !used)
+		gamepad_start_until = now + armNsToTicks(100000000ULL);
+	since = 0;
+	return 0;
+}
+
+/* What was chosen in the overlay; it closes. */
+static int overlay_chose(int what, struct cdp_input *in)
+{
+	if (what == OVERLAY_NONE)
+		return 0;
+	overlay_close();
+	cdp_repaint(0);
+	switch (what) {
+	case OVERLAY_FULL_SCREEN:
+		in->type = CDP_KEY;
+		in->x = 87;   /* F11 */
+		return 1;
+	case OVERLAY_KEYBOARD:
+		if (ask_text("Text to type", "", in->text, sizeof(in->text))) {
+			in->type = CDP_TEXT;
+			return 1;
+		}
+		return 0;
+	case OVERLAY_QUIT:
+		__atomic_store_n(&quit_wanted, 1, __ATOMIC_SEQ_CST);
+		return 0;
+	}
+	return 0;
+}
+
+static int poll_input(struct cdp_input *in)
 {
 	static PadState pad;
-	static int ready, touching, last_x, last_y;
+	static int ready, touching, last_x, last_y, overlay_finger;
 	static u64 last_scroll;
 	HidTouchScreenState touch = { 0 };
 	HidAnalogStickState left, right;
@@ -2307,6 +2669,14 @@ int host_input(struct cdp_input *in)
 	if (hidGetTouchScreenStates(&touch, 1) && touch.count) {
 		int x = touch.touches[0].x, y = touch.touches[0].y;
 
+		/* A finger put down while the overlay is open is the
+		 * overlay's until it is lifted. */
+		if (!touching && !overlay_finger && overlay_is_open()) {
+			overlay_finger = 1;
+			return overlay_chose(overlay_touch(x, y), in);
+		}
+		if (overlay_finger)
+			return 0;
 		if (!touching || abs(x - last_x) + abs(y - last_y) >= 2) {
 			in->type = touching ? CDP_TOUCH_MOVE : CDP_TOUCH_DOWN;
 			in->x = last_x = x;
@@ -2316,6 +2686,7 @@ int host_input(struct cdp_input *in)
 		}
 		return 0;
 	}
+	overlay_finger = 0;
 	if (touching) {
 		touching = 0;
 		in->type = CDP_TOUCH_UP;
@@ -2326,7 +2697,34 @@ int host_input(struct cdp_input *in)
 
 	padUpdate(&pad);
 	down = padGetButtonsDown(&pad);
-	if (down & HidNpadButton_B) {
+	/* + opens the overlay (overlay.c), which has the pad until it closes;
+	 * held, in controller mode, where a short press is Start. */
+	if (wayland && !overlay_is_open() &&
+	    (overlay_mode() == OVERLAY_CONTROLLER ? gamepad_plus(&pad, down) :!!(down & HidNpadButton_Plus))) {
+		game_release();
+		gamepad_input(&pad, 1);
+		overlay_open(wl_full_screen());
+		cdp_repaint(1);
+		return 0;
+	}
+	if (wayland && overlay_is_open()) {
+		overlay_full_screen(wl_full_screen());
+		return overlay_chose(overlay_pad(down), in);
+	}
+	if (wayland && overlay_mode() == OVERLAY_KEYBOARD_MOUSE) {
+		game_input(&pad);
+		return 0;
+	}
+	if (game_held)
+		game_release();
+	if (wayland && overlay_mode() == OVERLAY_CONTROLLER) {
+		gamepad_input(&pad, 0);
+		return 0;
+	}
+	if ((down & HidNpadButton_B) && tv_mode) {
+		in->type = CDP_KEY;
+		in->x = 1;   /* Escape */
+	} else if (down & HidNpadButton_B) {
 		in->type = CDP_BACK;
 	} else if (down & HidNpadButton_X) {
 		in->type = CDP_RELOAD;
@@ -2339,8 +2737,9 @@ int host_input(struct cdp_input *in)
 		 * pressed, and text gets the keyboard. */
 		in->type = CDP_ACTIVATE;
 	} else if (wayland && (down & HidNpadButton_Y)) {
-		/* The keyboard, on the address of the window. */
-		in->type = CDP_KEYBOARD;
+		/* The keyboard, on the address of the window (none in TV mode). */
+		if (!tv_mode)
+			in->type = CDP_KEYBOARD;
 	} else if (wayland && (down & (HidNpadButton_Up | HidNpadButton_Down | HidNpadButton_Left |
 				       HidNpadButton_Right))) {
 		/* The arrow keys, which move the focus from one thing of the
@@ -2373,6 +2772,18 @@ int host_input(struct cdp_input *in)
 		}
 	}
 	return in->type != CDP_NONE;
+}
+
+int host_input(struct cdp_input *in)
+{
+	if (!queue_count && poll_input(in))
+		return 1;
+	if (!queue_count)
+		return 0;
+	*in = queued[queue_head];
+	queue_head = (queue_head + 1) % QUEUED;
+	queue_count--;
+	return 1;
 }
 
 static const char *export_path;   /* a guest file to copy to sdmc:/gx when the guest exits */
@@ -2849,6 +3260,11 @@ static void run(void *arg)
 			host_exit(1);
 	}
 	populate_root();
+	if (wayland) {
+		/* Before the browser looks for controllers, which it does once. */
+		gamepad_create();
+		overlay_bindings(game_bindings);
+	}
 	if (disk_id >= 0) {
 		/* The card reads large pieces far faster than small ones, and what
 		 * is read of the root is mostly whole programs and libraries. */
@@ -3250,6 +3666,11 @@ int main(int argc, char **argv)
 	PadState pad;
 	int choice;
 
+	if (!browser_mode) {
+		extern int launcher_main(int argc, char **argv);
+
+		return launcher_main(argc, argv);
+	}
 	consoleInit(NULL);
 	padConfigureInput(1, HidNpadStyleSet_NpadStandard);
 	padInitializeDefault(&pad);
@@ -3275,6 +3696,7 @@ int main(int argc, char **argv)
 	if (commands[choice][0] == '[' && strchr(commands[choice], ']'))
 		memmove(commands[choice], strchr(commands[choice], ']') + 1,
 			strlen(strchr(commands[choice], ']')));
+	game_bindings_parse(NULL);
 	for (char *word = strtok(commands[choice], " "); word && guest_argc < MAX_ARGS;
 	     word = strtok(NULL, " ")) {
 		/* Before the program: -t, -b, @<root image>, ><guest file to copy out>. */
@@ -3284,6 +3706,10 @@ int main(int argc, char **argv)
 			browser = 1;
 		else if (!guest_argc && !strcmp(word, "-w"))
 			wayland = 1;
+		else if (!guest_argc && !strcmp(word, "-T"))
+			tv_mode = 1;
+		else if (!guest_argc && !strncmp(word, "-K", 2))
+			game_bindings_parse(word + 2);   /* the keyboard and mouse mode's keys */
 		else if (!guest_argc && !strcmp(word, "-p"))
 			profiling = cdp_network_log = 1;
 		else if (!guest_argc && !strncmp(word, "-x", 2)) {
@@ -3311,6 +3737,20 @@ int main(int argc, char **argv)
 	}
 	if (!guest_argc)
 		guest_argv[guest_argc++] = "/bin/hello";
+	if (tv_mode && guest_argc + 2 <= MAX_ARGS) {
+		static char features[1024];
+
+		/* Nor does it say what Chromium it is in other headers (client
+		 * hints). Chromium takes only the last --disable-features. */
+		for (int i = 1; i < guest_argc; i++)
+			if (!strncmp(guest_argv[i], "--disable-features=", 19)) {
+				snprintf(features, sizeof(features), "%s,UserAgentClientHint", guest_argv[i]);
+				guest_argv[i] = features;
+			}
+		guest_argv[guest_argc++] = "--user-agent=" TV_USER_AGENT;
+		guest_argv[guest_argc++] = "--start-fullscreen";
+		wl_address_bar(0, 0, 0, 0);   /* none on the screen */
+	}
 
 	/* Everything runs on created threads: on the main thread of a homebrew,
 	 * threadGetSelf() is not what LKL needs it to be (see nro/source/main.c). */
@@ -3350,7 +3790,10 @@ int main(int argc, char **argv)
 
 	while (appletMainLoop()) {
 		padUpdate(&pad);
-		if (padGetButtonsDown(&pad) & HidNpadButton_Plus)
+		/* With a window, + opens the overlay and Quit is in it. */
+		if (!wayland && (padGetButtonsDown(&pad) & HidNpadButton_Plus))
+			break;
+		if (__atomic_load_n(&quit_wanted, __ATOMIC_SEQ_CST))
 			break;
 		if (crashed) {
 			svcSleepThread(1000000000ULL);   /* what the others have to say */

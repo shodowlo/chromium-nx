@@ -2,9 +2,12 @@
  * The launcher: what the Chromium NX tile opens. A home screen in the manner
  * of Android's (a clock, a search bar, a row of apps) and the settings; what
  * is chosen becomes the browser's command line, written to launch.txt, and
- * the Homebrew loader is asked to load gx.nro (the browser) once this program
- * has ended. Nothing of the launcher is left when the browser starts: it is
- * another program loaded into the process afresh, with all of its memory.
+ * the Homebrew loader is asked to load this same program again, as the
+ * browser (--browser, host_nx.c), once the launcher has ended. Nothing of the
+ * launcher is left when the browser starts: the program is loaded into the
+ * process afresh, with all of its memory.
+ *
+ * It also looks for new versions when it starts (update.c).
  *
  * Drawn by the processor into the screen's own buffers, with the console's
  * system font (FreeType) and the app's icon (libjpeg-turbo).
@@ -18,11 +21,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
+#include "../keys.h"
+#include "../version.h"
+#include "update.h"
 
 #define W 1280
 #define H 720
 #define DIR "sdmc:/switch/chromium-nx"
-#define VERSION "0.2"
+#define SELF DIR "/" UPDATE_PROGRAM
+
+/* The browser's command line, as gx has it (host_nx.c). */
+const char *gx_default_command(void);
 
 extern const unsigned char icon_jpg[];
 extern const unsigned int icon_jpg_len;
@@ -58,9 +68,9 @@ static inline void blend(int x, int y, u32 c, int a)
 		 (C_B(c) * a + C_B(*d) * (255 - a)) / 255);
 }
 
-static void background(void)
+static void background_band(int y0, int y1)
 {
-	for (int y = 0; y < H; y++) {
+	for (int y = y0; y < y1; y++) {
 		int t = y * 255 / (H - 1);
 		u32 c = RGB((C_R(BG_TOP) * (255 - t) + C_R(BG_BOTTOM) * t) / 255,
 			    (C_G(BG_TOP) * (255 - t) + C_G(BG_BOTTOM) * t) / 255,
@@ -70,6 +80,11 @@ static void background(void)
 		for (int x = 0; x < W; x++)
 			row[x] = c;
 	}
+}
+
+static void background(void)
+{
+	background_band(0, H);
 }
 
 /* A rectangle with round corners, edges smoothed. */
@@ -276,13 +291,17 @@ static struct {
 	int diagnostics;     /* -p */
 	int async_disk;      /* not -xd */
 	int priorities;      /* not -xp */
-} settings = { 0, 1, 1 };
+	int keys[GX_INPUTS]; /* -K: the keyboard and mouse mode's, by input of keys.h */
+	int check_updates;   /* update.c, when the launcher starts */
+} settings = { 0, 1, 1, { 0 }, 1 };
 
 static void load_settings(void)
 {
 	FILE *f = fopen(DIR "/settings.ini", "r");
 	char line[600];
 
+	for (int i = 0; i < GX_INPUTS; i++)
+		settings.keys[i] = gx_inputs[i].default_key;
 	while (f && fgets(line, sizeof(line), f)) {
 		char *v = strchr(line, '=');
 
@@ -296,6 +315,12 @@ static void load_settings(void)
 			settings.async_disk = !!atoi(v);
 		else if (!strcmp(line, "priorities"))
 			settings.priorities = !!atoi(v);
+		else if (!strcmp(line, "check_updates"))
+			settings.check_updates = !!atoi(v);
+		else if (!strncmp(line, "key_", 4))
+			for (int i = 0; i < GX_INPUTS; i++)
+				if (!strcmp(line + 4, gx_inputs[i].setting))
+					settings.keys[i] = (int)strtol(v, NULL, 0);
 	}
 	if (f)
 		fclose(f);
@@ -307,8 +332,10 @@ static void save_settings(void)
 
 	if (!f)
 		return;
-	fprintf(f, "diagnostics=%d\nasync_disk=%d\npriorities=%d\n",
-		settings.diagnostics, settings.async_disk, settings.priorities);
+	fprintf(f, "diagnostics=%d\nasync_disk=%d\npriorities=%d\ncheck_updates=%d\n",
+		settings.diagnostics, settings.async_disk, settings.priorities, settings.check_updates);
+	for (int i = 0; i < GX_INPUTS; i++)
+		fprintf(f, "key_%s=%d\n", gx_inputs[i].setting, settings.keys[i]);
 	fclose(f);
 }
 
@@ -359,40 +386,45 @@ static void to_url(const char *in, char *out, size_t len)
 
 static char launch_error[160];
 
-/* The browser's command line is the first line of programs.txt, made by the
- * build; the settings change what goes in front of it and its last word,
- * the page to open (none: Chromium's own start page). */
-static int launch(const char *url)
+/* This program again, as the browser: what launch.txt says is run. */
+static int start_browser(void)
 {
-	static char cmd[4096], out[4600];
-	FILE *f = fopen(DIR "/programs.txt", "r");
-	char *p, *last, opts[32] = "";
-	int found = 0;
-
-	while (f && fgets(cmd, sizeof(cmd), f)) {
-		cmd[strcspn(cmd, "\r\n")] = 0;
-		/* The browser's line: with DEV=1 test programs come first. */
-		if (cmd[0] && cmd[0] != '#' && strstr(cmd, "/chromium ") && !strstr(cmd, "--disable-gpu ")) {
-			found = 1;
-			break;
-		}
-	}
-	if (f)
-		fclose(f);
-	if (!found) {
-		snprintf(launch_error, sizeof(launch_error), "programs.txt is missing");
+	if (R_FAILED(envSetNextLoad(SELF, SELF " --browser"))) {
+		remove(DIR "/launch.txt");
+		snprintf(launch_error, sizeof(launch_error), "the loader cannot start the browser");
 		return -1;
 	}
+	return 0;
+}
+
+/* The browser's command line is gx's own; the settings change what goes in
+ * front of it and its last word, the page to open (none: Chromium's own start
+ * page). */
+static int launch(const char *url, int tv)
+{
+	static char cmd[4096], out[4600];
+	char *p, *last, opts[256] = "";
+	FILE *f;
+
+	snprintf(cmd, sizeof(cmd), "%s", gx_default_command());
 	p = cmd;
-	if (*p == '[' && strchr(p, ']'))
-		p = strchr(p, ']') + 1;
-	while (*p == ' ')
-		p++;
 	last = strrchr(p, ' ');
 	if (last && (!strncmp(last + 1, "http://", 7) || !strncmp(last + 1, "https://", 8)))
 		*last = 0;
 	if (settings.diagnostics)
 		strcat(opts, "-p ");
+	if (tv)
+		strcat(opts, "-T ");   /* YouTube's TV page, full screen */
+	for (int i = 0; i < GX_INPUTS; i++)
+		if (settings.keys[i] != gx_inputs[i].default_key) {
+			/* The keys, all of them, when one is not as gx has it. */
+			strcat(opts, "-K");
+			for (int j = 0; j < GX_INPUTS; j++)
+				snprintf(opts + strlen(opts), sizeof(opts) - strlen(opts), "%s%d", j ? "," : "",
+					 settings.keys[j]);
+			strcat(opts, " ");
+			break;
+		}
 	if (!settings.async_disk || !settings.priorities) {
 		strcat(opts, "-x");
 		if (!settings.async_disk)
@@ -410,18 +442,15 @@ static int launch(const char *url)
 		return -1;
 	}
 	fclose(f);
-	if (R_FAILED(envSetNextLoad(DIR "/gx.nro", DIR "/gx.nro"))) {
-		remove(DIR "/launch.txt");
-		snprintf(launch_error, sizeof(launch_error), "the loader cannot start gx.nro");
-		return -1;
-	}
-	return 0;
+	return start_browser();
 }
 
 /* ---------- screens ---------- */
 
-enum { HOME, SETTINGS };
+enum { HOME, SETTINGS, KEYS };
 static int screen = HOME, focus = 1, dialog, dialog_focus;
+/* The key picker, over KEYS: open, and the key it has the focus on (gx_keys). */
+static int picking, pick_focus;
 static char toast[120];
 static u64 toast_until;
 
@@ -460,8 +489,8 @@ static void status_bar(void)
 /* The places that can be touched or focused, by screen. */
 struct spot { int x, y, w, h; };
 
-#define APPS 4
-static const char *app_names[APPS] = { "Chromium", "YouTube", "Google", "Settings" };
+#define APPS 5
+static const char *app_names[APPS] = { "Chromium", "YouTube", "Google", "Chromium settings", "Settings" };
 
 static struct spot home_spot(int i)
 {
@@ -472,9 +501,26 @@ static struct spot home_spot(int i)
 	return (struct spot){ x0 + (i - 1) * span + 30, 440, 140, 170 };
 }
 
+static void gear(int cx, int cy, float s, u32 color, u32 hole)
+{
+	for (int k = 0; k < 8; k++) {
+		float a = k * (float)M_PI / 4;
+
+		line(cx + cosf(a) * 18 * s, cy + sinf(a) * 18 * s, cx + cosf(a) * 30 * s, cy + sinf(a) * 30 * s,
+		     11 * s, color);
+	}
+	circle(cx, cy, 22 * s, color);
+	circle(cx, cy, 9 * s, hole);
+}
+
 static void draw_app_icon(int i, int cx, int cy)
 {
 	switch (i) {
+	case 3:   /* Chromium's settings: its icon, a gear on it */
+		draw_app_icon(0, cx, cy);
+		circle(cx + 32, cy + 32, 24, RGB(0x5F, 0x63, 0x68));
+		gear(cx + 32, cy + 32, 0.6f, TEXT, RGB(0x5F, 0x63, 0x68));
+		break;
 	case 0:   /* Chromium: the app's own icon, round */
 		if (have_icon) {
 			for (int y = 0; y < ICON; y++)
@@ -503,17 +549,10 @@ static void draw_app_icon(int i, int cx, int cy)
 		circle(cx, cy, 50, RGB(0xFF, 0xFF, 0xFF));
 		text(cx, cy + 20, 58, RGB(0x42, 0x85, 0xF4), CENTER, "G");
 		break;
-	case 3: { /* Settings: a gear */
+	case 4:   /* Settings: a gear */
 		circle(cx, cy, 50, RGB(0x5F, 0x63, 0x68));
-		for (int k = 0; k < 8; k++) {
-			float a = k * (float)M_PI / 4;
-
-			line(cx + cosf(a) * 18, cy + sinf(a) * 18, cx + cosf(a) * 30, cy + sinf(a) * 30, 11, TEXT);
-		}
-		circle(cx, cy, 22, TEXT);
-		circle(cx, cy, 9, RGB(0x5F, 0x63, 0x68));
+		gear(cx, cy, 1, TEXT, RGB(0x5F, 0x63, 0x68));
 		break;
-	}
 	}
 }
 
@@ -551,24 +590,37 @@ static void draw_home(void)
 		if (focus == i + 1)
 			rrect(a.x - 6, a.y - 6, a.w + 12, a.h + 12, 28, SURFACE_HI);
 		draw_app_icon(i, cx, cy);
-		text(cx, a.y + 150, 24, focus == i + 1 ? TEXT : TEXT_DIM, CENTER, app_names[i]);
+		int size = 24;
+
+		while (size > 16 && text_width(app_names[i], size) > 190)
+			size--;
+		text(cx, a.y + 150, size, focus == i + 1 ? TEXT : TEXT_DIM, CENTER, app_names[i]);
 	}
 }
 
 /* Settings: rows, some under a heading. */
-enum { S_DIAG, S_DISK, S_PRIO, S_CLEAR, ROWS };
+enum { S_KEYS, S_UPDATES, S_CHECK, S_DIAG, S_DISK, S_PRIO, S_CLEAR, ROWS };
+
+/* Where the rows are on the page of the settings, which is taller than the
+ * screen: it scrolls so that the row with the focus is seen. */
+static const int settings_top[ROWS] = { 156, 288, 368, 500, 580, 660, 792 };
+static int settings_scroll;
 
 static int row_y(int i)
 {
-	static const int y[ROWS] = { 156, 236, 316, 446 };
-
-	return y[i];
+	return settings_top[i] - settings_scroll;
 }
 
 static struct spot settings_spot(int i)
 {
 	return (struct spot){ 160, row_y(i), 960, 78 };
 }
+
+/* What is below the title and above the hints: the rows are seen there. */
+#define SETTINGS_TOP 120
+#define SETTINGS_BOTTOM 676
+
+static void background_band(int y0, int y1);
 
 static void switch_widget(int x, int y, int on)
 {
@@ -595,6 +647,20 @@ static void draw_settings(void)
 	line(64, 88, 82, 70, 5, TEXT);
 	line(64, 88, 82, 106, 5, TEXT);
 	text(104, 100, 36, TEXT, LEFT, "Settings");
+	if (settings_top[focus] + 78 - settings_scroll > SETTINGS_BOTTOM)
+		settings_scroll = settings_top[focus] + 78 - SETTINGS_BOTTOM;
+	if (settings_top[focus] - 40 - settings_scroll < SETTINGS_TOP)
+		settings_scroll = settings_top[focus] - 40 - SETTINGS_TOP > 0 ? settings_top[focus] - 40 - SETTINGS_TOP : 0;
+
+	text(192, row_y(S_KEYS) - 14, 20, ACCENT, LEFT, "Controls");
+	row(S_KEYS, "Keyboard & mouse keys", "What the pad's buttons are in that mode of the + menu");
+	line(1064, 182, 1078, 196, 4, TEXT_DIM);
+	line(1064, 210, 1078, 196, 4, TEXT_DIM);
+
+	text(192, row_y(S_UPDATES) - 14, 20, ACCENT, LEFT, "Updates");
+	row(S_UPDATES, "Check for updates", "When the launcher starts, on github.com/" UPDATE_REPO);
+	switch_widget(1024, row_y(S_UPDATES) + 21, settings.check_updates);
+	row(S_CHECK, "Check now", "Chromium NX " GX_VERSION);
 
 	text(192, row_y(S_DIAG) - 14, 20, ACCENT, LEFT, "Advanced");
 	row(S_DIAG, "Diagnostics", "Profiler and network errors in chromium-nx.log");
@@ -607,8 +673,66 @@ static void draw_settings(void)
 	text(192, row_y(S_CLEAR) - 14, 20, ACCENT, LEFT, "Data");
 	row(S_CLEAR, "Clear browsing data", "Cookies, history, cache and logins");
 
+	/* The rows that went under the title or the hints are covered. */
+	background_band(0, SETTINGS_TOP);
+	background_band(SETTINGS_BOTTOM, H);
+	status_bar();
+	line(64, 88, 82, 70, 5, TEXT);
+	line(64, 88, 82, 106, 5, TEXT);
+	text(104, 100, 36, TEXT, LEFT, "Settings");
 	text(W - 40, 98, 20, TEXT_DIM, RIGHT,
-	     "Chromium NX " VERSION "  \xC2\xB7  Chromium 156 on Linux (LKL)");
+	     "Chromium NX " GX_VERSION "  \xC2\xB7  Chromium 156 on Linux (LKL)");
+}
+
+/* The keys screen: the inputs in two columns of ten. */
+static struct spot key_spot(int i)
+{
+	return (struct spot){ 150 + i / 10 * 500, 130 + i % 10 * 52, 480, 46 };
+}
+
+static void draw_keys(void)
+{
+	line(64, 88, 82, 70, 5, TEXT);
+	line(64, 88, 82, 106, 5, TEXT);
+	text(104, 100, 36, TEXT, LEFT, "Keyboard & mouse keys");
+	for (int i = 0; i < GX_INPUTS; i++) {
+		struct spot s = key_spot(i);
+		int changed = settings.keys[i] != gx_inputs[i].default_key;
+
+		if (focus == i && !picking)
+			rrect(s.x, s.y, s.w, s.h, 16, SURFACE_HI);
+		text(s.x + 24, s.y + 31, 22, TEXT_DIM, LEFT, gx_inputs[i].name);
+		text(s.x + s.w - 24, s.y + 31, 22, changed ? ACCENT : TEXT, RIGHT, gx_key_name(settings.keys[i]));
+	}
+	text(W / 2, 666, 18, TEXT_DIM, CENTER, "The right stick is the mouse and + opens the menu: those stay.");
+}
+
+/* The key picker: every key of keys.h in a grid. */
+#define PICK_COLUMNS 8
+
+static struct spot pick_spot(int i)
+{
+	return (struct spot){ 116 + i % PICK_COLUMNS * 132, 166 + i / PICK_COLUMNS * 46, 124, 40 };
+}
+
+static void draw_picker(void)
+{
+	char title[80];
+
+	for (int y = 0; y < H; y++)
+		for (int x = 0; x < W; x++)
+			blend(x, y, RGB(0, 0, 0), 140);
+	rrect(84, 70, W - 168, 590, 28, SURFACE);
+	snprintf(title, sizeof(title), "Key for %s", gx_inputs[focus].name);
+	text(116, 130, 30, TEXT, LEFT, title);
+	for (int i = 0; i < GX_KEY_COUNT; i++) {
+		struct spot s = pick_spot(i);
+		int current = gx_keys[i].code == settings.keys[focus];
+
+		rrect(s.x, s.y, s.w, s.h, 14, i == pick_focus ? ACCENT : SURFACE_HI);
+		text(s.x + s.w / 2, s.y + 27, strlen(gx_keys[i].name) > 5 ? 17 : 20,
+		     i == pick_focus ? ACCENT_DARK : current ? ACCENT : TEXT, CENTER, gx_keys[i].name);
+	}
 }
 
 static struct spot dialog_spot(int i)
@@ -635,10 +759,200 @@ static void draw_dialog(void)
 	}
 }
 
+/* ---------- updates (update.c) ---------- */
+
+enum { UD_NONE, UD_UPDATE, UD_IMAGE, UD_PROGRESS, UD_ERROR };
+static int upd, upd_focus = 1, upd_prompted, upd_manual, upd_missing;
+static struct update_status us;
+
+static const char *megabytes(uint64_t bytes)
+{
+	static char s[2][24];
+	static int which;
+
+	which ^= 1;
+	if (bytes < (100ULL << 20))
+		snprintf(s[which], sizeof(s[which]), "%.1f MB", bytes / 1048576.0);
+	else
+		snprintf(s[which], sizeof(s[which]), "%llu MB", (unsigned long long)(bytes >> 20));
+	return s[which];
+}
+
+/* The dialog's buttons: two (0 on the left), or one. */
+static int upd_buttons(void)
+{
+	return upd == UD_UPDATE || (upd == UD_IMAGE && us.image_bytes) ? 2 : 1;
+}
+
+static struct spot upd_spot(int i)
+{
+	if (upd_buttons() == 1)
+		return (struct spot){ 550, 450, 180, 56 };
+	return (struct spot){ i ? 660 : 440, 450, 180, 56 };
+}
+
+static void show_image_dialog(void)
+{
+	upd_missing = access(DIR "/" UPDATE_IMAGE, F_OK) != 0;
+	upd = UD_IMAGE;
+	upd_focus = 1;
+}
+
+static void upd_choose(int i)
+{
+	if (upd_buttons() == 1)
+		i = 1;
+	switch (upd) {
+	case UD_UPDATE:
+		if (i) {
+			update_install_latest();
+			upd = UD_PROGRESS;
+		} else if (us.image == IMAGE_MISSING || us.image == IMAGE_OTHER) {
+			/* Later, but the browser cannot start without its image. */
+			show_image_dialog();
+		} else {
+			upd = UD_NONE;
+		}
+		break;
+	case UD_IMAGE:
+		if (i && us.image_bytes) {
+			update_install_image();
+			upd = UD_PROGRESS;
+		} else {
+			upd = UD_NONE;
+		}
+		break;
+	case UD_PROGRESS:
+		update_cancel();
+		break;
+	case UD_ERROR:
+		upd = UD_NONE;
+		break;
+	}
+	upd_focus = 1;
+}
+
+/* Each frame: what update.c has come to. 1 when the program was replaced
+ * and is to be started again. */
+static int update_tick(void)
+{
+	update_status(&us);
+	if (us.state == UPDATE_CHECKED && !upd_prompted) {
+		upd_prompted = 1;
+		if (us.newer) {
+			upd = UD_UPDATE;
+			upd_focus = 1;
+		} else if (us.image == IMAGE_MISSING || us.image == IMAGE_OTHER) {
+			show_image_dialog();
+		} else if (upd_manual) {
+			char s[200];
+
+			snprintf(s, sizeof(s), "No release found (%s)", us.error[0] ? us.error : "no connection");
+			say(us.latest[0] ? "Chromium NX is up to date" : s);
+		}
+	}
+	if (upd == UD_PROGRESS) {
+		if (us.state == UPDATE_INSTALLED)
+			return 1;
+		if (us.state == UPDATE_IMAGE_DONE) {
+			upd = UD_NONE;
+			say("Chromium's image is ready");
+		} else if (us.state == UPDATE_FAILED) {
+			upd = UD_ERROR;
+		}
+	}
+	return 0;
+}
+
+static void check_now(void)
+{
+	if (us.state == UPDATE_DOWNLOADING)
+		return;
+	if (us.state == UPDATE_CHECKING) {
+		/* The check of the start is still going: its answer is said. */
+		upd_manual = 1;
+		say("Checking for updates...");
+		return;
+	}
+	upd_manual = 1;
+	upd_prompted = 0;
+	say("Checking for updates...");
+	update_check();
+}
+
+static void upd_button(int i, const char *label)
+{
+	struct spot b = upd_spot(i);
+	int on = upd_focus == i || upd_buttons() == 1;
+
+	rrect(b.x, b.y, b.w, b.h, 28, on ? ACCENT : SURFACE_HI);
+	text(b.x + b.w / 2, b.y + 37, 24, on ? ACCENT_DARK : TEXT, CENTER, label);
+}
+
+static void draw_update(void)
+{
+	char s[200];
+
+	for (int y = 0; y < H; y++)
+		for (int x = 0; x < W; x++)
+			blend(x, y, RGB(0, 0, 0), 140);
+	rrect(220, 190, 840, 350, 28, SURFACE);
+	switch (upd) {
+	case UD_UPDATE:
+		snprintf(s, sizeof(s), "Chromium NX %s is available", us.latest);
+		text(W / 2, 262, 32, TEXT, CENTER, s);
+		snprintf(s, sizeof(s), "You have %s. To download: %s.", GX_VERSION, megabytes(us.update_bytes));
+		text(W / 2, 318, 22, TEXT_DIM, CENTER, s);
+		text(W / 2, 352, 22, TEXT_DIM, CENTER, "Your profile, settings and downloads are kept.");
+		upd_button(0, "Later");
+		upd_button(1, "Update");
+		break;
+	case UD_IMAGE:
+		text(W / 2, 262, 32, TEXT, CENTER,
+		     upd_missing ? "Chromium's image is missing" : "Chromium's image is not this version's");
+		text(W / 2, 312, 22, TEXT_DIM, CENTER,
+		     "Chromium NX " GX_VERSION " needs " UPDATE_IMAGE " from its release:");
+		text(W / 2, 344, 22, TEXT, CENTER, "github.com/" UPDATE_REPO "/releases/tag/v" GX_VERSION);
+		if (us.image_bytes) {
+			snprintf(s, sizeof(s), "Download it now (%s), or put it in /switch/chromium-nx.",
+				 megabytes(us.image_bytes));
+			text(W / 2, 384, 20, TEXT_DIM, CENTER, s);
+			upd_button(0, "Later");
+			upd_button(1, "Download");
+		} else {
+			text(W / 2, 384, 20, TEXT_DIM, CENTER, "Put it in /switch/chromium-nx on the SD card.");
+			upd_button(1, "OK");
+		}
+		break;
+	case UD_PROGRESS: {
+		uint64_t total = us.total ? us.total : 1;
+
+		text(W / 2, 262, 32, TEXT, CENTER, us.state != UPDATE_DOWNLOADING ? "Getting ready" :
+						   us.total && us.done >= us.total ? "Checking" : "Downloading");
+		text(W / 2, 306, 22, TEXT_DIM, CENTER, us.file);
+		rrect(320, 340, 640, 16, 8, SURFACE_HI);
+		if (us.done)
+			rrect(320, 340, (int)(640 * (us.done > total ? total : us.done) / total) < 16 ? 16 :
+					(int)(640 * (us.done > total ? total : us.done) / total), 16, 8, ACCENT);
+		snprintf(s, sizeof(s), "%s of %s", megabytes(us.done), megabytes(us.total));
+		text(W / 2, 400, 22, TEXT_DIM, CENTER, s);
+		upd_button(1, "Stop");
+		break;
+	}
+	case UD_ERROR:
+		text(W / 2, 262, 32, TEXT, CENTER, "Not updated");
+		text(W / 2, 320, 22, TEXT_DIM, CENTER, us.error);
+		upd_button(1, "OK");
+		break;
+	}
+}
+
 static void draw_hints(void)
 {
 	const char *h = dialog ? "A  Select     B  Cancel" :
-			screen == HOME ? "A  Open     X  Settings     +  Exit" : "A  Change     B  Back     +  Exit";
+			picking ? "A  Choose     B  Cancel" :
+			screen == HOME ? "A  Open     X  Settings     +  Exit" :
+			screen == KEYS ? "A  Change     Y  Reset all     B  Back" : "A  Change     B  Back     +  Exit";
 
 	text(W / 2, H - 18, 20, TEXT_DIM, CENTER, h);
 }
@@ -669,6 +983,7 @@ static int inside(struct spot s, int x, int y)
 
 enum { NONE, QUIT, GO };
 static char go_url[1024];
+static int go_tv;   /* YouTube's TV page: gx's -T */
 
 static void clear_data(void)
 {
@@ -697,7 +1012,22 @@ static int activate(void)
 		dialog = 0;
 		return NONE;
 	}
+	if (picking) {
+		settings.keys[focus] = gx_keys[pick_focus].code;
+		picking = 0;
+		save_settings();
+		return NONE;
+	}
+	if (screen == KEYS) {
+		picking = 1;
+		pick_focus = 0;
+		for (int i = 0; i < GX_KEY_COUNT; i++)
+			if (gx_keys[i].code == settings.keys[focus])
+				pick_focus = i;
+		return NONE;
+	}
 	if (screen == HOME) {
+		go_tv = focus == 2;
 		switch (focus) {
 		case 0:
 			if (ask("Search", "Search or type a web address", NULL, in, sizeof(in))) {
@@ -709,12 +1039,15 @@ static int activate(void)
 			go_url[0] = 0;
 			return GO;
 		case 2:
-			snprintf(go_url, sizeof(go_url), "https://www.youtube.com/");
+			snprintf(go_url, sizeof(go_url), "https://www.youtube.com/tv");
 			return GO;
 		case 3:
 			snprintf(go_url, sizeof(go_url), "https://www.google.com/");
 			return GO;
 		case 4:
+			snprintf(go_url, sizeof(go_url), "chrome://settings/");
+			return GO;
+		case 5:
 			screen = SETTINGS;
 			focus = 0;
 			return NONE;
@@ -722,6 +1055,16 @@ static int activate(void)
 		return NONE;
 	}
 	switch (focus) {
+	case S_KEYS:
+		screen = KEYS;
+		focus = 0;
+		return NONE;
+	case S_UPDATES:
+		settings.check_updates = !settings.check_updates;
+		break;
+	case S_CHECK:
+		check_now();
+		return NONE;
 	case S_DIAG:
 		settings.diagnostics = !settings.diagnostics;
 		break;
@@ -744,9 +1087,14 @@ static void back(void)
 {
 	if (dialog)
 		dialog = 0;
-	else if (screen == SETTINGS) {
+	else if (picking)
+		picking = 0;
+	else if (screen == KEYS) {
+		screen = SETTINGS;
+		focus = S_KEYS;
+	} else if (screen == SETTINGS) {
 		screen = HOME;
-		focus = 4;
+		focus = APPS;
 	}
 }
 
@@ -755,6 +1103,20 @@ static void move(int dx, int dy)
 	if (dialog) {
 		if (dx)
 			dialog_focus = dx > 0;
+		return;
+	}
+	if (picking) {
+		int to = pick_focus + dx + dy * PICK_COLUMNS;
+
+		if (to >= 0 && to < GX_KEY_COUNT && (dy || to / PICK_COLUMNS == pick_focus / PICK_COLUMNS))
+			pick_focus = to;
+		return;
+	}
+	if (screen == KEYS) {
+		int to = focus + dy + dx * 10;
+
+		if (to >= 0 && to < GX_INPUTS && (dx || to / 10 == focus / 10))
+			focus = to;
 		return;
 	}
 	if (screen == HOME) {
@@ -781,6 +1143,28 @@ static int tap(int x, int y)
 			}
 		return NONE;
 	}
+	if (picking) {
+		for (int i = 0; i < GX_KEY_COUNT; i++)
+			if (inside(pick_spot(i), x, y)) {
+				pick_focus = i;
+				return activate();
+			}
+		if (!inside((struct spot){ 84, 70, W - 168, 590 }, x, y))
+			picking = 0;
+		return NONE;
+	}
+	if (screen == KEYS) {
+		if (x < 140 && y < 150) {
+			back();
+			return NONE;
+		}
+		for (int i = 0; i < GX_INPUTS; i++)
+			if (inside(key_spot(i), x, y)) {
+				focus = i;
+				return activate();
+			}
+		return NONE;
+	}
 	if (screen == HOME) {
 		for (int i = 0; i <= APPS; i++)
 			if (inside(home_spot(i), x, y)) {
@@ -793,7 +1177,7 @@ static int tap(int x, int y)
 		back();
 		return NONE;
 	}
-	for (int i = 0; i < ROWS; i++)
+	for (int i = 0; i < ROWS && y >= SETTINGS_TOP && y < SETTINGS_BOTTOM; i++)
 		if (inside(settings_spot(i), x, y)) {
 			focus = i;
 			return activate();
@@ -803,12 +1187,28 @@ static int tap(int x, int y)
 
 /* ---------- main ---------- */
 
-int main(int argc, char **argv)
+int launcher_main(int argc, char **argv)
 {
 	Framebuffer fb;
 	PadState pad;
 	PlFontData font;
 	int touching = 0, result = NONE;
+	FILE *old;
+
+	/* Left by an older version, when the browser was a program of its own
+	 * and its command line a file the build wrote (not DEV=1's menu). */
+	remove(DIR "/gx.nro");
+	if ((old = fopen(DIR "/programs.txt", "r"))) {
+		char first[32] = "";
+		int built = fgets(first, sizeof(first), old) && !strncmp(first, "[Chromium NX]", 13);
+
+		fclose(old);
+		if (built)
+			remove(DIR "/programs.txt");
+	}
+	/* A launch asked for and not carried out (a test writes one): it is. */
+	if (!access(DIR "/launch.txt", F_OK) && !start_browser())
+		return 0;
 
 	plInitialize(PlServiceType_User);
 	psmInitialize();
@@ -819,13 +1219,17 @@ int main(int argc, char **argv)
 
 	if (FT_Init_FreeType(&ft) || R_FAILED(plGetSharedFontByType(&font, PlSharedFontType_Standard)) ||
 	    FT_New_Memory_Face(ft, font.address, font.size, 0, &face)) {
-		/* No font: straight to the browser, as before the launcher. */
-		result = launch("") ? QUIT : GO;
+		/* No font: straight to the browser. */
+		result = launch("", 0) ? QUIT : GO;
 		goto out;
 	}
 	load_icon();
 	framebufferCreate(&fb, nwindowGetDefault(), W, H, PIXEL_FORMAT_RGBA_8888, 2);
 	framebufferMakeLinear(&fb);
+	if (settings.check_updates)
+		update_check();
+	else if (access(DIR "/" UPDATE_IMAGE, F_OK))
+		show_image_dialog();
 
 	while (appletMainLoop()) {
 		HidTouchScreenState touch = { 0 };
@@ -833,9 +1237,33 @@ int main(int argc, char **argv)
 
 		padUpdate(&pad);
 		down = padGetButtonsDown(&pad);
-		if (down & HidNpadButton_Plus) {
+		if (update_tick()) {
+			/* The new program, in this one's place. */
+			envSetNextLoad(SELF, SELF);
 			result = QUIT;
 			break;
+		}
+		if ((down & HidNpadButton_Plus) && upd != UD_PROGRESS) {
+			result = QUIT;
+			break;
+		}
+		if (upd) {
+			/* The update's dialog has the pad and the screen. */
+			if (down & (HidNpadButton_AnyLeft | HidNpadButton_AnyRight))
+				upd_focus = !!(down & HidNpadButton_AnyRight);
+			if (down & HidNpadButton_A)
+				upd_choose(upd_focus);
+			else if (down & HidNpadButton_B)
+				upd_choose(0);
+			if (hidGetTouchScreenStates(&touch, 1) && touch.count > 0) {
+				for (int i = 0; i < 2 && !touching; i++)
+					if (inside(upd_spot(i), touch.touches[0].x, touch.touches[0].y))
+						upd_choose(i);
+				touching = 1;
+			} else {
+				touching = 0;
+			}
+			down = 0;
 		}
 		if (down & (HidNpadButton_AnyUp | HidNpadButton_StickLUp))
 			move(0, -1);
@@ -847,18 +1275,29 @@ int main(int argc, char **argv)
 			move(1, 0);
 		if (down & HidNpadButton_B)
 			back();
+		if ((down & HidNpadButton_Y) && screen == KEYS && !picking) {
+			for (int i = 0; i < GX_INPUTS; i++)
+				settings.keys[i] = gx_inputs[i].default_key;
+			save_settings();
+			say("Keys reset");
+		}
 		if ((down & HidNpadButton_X) && screen == HOME && !dialog) {
 			screen = SETTINGS;
 			focus = 0;
 		}
 		if (down & HidNpadButton_A)
 			result = activate();
-		if (hidGetTouchScreenStates(&touch, 1) && touch.count > 0) {
+		if (!upd && hidGetTouchScreenStates(&touch, 1) && touch.count > 0) {
 			if (!touching)
 				result = tap(touch.touches[0].x, touch.touches[0].y);
 			touching = 1;
-		} else {
+		} else if (!upd) {
 			touching = 0;
+		}
+		/* No browser without its image: what to do about it instead. */
+		if (result == GO && access(DIR "/" UPDATE_IMAGE, F_OK)) {
+			show_image_dialog();
+			result = NONE;
 		}
 
 		fbuf = framebufferBegin(&fb, &fstride);
@@ -866,7 +1305,7 @@ int main(int argc, char **argv)
 		if (result == GO) {
 			draw_starting();
 			framebufferEnd(&fb);
-			if (!launch(go_url))
+			if (!launch(go_url, go_tv))
 				break;
 			say(launch_error);
 			result = NONE;
@@ -876,17 +1315,25 @@ int main(int argc, char **argv)
 		status_bar();
 		if (screen == HOME)
 			draw_home();
+		else if (screen == KEYS)
+			draw_keys();
 		else
 			draw_settings();
+		if (picking)
+			draw_picker();
 		draw_hints();
 		if (dialog)
 			draw_dialog();
+		if (upd)
+			draw_update();
 		draw_toast();
 		framebufferEnd(&fb);
 	}
 	framebufferClose(&fb);
 out:
-	/* Everything given back: the browser is loaded into this process next. */
+	/* Everything given back: the browser is loaded into this process next,
+	 * by the Homebrew loader, which wants the heap as it gave it. */
+	update_exit();
 	for (int i = 0; i < GLYPHS; i++)
 		free(glyphs[i].bits);
 	if (face)

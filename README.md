@@ -14,14 +14,19 @@ This is experimental software.
 
 - Runs Debian's `chromium` 156, the whole browser (tabs, address bar, a
   profile that lasts), as shipped, without recompiling it.
-- Opens on a launcher (`chromium-nx.nro`, from `gx/launcher/`): a home
-  screen with a clock, a search bar and a row of sites (Chromium itself
-  opens on its own start page), and the settings (diagnostics, the disk and
-  priority options, clearing the browsing data; kept in `settings.ini`). It writes the browser's command
-  line to `launch.txt` and has the Homebrew loader load the browser,
-  `gx.nro`, once it has ended: the browser gets the whole process, as if
-  started alone (1936 MB for the guest either way). `gx.nro` started by
-  itself still reads `programs.txt`; holding L shows its menu.
+- One program, `chromium-nx.nro`, next to Chromium's image
+  (`chromium-full.ext4`) in `/switch/chromium-nx` on the SD card.
+- Opens on a launcher (`gx/launcher/`): a home screen with a clock, a
+  search bar and a row of tiles: Chromium on its own start page, YouTube's
+  TV page full screen (`-T`), Google, Chromium's settings, and the
+  launcher's settings (the keyboard and mouse keys, updates, diagnostics,
+  the disk and priority options, clearing the browsing data; kept in
+  `settings.ini`). It writes the browser's command line (host_nx.c's,
+  with what the settings add) to `launch.txt` and has the Homebrew loader
+  load the same program again as the browser (`--browser`): the browser
+  gets the whole process, as if started alone (1936 MB for the guest
+  either way).
+- Updates itself from the releases on GitHub: see [Updates](#updates).
 - Renders with the GPU: ANGLE inside Chromium talks to the console's own
   EGL/GLES driver
 - Runs JavaScript
@@ -36,7 +41,25 @@ This is experimental software.
   | Y | Opens the keyboard on the address bar |
   | L / R | Backspace / Enter |
   | Sticks | Scroll |
-  | + | Quit |
+  | + | The overlay: full screen, controls, keyboard, quit |
+
+  The overlay (`gx/overlay.c`) is a panel over the page. Its Controls row
+  says what the pad is for the page:
+
+  - **Browser**: the table above.
+  - **Keyboard & mouse**: the right stick is the mouse and every other
+    input a key, a mouse button or the wheel (by default the left stick
+    W A S D, ZR / ZL the buttons, L / R the wheel, A space, B shift, ...).
+    The launcher's settings change them (`gx/keys.h`, passed to gx as
+    `-K`). The page can lock the mouse (`requestPointerLock()`), as games
+    that look around with it do: Minecraft Classic plays this way.
+  - **Controller**: pages see a game controller through the Gamepad API,
+    for games that support one. The kernel is given a uinput device that
+    says it is an Xbox 360 pad, which Chromium finds as on any Linux
+    (sysfs, joydev, and the udev records gx writes since there is no
+    udev), and maps as a standard controller. Buttons go by position (the
+    Switch's B is the Xbox's A). + held opens the overlay; a short press is
+    Start.
 
 - HTTPS networking through the console's Wi-Fi.
 - Sound, through the console's audio output.
@@ -76,15 +99,47 @@ kernel's memory ran out.
 
 The log of the last run is `/switch/chromium-nx/chromium-nx.log`.
 
-### Options in programs.txt
+### Updates
 
-Before the program, on its line:
+Each release on GitHub has the program, Chromium's image, a zip of both for
+the SD card, and `manifest.txt`: the version, and each file's size and
+SHA-256. When the launcher starts (unless turned off in its settings), it
+reads the newest release's manifest (`gx/launcher/update.c`):
+
+- A newer version: it offers to update. Only the files that differ from
+  the card's are downloaded; the image (411 MB) is known by its SHA-256,
+  worked out once and kept in `chromium-full.ext4.sha256`, so an update of
+  the program alone is about 28 MB. Files are downloaded to `.part` (a
+  download cut short goes on from there), checked, and only then take the
+  old ones' place; the previous program is kept as `chromium-nx.nro.old`.
+  The launcher then starts again as the new version. The profile, the
+  settings and the downloads are not touched.
+- Then the image: missing, or not the one of this version's release, the
+  launcher says which one is needed (with the link to the release) and
+  offers to download it. Without it, the Chromium tiles show that instead
+  of starting a browser that cannot run.
+
+Installing is copying `chromium-nx.nro` to `/switch/chromium-nx/`: the
+launcher downloads the image the first time. Or extracting the release's zip
+at the root of the card. A release is made with `scripts/release.py` (after
+`build-nx.sh`; the version is `gx/version.h`'s), which needs `gh`. To try
+the updates without publishing: `release.py --local <folder>` lays a release
+out as GitHub does, to serve over HTTP to a build made with
+`UPDATE_RELEASES=http://<pc>:<port>/` and `GX_VERSION=<older>`.
+
+### The browser's command line
+
+The launcher writes it to `launch.txt`, which the browser reads and deletes;
+without one, the browser runs `programs.txt` if there is one (`DEV=1`'s menu),
+else its own (`DEFAULT_COMMAND` in host_nx.c). Before the program, on its line:
 
 | Option | Meaning |
 |---|---|
 | `-w` / `-b` | A Wayland display / the browser driven through its debugging pipe |
 | `@image` / `=image` | The root image / the profile image, next to the NRO |
 | `-c<n>` | Processors the guest is told about |
+| `-T` | YouTube's TV page (youtube.com/tv): the browser says it is the Switch's own browser (YouTube sends others to the desktop site), starts full screen, and B is the page's Back key (Escape) |
+| `-K<key>,...` | The keyboard and mouse mode's keys, in the order of `gx/keys.h` |
 | `-A<l>,<t>,<r>,<b>` | Where the address bar is |
 | `-p` | Diagnostics in the log: where the processor goes (a sampling profiler), what a syscall costs, failed requests and media player errors |
 | `-xb`, `-xh` | Experiments: no kernel priority for syscalls, a tickless kernel |
@@ -108,6 +163,7 @@ Before the program, on its line:
 │    tramp.S  every `svc` of the guest is patched into a jump     │
 │             here                                                │
 │    wl.c     a Wayland compositor: Chromium's window and inputs  │
+│    overlay.c  the panel + opens, laid over the page by glwin.c  │
 │    cdp.c    Chromium's debugging pipe, for what a window does   │
 │             not say (is the focus on a text field?)             │
 │    nat.c    a user-mode NAT between LKL's network and Horizon's │
@@ -179,9 +235,11 @@ The root image wants Debian's arm64 `chromium` installed in `lkl-gx`
 `build-chromium.sh` only make what the console needs and run nothing under
 qemu. LKL itself is the unmodified `lkl/linux` tree.
 
-`DEV=1 build-nx.sh` adds the test programs and Chromium without the GPU to
-`programs.txt`: the app then shows a menu of what to run instead of starting
-the browser.
+`DEV=1 build-nx.sh` writes `programs.txt` with the test programs and
+Chromium without the GPU: the program started as the browser with no
+`launch.txt` (`chromium-nx.nro --browser`) shows it as a menu. The launcher
+also starts the browser at once when it finds a `launch.txt` it did not
+write, which is how a test starts a page of its own.
 
 ## Testing on a PC
 

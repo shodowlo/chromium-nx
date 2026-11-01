@@ -25,6 +25,9 @@ PC_SYSROOT=$PC_OUT/sysroot
 CROSS=aarch64-none-elf-
 # UNIX: AF_UNIX sockets and socketpair(), as in build-lkl.sh.
 OPTIONS="UNIX TIMERFD SIGNALFD FILE_LOCKING INOTIFY_USER ADVISE_SYSCALLS HOSTFS"
+# The pad as a game controller for pages (the overlay's Controller mode): a
+# uinput device, which Chromium reads through joydev (host_nx.c).
+OPTIONS="$OPTIONS INPUT_EVDEV INPUT_JOYDEV INPUT_MISC INPUT_UINPUT"
 # And without these, as in build-lkl.sh: threads of the kernel nothing here
 # uses, out of the 96 an application may have.
 WITHOUT="XFS_FS BTRFS_FS BLK_DEV_NVME NVME_CORE IPV6"
@@ -145,10 +148,10 @@ ARCH="-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE"
 # The arena is as large as on the PC (Chromium fills 120 GB of addresses) if
 # the console has that much to reserve.
 CFLAGS="-g -O2 -Wall -ffunction-sections $ARCH -D__SWITCH__ -DGX_ARENA_SIZE=(256UL<<30) \
-	-I$DEVKITPRO/libnx/include -I$PORTLIBS/include -I$OUT/include -I$SRC/nx -I$SRC \
+	-I$DEVKITPRO/libnx/include -I$PORTLIBS/include -I$PORTLIBS/include/freetype2 -I$OUT/include -I$SRC/nx -I$SRC \
 	-iquote $OUT/lkl"
 objs=
-for f in "$SRC"/tramp.S "$SRC"/nx/exception.S "$SRC"/gmem.c "$SRC"/gelf.c "$SRC"/gsys.c "$SRC"/nat.c "$SRC"/cdp.c "$SRC"/wl.c "$SRC"/glwin.c "$SRC"/video.c "$SRC"/hostfs_nx.c "$SRC"/host_nx.c \
+for f in "$SRC"/tramp.S "$SRC"/nx/exception.S "$SRC"/gmem.c "$SRC"/gelf.c "$SRC"/gsys.c "$SRC"/nat.c "$SRC"/cdp.c "$SRC"/wl.c "$SRC"/glwin.c "$SRC"/video.c "$SRC"/overlay.c "$SRC"/hostfs_nx.c "$SRC"/host_nx.c \
 	"$OUT"/gl_table.c "$OUT"/profile_gz.c "$SRC"/../nro/source/nx_host.c "$OUT"/lkl/iomem.c "$OUT"/lkl/jmp_buf.c \
 	"$OUT"/lkl/utils.c "$OUT"/lkl/virtio.c "$OUT"/lkl/virtio_net.c "$OUT"/lkl/virtio_blk.c \
 	"$OUT"/lkl/net.c "$OUT"/lkl/fs.c; do
@@ -156,18 +159,10 @@ for f in "$SRC"/tramp.S "$SRC"/nx/exception.S "$SRC"/gmem.c "$SRC"/gelf.c "$SRC"
 	${CROSS}gcc $CFLAGS -c "$f" -o "$o"
 	objs="$objs $o"
 done
-# Mesa is C++ inside.
-${CROSS}g++ -specs=$DEVKITPRO/libnx/switch.specs -g $ARCH -Wl,-Map,"$OUT/gx.map" -Wl,--wrap=lkl_syscall \
-	$objs "$OUT/lkl-nro.o" -L$PORTLIBS/lib -L$DEVKITPRO/libnx/lib \
-	-lavcodec -ldav1d -lswresample -lavutil \
-	-lEGL -lGLESv2 -lglapi -ldrm_nouveau -lpng -lturbojpeg -lz -lnx -lm -o "$OUT/gx.elf"
-nacptool --create "Chromium NX" "shodowlo" "0.1" "$OUT/gx.nacp"
-elf2nro "$OUT/gx.elf" "$OUT/gx.nro" --nacp="$OUT/gx.nacp" --icon="$SRC/nx/icon.jpg"
-
-echo "== launcher"
-# What the tile opens (gx/launcher/main.c): a home screen and the settings,
-# then the browser, gx.nro, loaded in its place. Its own program, so that the
-# browser has every byte it had without it.
+# The launcher (gx/launcher/): a home screen, the settings and the updates.
+# Part of the same program, which starts as the launcher and is loaded again
+# as the browser (--browser, host_nx.c): the browser has every byte it would
+# have without it.
 mkdir -p "$OUT/launcher"
 python3 - "$SRC/nx/icon.jpg" "$OUT/launcher/icon.c" <<'PY'
 import sys
@@ -177,12 +172,24 @@ with open(sys.argv[2], 'w') as f:
     f.write('const unsigned int icon_jpg_len = %d;\n' % len(data))
 PY
 LCFLAGS="-O2 -Wall $ARCH -D__SWITCH__ -I$DEVKITPRO/libnx/include -I$PORTLIBS/include -I$PORTLIBS/include/freetype2"
-${CROSS}gcc $LCFLAGS -c "$SRC/launcher/main.c" -o "$OUT/launcher/main.o"
-${CROSS}gcc $LCFLAGS -c "$OUT/launcher/icon.c" -o "$OUT/launcher/icon.o"
-${CROSS}gcc -specs=$DEVKITPRO/libnx/switch.specs $ARCH "$OUT/launcher/main.o" "$OUT/launcher/icon.o" \
-	-L$PORTLIBS/lib -L$DEVKITPRO/libnx/lib -lfreetype -lharfbuzz -lfreetype -lbz2 -lpng16 -lz -lturbojpeg \
-	-lnx -lm -o "$OUT/launcher/launcher.elf"
-elf2nro "$OUT/launcher/launcher.elf" "$OUT/launcher.nro" --nacp="$OUT/gx.nacp" --icon="$SRC/nx/icon.jpg"
+# For a test of the updates: UPDATE_RELEASES=http://<pc>:<port>/releases/ (a
+# folder made by scripts/release.py --local) and GX_VERSION=<version>.
+[ -z "${UPDATE_RELEASES:-}" ] || LCFLAGS="$LCFLAGS -DUPDATE_RELEASES=\"$UPDATE_RELEASES\""
+[ -z "${GX_VERSION:-}" ] || LCFLAGS="$LCFLAGS -DGX_VERSION=\"$GX_VERSION\""
+for f in "$SRC/launcher/main.c" "$SRC/launcher/update.c" "$OUT/launcher/icon.c"; do
+	o=$OUT/launcher/$(basename "${f%.*}").o
+	${CROSS}gcc $LCFLAGS -c "$f" -o "$o"
+	objs="$objs $o"
+done
+VERSION=${GX_VERSION:-$(sed -n 's/^#define GX_VERSION "\(.*\)"$/\1/p' "$SRC/version.h")}
+# Mesa is C++ inside.
+${CROSS}g++ -specs=$DEVKITPRO/libnx/switch.specs -g $ARCH -Wl,-Map,"$OUT/gx.map" -Wl,--wrap=lkl_syscall \
+	$objs "$OUT/lkl-nro.o" -L$PORTLIBS/lib -L$DEVKITPRO/libnx/lib \
+	-lavcodec -ldav1d -lswresample -lavutil \
+	-lEGL -lGLESv2 -lglapi -ldrm_nouveau -lcurl -lfreetype -lharfbuzz -lfreetype -lbz2 -lpng -lturbojpeg -lz \
+	-lnx -lm -o "$OUT/gx.elf"
+nacptool --create "Chromium NX" "shodowlo" "$VERSION" "$OUT/gx.nacp"
+elf2nro "$OUT/gx.elf" "$OUT/chromium-nx.nro" --nacp="$OUT/gx.nacp" --icon="$SRC/nx/icon.jpg"
 
 # What the browser is started with on the console, on top of
 # chromium-full.cmd (build-chromium.sh):
@@ -223,9 +230,8 @@ for log in "$APP"/*.log; do
 done
 rm -rf "$DIST"
 mkdir -p "$APP"
-# The tile opens chromium-nx.nro: the launcher, which loads gx.nro.
-cp "$OUT/launcher.nro" "$APP/chromium-nx.nro"
-cp "$OUT/gx.nro" "$APP/gx.nro"
+# The tile opens chromium-nx.nro: the launcher, then the browser.
+cp "$OUT/chromium-nx.nro" "$APP/chromium-nx.nro"
 if [ -n "${DEV:-}" ]; then
 	[ -e "$PC_SYSROOT/bin/hello" ] ||
 		{ echo "run build-pc.sh first: it makes the guest programs"; exit 1; }
@@ -242,19 +248,24 @@ if [ -n "${DEV:-}" ]; then
 -t /bin/hello
 EOF
 fi
-# Chromium: the whole browser, in its own image (chromium-full.ext4), and its
-# profile. programs.txt has one line, so it starts without a menu; with DEV=1
-# the test programs come first and the menu is shown.
+# Chromium: the whole browser, in its own image (chromium-full.ext4). The
+# launcher starts it with the command line of host_nx.c (DEFAULT_COMMAND),
+# which must say what this build of the image needs: the line below, which
+# the build checks. With DEV=1, programs.txt offers it too, after the tests.
 if [ -e "$PC_OUT/chromium-full-switch.ext4" ] && [ -e "$PC_OUT/chromium-full.cmd" ]; then
 	cp "$PC_OUT/chromium-full-switch.ext4" "$APP/chromium-full.ext4"
-	# Its profile is the folder profile/ next to it, and its downloads
-	# Downloads/ (host_nx.c, mount_home()). =profile.ext4 names the image
-	# a profile was kept in before: copied into the folder once, if there.
-	# -c3: the browser is told of the three processors it runs on.
+	# Its profile is profile.ext4 next to it, and its downloads Downloads/
+	# (host_nx.c, mount_home()). -c3: the browser is told of the three
+	# processors it runs on.
 	F="-w -b -c3 @chromium-full.ext4 =profile.ext4 $(cat "$PC_OUT/chromium-full.cmd") $NX_FLAGS"
 	GPU="--use-gl=angle --use-angle=gles-egl --ignore-gpu-blocklist --disable-gpu-sandbox --in-process-gpu"
-	echo "[Chromium NX] $F $GPU https://www.google.com/" >>"$APP/programs.txt"
-	[ -z "${DEV:-}" ] || echo "[Chromium NX (no GPU)] $F --disable-gpu https://www.google.com/" >>"$APP/programs.txt"
+	LINE="$F $GPU https://www.google.com/"
+	strings -n 200 "$OUT/gx.elf" | grep -qxF -- "$LINE" ||
+		echo "warning: DEFAULT_COMMAND (host_nx.c) is not the image's command line: $LINE"
+	if [ -n "${DEV:-}" ]; then
+		echo "[Chromium NX] $LINE" >>"$APP/programs.txt"
+		echo "[Chromium NX (no GPU)] $F --disable-gpu https://www.google.com/" >>"$APP/programs.txt"
+	fi
 fi
 ls -la "$APP"
 echo "copy the contents of gx/dist-nx to the root of the SD card"

@@ -17,6 +17,11 @@ struct glwin_host {
 	/* Called with the screen drawn and current, before it is shown: for a
 	 * host that wants to look at it. May be NULL. */
 	void (*presented)(void *dpy, void *screen);
+	/* What is laid over the windows, if anything: a picture (RGBA, colours
+	 * already multiplied by their opacity, rows from the top), where it goes
+	 * on the screen and its size, and a number that changes when the
+	 * picture does. NULL when there is nothing. May be NULL. */
+	const uint32_t *(*overlay)(int *x, int *y, int *width, int *height, unsigned *serial);
 };
 
 /* To be called before anything else here. */
