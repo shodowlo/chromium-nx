@@ -6,9 +6,9 @@
     python scripts/release.py --local DIR  # lays a release out in DIR as GitHub does, to
                                            # serve to a launcher built with UPDATE_RELEASES
 
-The version is gx/version.h's. The release has the program, Chromium's image,
-manifest.txt (what the launcher reads: gx/launcher/update.c) and a zip of the
-folder for the SD card, for those who install by hand. Publishing needs gh,
+The version is gx/version.h's. The release has the program, Chromium's image
+and manifest.txt (what the launcher reads: gx/launcher/update.c); --zip adds a
+zip of the folder for the SD card. Publishing needs gh,
 logged in to GitHub.
 """
 import argparse
@@ -46,7 +46,7 @@ def main():
     p.add_argument('--dry-run', action='store_true')
     p.add_argument('--local')
     p.add_argument('--notes', default='', help='what is new, for the release page')
-    p.add_argument('--no-zip', action='store_true')
+    p.add_argument('--zip', action='store_true')
     a = p.parse_args()
 
     v = version()
@@ -81,7 +81,7 @@ def main():
         return
 
     assets = [manifest] + [os.path.join(APP, name) for name in FILES]
-    if not a.no_zip:
+    if a.zip:
         z = os.path.join(OUT, 'chromium-nx-%s.zip' % v)
         print('zipping', z)
         with zipfile.ZipFile(z, 'w', zipfile.ZIP_STORED) as f:
@@ -96,8 +96,8 @@ def main():
         sys.exit('%s exists already: change GX_VERSION in gx/version.h' % tag)
     notes = a.notes or (
         'Copy chromium-nx.nro to /switch/chromium-nx/ on the SD card: the launcher downloads '
-        'Chromium\'s image (chromium-full.ext4) the first time. Or extract the zip at the root '
-        'of the SD card, which has both.\n\nAlready installed: the launcher offers the update itself.')
+        'Chromium\'s image (chromium-full.ext4) the first time.\n\n'
+        'Already installed: the launcher offers the update itself.')
     subprocess.run(['gh', 'release', 'create', tag, '--title', 'Chromium NX ' + v, '--notes', notes]
                    + assets, check=True)
 
