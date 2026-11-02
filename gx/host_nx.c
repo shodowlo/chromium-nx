@@ -1213,8 +1213,30 @@ static void *gl_raw(const char *name)
 /* The screen, for glwin.c, which the console gives up. */
 static void *gl_screen(void *dpy, void *config)
 {
+	NWindow *win = nwindowGetDefault();
+	int portrait = wl_height > wl_width;
+
 	console_off();
-	window_surface = eglCreateWindowSurface(dpy, config, nwindowGetDefault(), NULL);
+	/* In pixels: on a TV, 1.5 of them to the window's every unit (wl.h). */
+	u32 w = (u32)(wl_width * wl_scale + 0.5f), h = (u32)(wl_height * wl_scale + 0.5f);
+
+	/* Portrait: the window's pictures are as tall as the screen is wide.
+	 * The screen is a square as long as that, so that they fit, and the
+	 * console shows its top, as wide as the screen, where glwin.c lays the
+	 * picture turned a quarter to the left (its top on the left of the
+	 * screen). The console's own turning is not used: a TV shows nothing
+	 * of a picture taller than itself. See poll_input() for the touch
+	 * screen and the pad. */
+	nwindowReleaseBuffers(win);
+	nwindowSetTransform(win, 0);
+	if (portrait) {
+		nwindowSetDimensions(win, h, h);
+		nwindowSetCrop(win, 0, 0, h, w);
+	} else {
+		nwindowSetDimensions(win, w, h);
+		nwindowSetCrop(win, 0, 0, w, h);
+	}
+	window_surface = eglCreateWindowSurface(dpy, config, win, NULL);
 	if (window_surface == EGL_NO_SURFACE)
 		host_log("gx: gl: no window surface (%#x)\n", eglGetError());
 	else
@@ -1247,7 +1269,8 @@ static void gl_presented(void *dpy, void *screen)
 		gl_gap_max = gap;
 }
 
-static const struct glwin_host gl_host = { gl_raw, gl_screen, gl_presented, overlay_picture };
+static const uint32_t *gl_cursor(int *x, int *y, int *width, int *height);
+static const struct glwin_host gl_host = { gl_raw, gl_screen, gl_presented, overlay_picture, gl_cursor };
 
 /* The guest's windows are glwin.c's: it puts them together on the screen. */
 static EGLSurface gl_create_window_surface(EGLDisplay dpy, EGLConfig config, void *window,
@@ -2025,6 +2048,80 @@ static void mount_home(int disk)
 	else
 		host_log("gx: downloads go to sdmc:" SD_DIR "/Downloads\n");
 
+	/* The whole card, read only: where the files a page asks for are taken
+	 * from (the file picker, overlay.c). Nothing is read of it until then. */
+	lkl_sys_mkdir("/gx-root/root/SD", 0755);
+	err = lkl_sys_mount("none", "/gx-root/root/SD", "hostfs", 1 /* MS_RDONLY */, (void *)"");
+	if (err)
+		host_log("gx: cannot show the SD card to pages (%d)\n", err);
+}
+
+/*
+ * Chromium draws its own title bar buttons (minimize, maximize, close) unless
+ * its "Use system title bar and borders" setting is on; then it leaves the
+ * frame to the compositor, which here draws none: the window is the screen
+ * and cannot be minimized or closed but from the overlay. The setting is
+ * turned on in the profile, unless it has been set already (by the user, in
+ * Chromium's settings, whichever way).
+ */
+static void system_title_bar(void)
+{
+	static const char path[] = "/root/profile/Default/Preferences", fresh[] = "/root/profile/Default/Preferences.gx";
+	static const char setting[] = "\"custom_chrome_frame\":false";
+	struct lkl_stat st;
+	char *text, *out, *at;
+	long n = 0;
+	int fd;
+
+	if (lkl_sys_stat(path, &st)) {
+		/* A new profile: Chromium fills in the rest. */
+		lkl_sys_mkdir("/root/profile", 0700);
+		lkl_sys_mkdir("/root/profile/Default", 0700);
+		fd = lkl_sys_open(path, LKL_O_WRONLY | LKL_O_CREAT | LKL_O_EXCL, 0600);
+		if (fd >= 0) {
+			lkl_sys_write(fd, "{\"browser\":{\"custom_chrome_frame\":false}}", 41);
+			lkl_sys_close(fd);
+		}
+		return;
+	}
+	if (st.st_size <= 2 || st.st_size > (16 << 20) || !(text = malloc(st.st_size + 1)))
+		return;
+	fd = lkl_sys_open(path, LKL_O_RDONLY, 0);
+	while (fd >= 0 && n < st.st_size) {
+		long got = lkl_sys_read(fd, text + n, st.st_size - n);
+
+		if (got <= 0)
+			break;
+		n += got;
+	}
+	if (fd >= 0)
+		lkl_sys_close(fd);
+	text[n] = 0;
+	if (n != st.st_size || text[0] != '{' || strstr(text, "\"custom_chrome_frame\"") ||
+	    !(out = malloc(n + 64))) {
+		free(text);
+		return;
+	}
+	/* Into the "browser" object if there is one, else a new one at the top. */
+	at = strstr(text, "\"browser\":{");
+	if (at) {
+		at += strlen("\"browser\":{");
+		n = snprintf(out, n + 64, "%.*s%s%s%s", (int)(at - text), text, setting, *at == '}' ? "" : ",", at);
+	} else {
+		n = snprintf(out, n + 64, "{\"browser\":{%s}%s%s", setting, text[1] == '}' ? "" : ",", text + 1);
+	}
+	fd = lkl_sys_open(fresh, LKL_O_WRONLY | LKL_O_CREAT | LKL_O_TRUNC, 0600);
+	if (fd >= 0) {
+		int whole = lkl_sys_write(fd, out, n) == n;
+
+		lkl_sys_close(fd);
+		if (whole && !lkl_sys_rename(fresh, path))
+			host_log("gx: Chromium is told to leave the title bar to us\n");
+		else
+			lkl_sys_unlink(fresh);
+	}
+	free(out);
+	free(text);
 }
 
 /* A browser leaves these in its profile to say it is running, and takes them
@@ -2302,6 +2399,26 @@ static int wayland;   /* -w: the program wants a Wayland display (wl.c) */
  * browser says it is the Switch's own; it fills the screen, and B is its Back
  * key (Escape) rather than the page history. */
 static int tv_mode;
+static int start_full_screen;   /* -F */
+static int stay_720p;           /* -l */
+
+/* 1920 x 1080 in the dock, 1280 x 720 out of it (wl.h); said to wl.c when
+ * it changes. */
+static u64 screen_changed;   /* when tv_screen() last changed it */
+
+static void tv_screen(void)
+{
+	static int was = -1;
+	int docked = appletGetOperationMode() == AppletOperationMode_Console;
+
+	if (docked == was)
+		return;
+	if (was >= 0)
+		screen_changed = armGetSystemTick();
+	was = docked;
+	wl_set_screen(docked ? 1920 : 1280, docked ? 1080 : 720);
+	host_log("gx: %s: %s\n", docked ? "on a TV" : "handheld", docked ? "1920 x 1080" : "1280 x 720");
+}
 #define TV_USER_AGENT "Mozilla/5.0 (Nintendo Switch; WebApplet) AppleWebKit/609.4 (KHTML, like Gecko) " \
 	"NF/6.0.2.20.5 NintendoBrowser/5.1.0.22023 Dalvik/2.1.0 (Linux; U; Android 5.1.1; AEOBC Build/LVY48f)"
 
@@ -2319,6 +2436,7 @@ int host_ask_text(char *text, size_t room)
 static struct cdp_input queued[QUEUED];
 static int queue_head, queue_count;
 static int quit_wanted;   /* Quit, chosen in the overlay */
+static int to_launcher;   /* and the launcher after (the overlay's Launcher) */
 
 static void push(int type, int x, int y)
 {
@@ -2330,7 +2448,15 @@ static void push(int type, int x, int y)
 	q->type = type;
 	q->x = x;
 	q->y = y;
+	q->finger = 0;
 	q->text[0] = 0;
+}
+
+static void push_touch(int type, int finger, int x, int y)
+{
+	push(type, x, y);
+	if (queue_count)
+		queued[(queue_head + queue_count - 1) % QUEUED].finger = finger;
 }
 
 /* Keyboard and mouse mode (chosen in the overlay): the pad is a keyboard and
@@ -2630,18 +2756,36 @@ static int overlay_chose(int what, struct cdp_input *in)
 	if (what == OVERLAY_NONE)
 		return 0;
 	overlay_close();
-	cdp_repaint(0);
 	switch (what) {
 	case OVERLAY_FULL_SCREEN:
 		in->type = CDP_KEY;
 		in->x = 87;   /* F11 */
 		return 1;
+	case OVERLAY_ORIENTATION:
+		wl_set_portrait(!wl_portrait());
+		return 0;
+	case OVERLAY_COPY:
+	case OVERLAY_PASTE:
+		in->type = CDP_CONTROL_KEY;
+		in->x = what == OVERLAY_COPY ? 46 /* C */ : 47 /* V */;
+		return 1;
+	case OVERLAY_PICKED: {
+		/* The card is /root/SD in the guest (mount_home()). */
+		char path[1100];
+
+		snprintf(path, sizeof(path), "/root/SD/%s", overlay_picked() + strlen("sdmc:/"));
+		cdp_file_chosen(path);
+		return 0;
+	}
 	case OVERLAY_KEYBOARD:
 		if (ask_text("Text to type", "", in->text, sizeof(in->text))) {
 			in->type = CDP_TEXT;
 			return 1;
 		}
 		return 0;
+	case OVERLAY_LAUNCHER:
+		to_launcher = 1;
+		/* fall through */
 	case OVERLAY_QUIT:
 		__atomic_store_n(&quit_wanted, 1, __ATOMIC_SEQ_CST);
 		return 0;
@@ -2649,10 +2793,106 @@ static int overlay_chose(int what, struct cdp_input *in)
 	return 0;
 }
 
+/* The browser's controls (overlay mode Browser): the left stick moves a
+ * mouse pointer, which A clicks with while it is shown; the right stick
+ * scrolls, both ways. The pointer is drawn over the screen by glwin.c
+ * (gl_cursor()); it goes when a finger or the d-pad is used. */
+static int cursor_shown, a_is_click;
+static u64 cursor_moved;   /* when it last moved or went: the page is drawn meanwhile */
+
+static void cursor_hide(u64 now)
+{
+	if (cursor_shown) {
+		cursor_shown = 0;
+		cursor_moved = now;
+	}
+}
+
+static void browser_sticks(PadState *pad, u64 now)
+{
+	static u64 last, last_scroll;
+	static float carry_x, carry_y;
+	HidAnalogStickState l = padGetStickPos(pad, 0), r = padGetStickPos(pad, 1);
+	float seconds = last ? armTicksToNs(now - last) / 1e9f : 0, v[2] = { l.x / 32767.0f, -l.y / 32767.0f };
+	int moving = 0;
+
+	/* Portrait: the console is held turned, its left side up. */
+	if (wl_portrait()) {
+		HidAnalogStickState t = l;
+
+		v[0] = t.y / 32767.0f;
+		v[1] = t.x / 32767.0f;
+		t = r;
+		r.x = t.y;
+		r.y = -t.x;
+	}
+
+	last = now;
+	if (seconds > 0.05f)
+		seconds = 0.05f;
+	for (int i = 0; i < 2; i++) {
+		float a = fabsf(v[i]);
+
+		a = a < 0.15f ? 0 : (a - 0.15f) / 0.85f;
+		moving |= a > 0;
+		/* Up to 900 pixels a second, slowly near the middle. */
+		v[i] = copysignf(a * a * 900.0f * seconds, v[i]);
+	}
+	if (moving) {
+		cursor_shown = 1;
+		cursor_moved = now;
+		carry_x += v[0];
+		carry_y += v[1];
+		if ((int)carry_x || (int)carry_y) {
+			push(CDP_MOTION, (int)carry_x, (int)carry_y);
+			carry_x -= (int)carry_x;
+			carry_y -= (int)carry_y;
+		}
+	}
+	/* The right stick: sixty steps a second at most, one per picture. A
+	 * step of Wayland's unit is about 13 pixels to Chromium, so the steps
+	 * are fractions of one: from a fifth (150 pixels a second) just past
+	 * the middle to 3.2 (2400 a second) pushed all the way. Whole units,
+	 * the slowest was 800 a second and the fastest too fast to read. */
+	if (armTicksToNs(now - last_scroll) > 16000000ULL &&
+	    (abs(r.x) > 6000 || abs(r.y) > 6000)) {
+		float sx = abs(r.x) > 6000 ? (abs(r.x) - 6000) / 26767.0f : 0;
+		float sy = abs(r.y) > 6000 ? (abs(r.y) - 6000) / 26767.0f : 0;
+		int fx = abs(r.x) > 6000 ? (int)((0.2f + 3.0f * sx * sx) * 256) : 0;
+		int fy = abs(r.y) > 6000 ? (int)((0.2f + 3.0f * sy * sy) * 256) : 0;
+
+		last_scroll = now;
+		push(CDP_SCROLL_FINE, r.x > 0 ? fx : -fx, r.y > 0 ? -fy : fy);
+	}
+}
+
+/* The page drawn at every frame while something of ours over it changes:
+ * the overlay, or the pointer moving (cdp_repaint()); and for a while after
+ * the console went into its dock or out of it, when the screen is made
+ * again and shows nothing until it is drawn on (tv_screen()). */
+static void update_repaint(u64 now)
+{
+	static int on;
+	int want = overlay_is_open() || (cursor_moved && armTicksToNs(now - cursor_moved) < 500000000ULL) ||
+		   (screen_changed && armTicksToNs(now - screen_changed) < 2000000000ULL);
+
+	if (want != on) {
+		cdp_repaint(want);
+		on = want;
+	}
+}
+
+static const uint32_t *gl_cursor(int *x, int *y, int *width, int *height)
+{
+	if (!cursor_shown || overlay_is_open() || !wl_pointer_at(x, y))
+		return NULL;
+	return overlay_cursor(width, height);
+}
+
 static int poll_input(struct cdp_input *in)
 {
 	static PadState pad;
-	static int ready, touching, last_x, last_y, overlay_finger;
+	static int ready, overlay_finger;
 	static u64 last_scroll;
 	HidTouchScreenState touch = { 0 };
 	HidAnalogStickState left, right;
@@ -2660,39 +2900,99 @@ static int poll_input(struct cdp_input *in)
 	int dy;
 
 	if (!ready) {
-		padInitializeDefault(&pad);
+		padInitializeAny(&pad);
 		hidInitializeTouchScreen();
 		ready = 1;
 	}
 	memset(in, 0, sizeof(*in));
-
-	if (hidGetTouchScreenStates(&touch, 1) && touch.count) {
-		int x = touch.touches[0].x, y = touch.touches[0].y;
-
-		/* A finger put down while the overlay is open is the
-		 * overlay's until it is lifted. */
-		if (!touching && !overlay_finger && overlay_is_open()) {
-			overlay_finger = 1;
-			return overlay_chose(overlay_touch(x, y), in);
+	if (wayland) {
+		/* A page wants a file: the picker (overlay.c), over anything. */
+		if (cdp_file_wanted()) {
+			overlay_close();
+			game_release();
+			overlay_picker_open();
 		}
-		if (overlay_finger)
-			return 0;
-		if (!touching || abs(x - last_x) + abs(y - last_y) >= 2) {
-			in->type = touching ? CDP_TOUCH_MOVE : CDP_TOUCH_DOWN;
-			in->x = last_x = x;
-			in->y = last_y = y;
-			touching = 1;
-			return 1;
-		}
-		return 0;
+		update_repaint(now);
 	}
-	overlay_finger = 0;
-	if (touching) {
-		touching = 0;
-		in->type = CDP_TOUCH_UP;
-		in->x = last_x;
-		in->y = last_y;
-		return 1;
+
+	/* The fingers on the touch screen, each told apart (two pinch: the page
+	 * zooms). Without a window, only the first. */
+	{
+		static struct {
+			int used, x, y;
+			u32 id;
+		} fingers[WL_FINGERS];
+		int count = hidGetTouchScreenStates(&touch, 1) ? (int)touch.count : 0, any = 0;
+		int xs[16], ys[16];
+
+		if (count > 16)
+			count = 16;
+		if (!wayland && count > 1)
+			count = 1;
+		for (int i = 0; i < count; i++) {
+			xs[i] = touch.touches[i].x;
+			ys[i] = touch.touches[i].y;
+			/* Portrait: the picture's top is on the screen's left (gl_screen()). */
+			if (wayland && wl_portrait()) {
+				int t = xs[i];
+
+				xs[i] = WL_SCREEN_HEIGHT - 1 - ys[i];
+				ys[i] = t;
+			}
+		}
+		for (int f = 0; f < WL_FINGERS; f++)
+			any |= fingers[f].used;
+		if (count) {
+			cursor_hide(now);
+			/* A finger put down while the overlay is open is the
+			 * overlay's, and all of them until they are lifted. */
+			if (!any && !overlay_finger && overlay_is_open()) {
+				overlay_finger = 1;
+				return overlay_chose(overlay_touch(xs[0], ys[0]), in);
+			}
+			if (overlay_finger)
+				return 0;
+		} else {
+			overlay_finger = 0;
+		}
+		/* Lifted. */
+		for (int f = 0; f < WL_FINGERS; f++) {
+			int still = 0;
+
+			for (int i = 0; i < count && fingers[f].used; i++)
+				still |= touch.touches[i].finger_id == fingers[f].id;
+			if (fingers[f].used && !still) {
+				fingers[f].used = 0;
+				push_touch(CDP_TOUCH_UP, f, fingers[f].x, fingers[f].y);
+			}
+		}
+		/* Put down, or moved. */
+		for (int i = 0; i < count; i++) {
+			int f = -1;
+
+			for (int j = 0; j < WL_FINGERS && f < 0; j++)
+				if (fingers[j].used && fingers[j].id == touch.touches[i].finger_id)
+					f = j;
+			if (f < 0) {
+				for (int j = 0; j < WL_FINGERS && f < 0; j++)
+					if (!fingers[j].used)
+						f = j;
+				if (f < 0)
+					continue;   /* more fingers than are told apart */
+				fingers[f].used = 1;
+				fingers[f].id = touch.touches[i].finger_id;
+				fingers[f].x = xs[i];
+				fingers[f].y = ys[i];
+				push_touch(CDP_TOUCH_DOWN, f, xs[i], ys[i]);
+			} else if (abs(xs[i] - fingers[f].x) + abs(ys[i] - fingers[f].y) >= 2) {
+				fingers[f].x = xs[i];
+				fingers[f].y = ys[i];
+				push_touch(CDP_TOUCH_MOVE, f, xs[i], ys[i]);
+			}
+		}
+		/* The pad is not looked at while fingers are down. */
+		if (count || any)
+			return 0;
 	}
 
 	padUpdate(&pad);
@@ -2704,7 +3004,6 @@ static int poll_input(struct cdp_input *in)
 		game_release();
 		gamepad_input(&pad, 1);
 		overlay_open(wl_full_screen());
-		cdp_repaint(1);
 		return 0;
 	}
 	if (wayland && overlay_is_open()) {
@@ -2720,6 +3019,24 @@ static int poll_input(struct cdp_input *in)
 	if (wayland && overlay_mode() == OVERLAY_CONTROLLER) {
 		gamepad_input(&pad, 0);
 		return 0;
+	}
+	if (wayland) {
+		u64 up = padGetButtonsUp(&pad);
+
+		browser_sticks(&pad, now);
+		/* A is the mouse's button while the pointer is shown, held as
+		 * long as A is (a drag). */
+		if (cursor_shown && (down & HidNpadButton_A)) {
+			push(CDP_BUTTON, 0x110, 1);
+			a_is_click = 1;
+			down &= ~HidNpadButton_A;
+		}
+		if (a_is_click && (up & HidNpadButton_A)) {
+			push(CDP_BUTTON, 0x110, 0);
+			a_is_click = 0;
+		}
+		if (down & (HidNpadButton_Up | HidNpadButton_Down | HidNpadButton_Left | HidNpadButton_Right))
+			cursor_hide(now);
 	}
 	if ((down & HidNpadButton_B) && tv_mode) {
 		in->type = CDP_KEY;
@@ -2748,6 +3065,9 @@ static int poll_input(struct cdp_input *in)
 		in->type = CDP_KEY;
 		in->x = (down & HidNpadButton_Up) ? 103 : (down & HidNpadButton_Down) ? 108 :
 			(down & HidNpadButton_Left) ? 105 : 106;
+		/* Portrait, the console turned: its up is the picture's right. */
+		if (wl_portrait())
+			in->x = in->x == 103 ? 106 : in->x == 106 ? 108 : in->x == 108 ? 105 : 103;
 	} else if (wayland && (down & (HidNpadButton_B | HidNpadButton_X))) {
 		/* Nothing: the window has buttons of its own for those. */
 	} else if (down & HidNpadButton_Y) {
@@ -2759,7 +3079,7 @@ static int poll_input(struct cdp_input *in)
 	} else if (down & (HidNpadButton_Up | HidNpadButton_Down)) {
 		in->type = CDP_SCROLL;
 		in->y = (down & HidNpadButton_Down) ? 240 : -240;
-	} else if (armTicksToNs(now - last_scroll) > 16000000ULL) {
+	} else if (!wayland && armTicksToNs(now - last_scroll) > 16000000ULL) {
 		/* The sticks, sixty times a second while they are pushed: at
 		 * most one step per picture the screen can show. */
 		left = padGetStickPos(&pad, 0);
@@ -3277,6 +3597,8 @@ static void run(void *arg)
 	}
 	if (profile_mounted)
 		unlock_profile();
+	if (wayland)
+		system_title_bar();
 	if (cpu_count)
 		gx_set_cpus(cpu_count);
 	if (profiling)
@@ -3672,8 +3994,11 @@ int main(int argc, char **argv)
 		return launcher_main(argc, argv);
 	}
 	consoleInit(NULL);
-	padConfigureInput(1, HidNpadStyleSet_NpadStandard);
-	padInitializeDefault(&pad);
+	/* Any number of players, so that Joy-Con taken off, put back or paired
+	 * while we run are let in (with one, only the HOME menu takes them);
+	 * all of them read as one pad. */
+	padConfigureInput(8, HidNpadStyleSet_NpadStandard);
+	padInitializeAny(&pad);
 	if (!enough_addresses(&pad)) {
 		consoleExit(NULL);
 		leave();   /* not a return: see __libnx_initheap() */
@@ -3697,6 +4022,19 @@ int main(int argc, char **argv)
 		memmove(commands[choice], strchr(commands[choice], ']') + 1,
 			strlen(strchr(commands[choice], ']')));
 	game_bindings_parse(NULL);
+	/* The options, before the program (launch.txt, from the launcher):
+	 *   -w / -b       a Wayland display / the browser's debugging pipe
+	 *   @img / =img   the root image / the profile image, next to the NRO
+	 *   -c<n>         processors the guest is told about
+	 *   -T            YouTube's TV page, full screen
+	 *   -F / -R       start full screen / in portrait (My sites)
+	 *   -M<n>         the pad's mode: 0 browser, 1 keyboard and mouse, 2 controller
+	 *   -K<k>,...     the keyboard and mouse keys, in keys.h's order
+	 *   -N<url>       a page to go to once open (chrome:// ones)
+	 *   -A<l>,<t>,<r>,<b>  where the address bar is
+	 *   -l            720p on a TV too
+	 *   -p            diagnostics in the log; -t traces every syscall
+	 *   -x<letters>   experiments (b, h, p, d: see below) */
 	for (char *word = strtok(commands[choice], " "); word && guest_argc < MAX_ARGS;
 	     word = strtok(NULL, " ")) {
 		/* Before the program: -t, -b, @<root image>, ><guest file to copy out>. */
@@ -3708,6 +4046,16 @@ int main(int argc, char **argv)
 			wayland = 1;
 		else if (!guest_argc && !strcmp(word, "-T"))
 			tv_mode = 1;
+		else if (!guest_argc && !strcmp(word, "-l"))
+			stay_720p = 1;   /* not 1080p on a TV: faster */
+		else if (!guest_argc && !strcmp(word, "-F"))
+			start_full_screen = 1;   /* a site of the launcher's, full screen */
+		else if (!guest_argc && !strncmp(word, "-M", 2))
+			overlay_set_mode(atoi(word + 2));   /* the pad's mode from the start */
+		else if (!guest_argc && !strcmp(word, "-R"))
+			wl_set_portrait(1);   /* a site of the launcher's, in portrait */
+		else if (!guest_argc && !strncmp(word, "-N", 2))
+			cdp_start_url(word + 2);   /* a page Chromium will not open from its command line */
 		else if (!guest_argc && !strncmp(word, "-K", 2))
 			game_bindings_parse(word + 2);   /* the keyboard and mouse mode's keys */
 		else if (!guest_argc && !strcmp(word, "-p"))
@@ -3737,6 +4085,28 @@ int main(int argc, char **argv)
 	}
 	if (!guest_argc)
 		guest_argv[guest_argc++] = "/bin/hello";
+	/* The console's theme, which Chromium has no way to ask about here (it
+	 * asks GTK or the desktop over D-Bus): dark, its windows and the pages'
+	 * prefers-color-scheme are dark too, as its "Device" setting means. */
+	if (wayland && guest_argc < MAX_ARGS) {
+		ColorSetId theme = ColorSetId_Light;
+
+		if (R_SUCCEEDED(setsysInitialize())) {
+			setsysGetColorSetId(&theme);
+			setsysExit();
+		}
+		if (theme == ColorSetId_Dark)
+			guest_argv[guest_argc++] = "--force-dark-mode";
+	}
+	/* On a TV (the console in its dock), 1080p: the screen is made
+	 * 1920 x 1080 (gl_screen()) and Chromium is told to draw at one and a
+	 * half times (wl.c, wp_fractional_scale_v1), so that pages are laid out
+	 * as on the console's own screen, only sharper. It follows the console
+	 * in and out of the dock (tv_screen()). */
+	if (wayland && !stay_720p)
+		tv_screen();
+	if (start_full_screen && !tv_mode && guest_argc < MAX_ARGS)
+		guest_argv[guest_argc++] = "--start-fullscreen";
 	if (tv_mode && guest_argc + 2 <= MAX_ARGS) {
 		static char features[1024];
 
@@ -3790,6 +4160,8 @@ int main(int argc, char **argv)
 
 	while (appletMainLoop()) {
 		padUpdate(&pad);
+		if (wayland && !stay_720p)
+			tv_screen();
 		/* With a window, + opens the overlay and Quit is in it. */
 		if (!wayland && (padGetButtonsDown(&pad) & HidNpadButton_Plus))
 			break;
@@ -3824,6 +4196,13 @@ int main(int argc, char **argv)
 		fclose(log_file);
 	if (profile_image.file && mutexTryLock(&profile_image.lock))
 		fclose(profile_image.file);
+	/* Back to the launcher: the program started again, as its title does
+	 * it (no --browser, no launch.txt: the launcher). Only a title can; from
+	 * the album, Quit. */
+	if (to_launcher && (appletGetAppletType() == AppletType_Application ||
+			    appletGetAppletType() == AppletType_SystemApplication) &&
+	    R_SUCCEEDED(appletRestartProgram(NULL, 0)))
+		svcSleepThread(5000000000ULL);   /* the system ends this process meanwhile */
 	leave();
 	return 0;
 }

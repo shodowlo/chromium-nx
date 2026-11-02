@@ -22,6 +22,9 @@ struct glwin_host {
 	 * on the screen and its size, and a number that changes when the
 	 * picture does. NULL when there is nothing. May be NULL. */
 	const uint32_t *(*overlay)(int *x, int *y, int *width, int *height, unsigned *serial);
+	/* The mouse pointer to draw, if it is to be: its picture (as the
+	 * overlay's, never changing), and where its tip is. May be NULL. */
+	const uint32_t *(*cursor)(int *x, int *y, int *width, int *height);
 };
 
 /* To be called before anything else here. */

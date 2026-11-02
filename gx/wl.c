@@ -34,6 +34,7 @@ enum {
 	T_SUBSURFACE, T_WM_BASE, T_POSITIONER, T_XDG_SURFACE, T_TOPLEVEL, T_POPUP,
 	T_DECORATION_MANAGER, T_DECORATION, T_DATA_MANAGER, T_DATA_SOURCE, T_DATA_DEVICE,
 	T_RELATIVE_MANAGER, T_RELATIVE_POINTER, T_CONSTRAINTS, T_LOCKED, T_CONFINED,
+	T_VIEWPORTER, T_VIEWPORT, T_FRACTION_MANAGER, T_FRACTION,
 };
 
 static const char *const type_names[] = {
@@ -43,7 +44,8 @@ static const char *const type_names[] = {
 	"xdg_toplevel", "xdg_popup", "zxdg_decoration_manager_v1", "zxdg_toplevel_decoration_v1",
 	"wl_data_device_manager", "wl_data_source", "wl_data_device",
 	"zwp_relative_pointer_manager_v1", "zwp_relative_pointer_v1", "zwp_pointer_constraints_v1",
-	"zwp_locked_pointer_v1", "zwp_confined_pointer_v1",
+	"zwp_locked_pointer_v1", "zwp_confined_pointer_v1", "wp_viewporter", "wp_viewport",
+	"wp_fractional_scale_manager_v1", "wp_fractional_scale_v1",
 };
 
 /* What the registry announces; the name of a global is its place here + 1. */
@@ -70,6 +72,13 @@ static const struct {
 	 * around with the mouse). The pad moves it in game mode. */
 	{ "zwp_relative_pointer_manager_v1", 1, T_RELATIVE_MANAGER },
 	{ "zwp_pointer_constraints_v1", 1, T_CONSTRAINTS },
+	/* On a TV only (wl_scale > 1, which is not a whole number): the client
+	 * is told to draw wl_scale pixels to the window's unit, and says with a
+	 * viewport that its pictures, that large, are to be shown at the
+	 * window's size. We lay them on the screen as they are, so what it asks
+	 * of a viewport needs nothing more. Last, so that they can be left out. */
+	{ "wp_viewporter", 1, T_VIEWPORTER },
+	{ "wp_fractional_scale_manager_v1", 1, T_FRACTION_MANAGER },
 };
 
 struct object {
@@ -98,6 +107,15 @@ static uint32_t keyboard_id, keyboard_inside;
  * on (0: none); where the pointer is when it is not locked. */
 static uint32_t relative_id, locked_id;
 static int pointer_x = WL_SCREEN_WIDTH / 2, pointer_y = WL_SCREEN_HEIGHT / 2;
+/* The screen as the window has it: turned (portrait) or not. */
+int wl_width = WL_SCREEN_WIDTH, wl_height = WL_SCREEN_HEIGHT;
+float wl_scale = 1;   /* the screen's pixels to a unit of the window (wl.h) */
+static int base_width = WL_SCREEN_WIDTH, base_height = WL_SCREEN_HEIGHT;   /* not turned */
+static int portrait, portrait_wanted;
+/* The scale the host wants (wl_set_screen()), in 120ths as
+ * wp_fractional_scale_v1 has it, and whether it may change at all: the
+ * protocols that say it are only offered then. */
+static int scale_wanted = 120, scalable;
 static int has_keymap;
 /* The client's clipboard: the wl_data_source it last set as the selection,
  * the kind of text it offers (0: none), and a count of the times it changed. */
@@ -141,8 +159,8 @@ static struct positioner positioners[MAX_POSITIONERS];
 static struct popup popups[MAX_POPUPS];   /* the later ones are on top */
 static uint32_t main_buffer;              /* the window's picture: kept until the next */
 static uint8_t *canvas;                   /* the screen when there are popups */
-static uint32_t touch_surface;            /* what the finger went down on */
-static int32_t touch_dx, touch_dy;
+static uint32_t touch_surface[WL_FINGERS];   /* what each finger went down on */
+static int32_t touch_dx[WL_FINGERS], touch_dy[WL_FINGERS];
 
 /* The kernel's socket structures, which LKL's headers do not have. */
 struct wl_msghdr {
@@ -194,6 +212,8 @@ static void event(uint32_t object, uint16_t opcode, const char *format, ...)
 			msg[n++] = va_arg(ap, uint32_t);
 		} else if (*format == 'f') {
 			msg[n++] = (uint32_t)(va_arg(ap, int32_t) * 256);
+		} else if (*format == 'F') {       /* fixed point already: 256ths */
+			msg[n++] = va_arg(ap, uint32_t);
 		} else if (*format == 's') {
 			const char *text = va_arg(ap, const char *);
 			uint32_t len = strlen(text) + 1;
@@ -432,10 +452,10 @@ static void place_popup(const struct positioner *q, int32_t x, int32_t y, int32_
 	y += q->y + (a[1] < 0 ? 0 : a[1] > 0 ? q->h : q->h / 2) + q->dy;
 	x -= g[0] < 0 ? q->width : g[0] > 0 ? 0 : q->width / 2;
 	y -= g[1] < 0 ? q->height : g[1] > 0 ? 0 : q->height / 2;
-	if (x + q->width > WL_SCREEN_WIDTH)
-		x = WL_SCREEN_WIDTH - q->width;
-	if (y + q->height > WL_SCREEN_HEIGHT)
-		y = WL_SCREEN_HEIGHT - q->height;
+	if (x + q->width > wl_width)
+		x = wl_width - q->width;
+	if (y + q->height > wl_height)
+		y = wl_height - q->height;
 	*px = x < 0 ? 0 : x;
 	*py = y < 0 ? 0 : y;
 }
@@ -451,9 +471,9 @@ static void configure_window(struct object *surface)
 	static const uint32_t states[] = { 1, 4 }, full_states[] = { 2, 4 };
 
 	if (surface->full_screen)
-		event(surface->toplevel, 0, "iia", WL_SCREEN_WIDTH, WL_SCREEN_HEIGHT, full_states, 2);
+		event(surface->toplevel, 0, "iia", wl_width, wl_height, full_states, 2);
 	else
-		event(surface->toplevel, 0, "iia", WL_SCREEN_WIDTH, WL_SCREEN_HEIGHT, states, 2);
+		event(surface->toplevel, 0, "iia", wl_width, wl_height, states, 2);
 	event(surface->xdg, 0, "u", serial++);   /* xdg_surface.configure */
 }
 
@@ -576,7 +596,8 @@ static void bind_global(const uint32_t *w)
 	case T_OUTPUT:
 		output_id = id;
 		event(id, 0, "iiiiissi", 0, 0, 137, 77, 0, "gx", "screen", 0);
-		event(id, 1, "uiii", 3, WL_SCREEN_WIDTH, WL_SCREEN_HEIGHT, 60000);
+		/* In the window's units: the client has wl_scale from wp_fractional_scale_v1. */
+		event(id, 1, "uiii", 3, wl_width, wl_height, 60000);
 		if (version >= 2) {
 			event(id, 3, "i", 1);   /* scale */
 			event(id, 2, "");       /* done */
@@ -600,7 +621,9 @@ static void request(uint32_t id, uint16_t opcode, const uint32_t *w, uint32_t wo
 		} else if (opcode == 1) {     /* get_registry */
 			create(w[0], T_REGISTRY, 1);
 			for (uint32_t i = 0; i < sizeof(globals) / sizeof(globals[0]); i++)
-				event(w[0], 0, "usu", i + 1, globals[i].interface, globals[i].version);
+				if ((globals[i].type != T_VIEWPORTER && globals[i].type != T_FRACTION_MANAGER) ||
+				    scalable)
+					event(w[0], 0, "usu", i + 1, globals[i].interface, globals[i].version);
 		}
 		break;
 	case T_REGISTRY:
@@ -938,6 +961,28 @@ static void request(uint32_t id, uint16_t opcode, const uint32_t *w, uint32_t wo
 				event(objects[o->surface].xdg, 0, "u", serial++);
 		}
 		break;
+	case T_VIEWPORTER:
+		if (opcode == 0)
+			delete_id(id);
+		else if (opcode == 1)         /* get_viewport(new id, surface) */
+			create(w[0], T_VIEWPORT, 1)->surface = w[1];
+		break;
+	case T_VIEWPORT:
+		if (opcode == 0)              /* destroy; set_source, set_destination: see globals */
+			delete_id(id);
+		break;
+	case T_FRACTION_MANAGER:
+		if (opcode == 0) {
+			delete_id(id);
+		} else if (opcode == 1) {     /* get_fractional_scale(new id, surface) */
+			create(w[0], T_FRACTION, 1);
+			event(w[0], 0, "u", (uint32_t)(wl_scale * 120 + 0.5f));   /* preferred_scale */
+		}
+		break;
+	case T_FRACTION:
+		if (opcode == 0)
+			delete_id(id);
+		break;
 	case T_RELATIVE_MANAGER:
 		if (opcode == 0) {
 			delete_id(id);
@@ -1075,47 +1120,178 @@ void wl_address_bar(int left, int top, int right, int bottom)
 static uint64_t address_touched;
 static int edit_is_address;
 
+/* A finger on the right edge of the window, where a page has its scroll bar:
+ * Chromium does not let a finger take the bar (the touch goes to the page
+ * under it), so there it is the mouse, which can. */
+#define SCROLL_BAR_EDGE 22
+/* The mouse goes on the bar itself (15 pixels wide), wherever in the edge
+ * the finger is: the panel says a finger at the very edge is a few pixels
+ * in from it. */
+#define SCROLL_BAR_X (wl_width - 7)
+static int touch_is_mouse;
+
+static int popup_at(int x, int y)
+{
+	for (int i = 0; i < MAX_POPUPS; i++)
+		if (popups[i].id && popups[i].width > 0 && x >= popups[i].x && x < popups[i].x + popups[i].width &&
+		    y >= popups[i].y && y < popups[i].y + popups[i].height)
+			return 1;
+	return 0;
+}
+
+void wl_set_screen(int width, int height)
+{
+	int scale = height * 120 / WL_SCREEN_HEIGHT;
+
+	(void)width;
+	/* Before the client, at once; after, on wl.c's thread (rescale()). */
+	if (!scalable)
+		wl_scale = scale / 120.0f;
+	scalable = 1;
+	__atomic_store_n(&scale_wanted, scale, __ATOMIC_SEQ_CST);
+}
+
+/* The scale to draw at: the host's, but 1 in portrait. A turned screen is a
+ * square as long as its long side (glwin.c), and one of 1920 x 1920 is more
+ * than the GPU has room for beside a browser full screen at 1080 x 1920. */
+static int scale_now(void)
+{
+	return __atomic_load_n(&portrait_wanted, __ATOMIC_SEQ_CST) ? 120 :
+	       __atomic_load_n(&scale_wanted, __ATOMIC_SEQ_CST);
+}
+
+/* The console went into its dock or out of it, or the screen turned: the
+ * client is told the new scale, draws its pictures that large, and glwin.c,
+ * seeing wl_scale change, makes the screen again at the new size
+ * (gl_screen()). The window and all else keep their size in units. */
+static void rescale(void)
+{
+	int scale = scale_now();
+
+	wl_scale = scale / 120.0f;
+	for (uint32_t id = 1; id < MAX_OBJECTS; id++)
+		if (objects[id].type == T_FRACTION)
+			event(id, 0, "u", (uint32_t)scale);   /* preferred_scale */
+	/* What the window is asked to be is where the client takes it up. */
+	if (main_surface < MAX_OBJECTS && objects[main_surface].configured)
+		configure_window(&objects[main_surface]);
+	host_log("gx: wayland: %d x %d pixels\n", (int)(wl_width * wl_scale + 0.5f),
+		 (int)(wl_height * wl_scale + 0.5f));
+}
+
+void wl_set_portrait(int on)
+{
+	__atomic_store_n(&portrait_wanted, !!on, __ATOMIC_SEQ_CST);
+}
+
+int wl_portrait(void)
+{
+	return __atomic_load_n(&portrait, __ATOMIC_SEQ_CST);
+}
+
+/* The screen turned: the output and the window are told its new size, and
+ * glwin.c, seeing it, turns the picture (host_nx.c's gl_screen()). The
+ * address bar is as far from the right edge as it was. */
+static void turn(void)
+{
+	int was_width = wl_width;
+
+	__atomic_store_n(&portrait, portrait_wanted, __ATOMIC_SEQ_CST);
+	wl_width = portrait ? base_height : base_width;
+	wl_height = portrait ? base_width : base_height;
+	address_right += wl_width - was_width;
+	if (output_id && output_id < MAX_OBJECTS && objects[output_id].type == T_OUTPUT) {
+		event(output_id, 1, "uiii", 3, wl_width, wl_height, 60000);
+		if (objects[output_id].version >= 2)
+			event(output_id, 2, "");   /* done */
+	}
+	if (main_surface < MAX_OBJECTS && objects[main_surface].configured)
+		configure_window(&objects[main_surface]);
+	pointer_x = wl_width / 2;
+	pointer_y = wl_height / 2;
+	host_log("gx: wayland: the screen is now %dx%d\n", wl_width, wl_height);
+}
+
+int wl_pointer_at(int *x, int *y)
+{
+	*x = pointer_x;
+	*y = pointer_y;
+	return pointer_inside;
+}
+
+static void pointer_to(int x, int y, uint32_t ms)
+{
+	pointer_enter();
+	pointer_x = x;
+	pointer_y = y;
+	event(pointer_id, 2, "uff", ms, x, y);
+}
+
 static void input(const struct cdp_input *in, uint32_t ms)
 {
+	/* Each finger is its own touch point: two make a pinch, which Chromium
+	 * zooms the page with. */
+	int f = in->finger >= 0 && in->finger < WL_FINGERS ? in->finger : 0;
+
 	if (!main_surface)
 		return;
+	if (touch_is_mouse && pointer_id && f == 0 &&
+	    (in->type == CDP_TOUCH_MOVE || in->type == CDP_TOUCH_UP)) {
+		pointer_to(SCROLL_BAR_X, in->y, ms);
+		if (in->type == CDP_TOUCH_UP) {
+			event(pointer_id, 3, "uuuu", serial++, ms, 0x110, 0);   /* left button up */
+			touch_is_mouse = 0;
+		}
+		pointer_frame();
+		return;
+	}
 	switch (in->type) {
 	case CDP_TOUCH_DOWN:
+		if (pointer_id && f == 0 && in->x >= wl_width - SCROLL_BAR_EDGE && in->y >= address_bottom &&
+		    !popup_at(in->x, in->y)) {
+			touch_is_mouse = 1;
+			pointer_to(SCROLL_BAR_X, in->y, ms);
+			event(pointer_id, 3, "uuuu", serial++, ms, 0x110, 1);   /* left button down */
+			pointer_frame();
+			break;
+		}
 		/* On the popup that is there, the topmost one, or on the window. */
-		touch_surface = main_surface;
-		touch_dx = touch_dy = 0;
+		touch_surface[f] = main_surface;
+		touch_dx[f] = touch_dy[f] = 0;
 		for (int i = 0; i < MAX_POPUPS; i++) {
 			const struct popup *p = &popups[i];
 
 			if (p->id && p->width > 0 && in->x >= p->x && in->x < p->x + p->width &&
 			    in->y >= p->y && in->y < p->y + p->height) {
-				touch_surface = p->surface;
-				touch_dx = p->x;
-				touch_dy = p->y;
+				touch_surface[f] = p->surface;
+				touch_dx[f] = p->x;
+				touch_dy[f] = p->y;
 			}
 		}
 		if (touch_id) {
-			event(touch_id, 0, "uuuiff", serial++, ms, touch_surface, 0, in->x - touch_dx,
-			      in->y - touch_dy);
+			event(touch_id, 0, "uuuiff", serial++, ms, touch_surface[f], f, in->x - touch_dx[f],
+			      in->y - touch_dy[f]);
 			event(touch_id, 3, "");   /* frame */
 		}
 		break;
 	case CDP_TOUCH_MOVE:
 		if (touch_id) {
-			event(touch_id, 2, "uiff", ms, 0, in->x - touch_dx, in->y - touch_dy);
+			event(touch_id, 2, "uiff", ms, f, in->x - touch_dx[f], in->y - touch_dy[f]);
 			event(touch_id, 3, "");
 		}
 		break;
 	case CDP_TOUCH_UP:
 		if (touch_id) {
-			event(touch_id, 1, "uui", serial++, ms, 0);
+			event(touch_id, 1, "uui", serial++, ms, f);
 			event(touch_id, 3, "");
 		}
+		if (f)
+			break;
 		/* A finger on the address: the keyboard, once the window has
 		 * made the address what keys go to. The page says when its own
 		 * text is touched (cdp.c); the window's has no one to say it,
 		 * but is always in the same place. */
-		if (touch_surface == main_surface && in->y >= address_top && in->y < address_bottom &&
+		if (touch_surface[0] == main_surface && in->y >= address_top && in->y < address_bottom &&
 		    in->x >= address_left && in->x < address_right)
 			address_touched = host_now_ns();
 		break;
@@ -1126,7 +1302,20 @@ static void input(const struct cdp_input *in, uint32_t ms)
 	case CDP_SCROLL:
 		if (pointer_id) {
 			pointer_enter();
-			event(pointer_id, 4, "uuf", ms, 0, in->y);   /* axis: vertical */
+			if (in->y)
+				event(pointer_id, 4, "uuf", ms, 0, in->y);   /* axis: vertical */
+			if (in->x)
+				event(pointer_id, 4, "uuf", ms, 1, in->x);   /* horizontal */
+			pointer_frame();
+		}
+		break;
+	case CDP_SCROLL_FINE:
+		if (pointer_id) {
+			pointer_enter();
+			if (in->y)
+				event(pointer_id, 4, "uuF", ms, 0, in->y);
+			if (in->x)
+				event(pointer_id, 4, "uuF", ms, 1, in->x);
 			pointer_frame();
 		}
 		break;
@@ -1154,8 +1343,8 @@ static void input(const struct cdp_input *in, uint32_t ms)
 		} else {
 			pointer_x += in->x;
 			pointer_y += in->y;
-			pointer_x = pointer_x < 0 ? 0 : pointer_x >= WL_SCREEN_WIDTH ? WL_SCREEN_WIDTH - 1 : pointer_x;
-			pointer_y = pointer_y < 0 ? 0 : pointer_y >= WL_SCREEN_HEIGHT ? WL_SCREEN_HEIGHT - 1 : pointer_y;
+			pointer_x = pointer_x < 0 ? 0 : pointer_x >= wl_width ? wl_width - 1 : pointer_x;
+			pointer_y = pointer_y < 0 ? 0 : pointer_y >= wl_height ? wl_height - 1 : pointer_y;
 			event(pointer_id, 2, "uff", ms, pointer_x, pointer_y);
 		}
 		pointer_frame();
@@ -1190,6 +1379,9 @@ static void input(const struct cdp_input *in, uint32_t ms)
 		break;
 	case CDP_BACKSPACE:
 		press_key(14, 0, ms);
+		break;
+	case CDP_CONTROL_KEY:
+		press_control(in->x, ms);
 		break;
 	case CDP_QUIT:
 		wl_close();
@@ -1395,6 +1587,15 @@ static void wl_thread(void *arg)
 		now = host_now_ns();
 		while (host_input(&in))
 			input(&in, (uint32_t)(now / 1000000));
+		/* Into portrait, smaller first; out of it, larger after: the
+		 * screen is never a square of the larger scale. */
+		if (__atomic_load_n(&portrait_wanted, __ATOMIC_SEQ_CST) && !portrait &&
+		    scale_now() != (int)(wl_scale * 120 + 0.5f))
+			rescale();
+		if (__atomic_load_n(&portrait_wanted, __ATOMIC_SEQ_CST) != portrait)
+			turn();
+		if (scale_now() != (int)(wl_scale * 120 + 0.5f))
+			rescale();
 		if (address_touched && now - address_touched > ADDRESS_FOCUS_NS) {
 			address_touched = 0;
 			edit_is_address = 1;

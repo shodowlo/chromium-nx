@@ -57,6 +57,9 @@
 #define GL_VERTEX_SHADER 0x8B31
 
 #define MAX_WINDOWS 16
+/* The screen in pixels (wl.h). */
+#define SCREEN_W ((int)(wl_width * wl_scale + 0.5f))
+#define SCREEN_H ((int)(wl_height * wl_scale + 0.5f))
 
 /* What libwayland-egl hands to eglCreateWindowSurface for a window, as the
  * guest has it in its memory: its size, and the wl_surface it is for, whose
@@ -86,6 +89,9 @@ static struct window windows[MAX_WINDOWS];
 static struct window *current;       /* the one the guest has current to draw in */
 static const struct glwin_host *host;
 static void *screen, *context;
+static void *screen_config;   /* what the screen was made with: to make it again, turned */
+static int screen_portrait;   /* how the screen is made now (wl.h) */
+static int screen_w, screen_h;   /* and its size in pixels */
 static int ready, failed, opaque;
 
 /* The host's functions, found by name once. */
@@ -94,6 +100,7 @@ static unsigned (*MakeCurrent)(void *, void *, void *, void *);
 static void *(*GetCurrentContext)(void);
 static void *(*GetCurrentSurface)(int32_t);
 static unsigned (*SwapBuffers)(void *, void *);
+static unsigned (*DestroySurface)(void *, void *);
 static unsigned (*QuerySurface)(void *, void *, int32_t, int32_t *);
 static int32_t (*GetError)(void);
 static unsigned (*GlError)(void);
@@ -124,6 +131,7 @@ static void (*EnableVertexAttribArray)(unsigned);
 static void (*DrawArrays)(unsigned, int32_t, int32_t);
 
 static int32_t where;   /* the uniform: the rectangle a picture is drawn in */
+static int32_t turn;    /* and how the whole is turned: a 2 x 2 matrix (present()) */
 
 static int find_functions(void)
 {
@@ -134,6 +142,7 @@ static int find_functions(void)
 		{ "eglCreateContext", &CreateContext },
 		{ "eglMakeCurrent", &MakeCurrent }, { "eglGetCurrentContext", &GetCurrentContext },
 		{ "eglGetCurrentSurface", &GetCurrentSurface }, { "eglSwapBuffers", &SwapBuffers },
+		{ "eglDestroySurface", &DestroySurface },
 		{ "eglQuerySurface", &QuerySurface }, { "eglGetError", &GetError }, { "glGetError", &GlError },
 		{ "glViewport", &Viewport }, { "glClearColor", &ClearColor }, { "glClear", &Clear },
 		{ "glGenTextures", &GenTextures }, { "glDeleteTextures", &DeleteTextures },
@@ -178,14 +187,16 @@ static struct window *window_of(void *surface)
 static void measure(struct window *w)
 {
 	/* A program that has no window to speak of has the screen. */
-	w->width = w->guest ? w->guest->width : WL_SCREEN_WIDTH;
-	w->height = w->guest ? w->guest->height : WL_SCREEN_HEIGHT;
+	/* In pixels: on a TV, the client's window is wl_scale times its size in
+	 * Wayland's units (wp_viewporter in wl.c). */
+	w->width = w->guest ? w->guest->width : SCREEN_W;
+	w->height = w->guest ? w->guest->height : SCREEN_H;
 	if (w->guest && w->guest->surface)
 		w->id = w->guest->surface->id;
-	if (w->width < 1 || w->width > WL_SCREEN_WIDTH)
-		w->width = WL_SCREEN_WIDTH;
-	if (w->height < 1 || w->height > WL_SCREEN_HEIGHT)
-		w->height = WL_SCREEN_HEIGHT;
+	if (w->width < 1 || w->width > SCREEN_W)
+		w->width = SCREEN_W;
+	if (w->height < 1 || w->height > SCREEN_H)
+		w->height = SCREEN_H;
 }
 
 /* Our context, current on the screen: made the first time, with the little
@@ -194,8 +205,9 @@ static int prepare(void *dpy, void *config)
 {
 	static const int32_t version[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
 	static const char *const vertex =
-		"attribute vec2 p; uniform vec4 r; varying vec2 t;\n"
-		"void main() { t = p; gl_Position = vec4(mix(r.xy, r.zw, p), 0.0, 1.0); }\n";
+		"attribute vec2 p; uniform vec4 r, m; varying vec2 t;\n"
+		"void main() { vec2 q = mix(r.xy, r.zw, p); t = p;\n"
+		"  gl_Position = vec4(q.x * m.x + q.y * m.y, q.x * m.z + q.y * m.w, 0.0, 1.0); }\n";
 	static const char *const fragment =
 		"precision mediump float; uniform sampler2D s; varying vec2 t;\n"
 		"void main() { gl_FragColor = texture2D(s, t); }\n";
@@ -227,9 +239,9 @@ static int prepare(void *dpy, void *config)
 	LinkProgram(program);
 	UseProgram(program);
 	where = GetUniformLocation(program, "r");
+	turn = GetUniformLocation(program, "m");
 	VertexAttribPointer(0, 2, GL_FLOAT, 0, 0, corners);
 	EnableVertexAttribArray(0);
-	Viewport(0, 0, WL_SCREEN_WIDTH, WL_SCREEN_HEIGHT);
 	BlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
 	return 0;
 }
@@ -266,10 +278,11 @@ static void keep(struct window *w)
 /* Draws one window where it goes; (x, y) is its top left corner. */
 static void draw(const struct window *w, int32_t x, int32_t y, int blend)
 {
-	float left = 2.0f * x / WL_SCREEN_WIDTH - 1.0f;
-	float right = 2.0f * (x + w->width) / WL_SCREEN_WIDTH - 1.0f;
-	float top = 1.0f - 2.0f * y / WL_SCREEN_HEIGHT;
-	float bottom = 1.0f - 2.0f * (y + w->height) / WL_SCREEN_HEIGHT;
+	/* (x, y) in the window's units, the picture in pixels. */
+	float left = 2.0f * x * wl_scale / SCREEN_W - 1.0f;
+	float right = 2.0f * (x * wl_scale + w->width) / SCREEN_W - 1.0f;
+	float top = 1.0f - 2.0f * y * wl_scale / SCREEN_H;
+	float bottom = 1.0f - 2.0f * (y * wl_scale + w->height) / SCREEN_H;
 
 	BindTexture(GL_TEXTURE_2D, w->texture);
 	if (blend && !opaque)
@@ -280,18 +293,34 @@ static void draw(const struct window *w, int32_t x, int32_t y, int blend)
 	DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 }
 
-/* What the host lays over the windows (its overlay), if anything: its
- * picture goes into a texture of ours when it has changed. */
+static void draw_picture(unsigned *texture, unsigned *serial, unsigned now, const uint32_t *picture, int x,
+			 int y, int width, int height, int draw_width, int draw_height);
+
+/* What the host lays over the windows (its overlay, the mouse pointer), if
+ * anything: a picture goes into a texture of ours when it has changed. */
 static void draw_overlay(void)
 {
-	static unsigned texture, serial = ~0u;
+	static unsigned texture, serial = ~0u, cursor_texture, cursor_serial = ~0u;
 	const uint32_t *picture;
 	int x, y, width, height;
 	unsigned now;
+
+	/* Both are made for the console's 1280 x 720: larger on a larger
+	 * screen (wl_scale). The pointer's tip is where the pointer is. */
+	if (host->cursor && (picture = host->cursor(&x, &y, &width, &height)))
+		draw_picture(&cursor_texture, &cursor_serial, 0, picture, (int)(x * wl_scale), (int)(y * wl_scale),
+			     width, height, (int)(width * wl_scale), (int)(height * wl_scale));
+	if (host->overlay && (picture = host->overlay(&x, &y, &width, &height, &now)))
+		draw_picture(&texture, &serial, now, picture, (int)(x * wl_scale), (int)(y * wl_scale), width, height,
+			     (int)(width * wl_scale), (int)(height * wl_scale));
+}
+
+static void draw_picture(unsigned *texture_slot, unsigned *serial_slot, unsigned now, const uint32_t *picture,
+			 int x, int y, int width, int height, int draw_width, int draw_height)
+{
+	unsigned texture = *texture_slot, serial = *serial_slot;
 	float left, right, top, bottom;
 
-	if (!host->overlay || !(picture = host->overlay(&x, &y, &width, &height, &now)))
-		return;
 	if (!texture) {
 		GenTextures(1, &texture);
 		BindTexture(GL_TEXTURE_2D, texture);
@@ -305,14 +334,45 @@ static void draw_overlay(void)
 		TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, picture);
 		serial = now;
 	}
+	*texture_slot = texture;
+	*serial_slot = serial;
 	/* Its rows go from the top, where the windows' go from the bottom. */
-	left = 2.0f * x / WL_SCREEN_WIDTH - 1.0f;
-	right = 2.0f * (x + width) / WL_SCREEN_WIDTH - 1.0f;
-	top = 1.0f - 2.0f * y / WL_SCREEN_HEIGHT;
-	bottom = 1.0f - 2.0f * (y + height) / WL_SCREEN_HEIGHT;
+	left = 2.0f * x / SCREEN_W - 1.0f;
+	right = 2.0f * (x + draw_width) / SCREEN_W - 1.0f;
+	top = 1.0f - 2.0f * y / SCREEN_H;
+	bottom = 1.0f - 2.0f * (y + draw_height) / SCREEN_H;
 	Enable(GL_BLEND);
 	Uniform4f(where, left, top, right, bottom);
 	DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+}
+
+/* The screen turned (wl.c, turn()): it is made again, at the new size, the
+ * host turning what is shown of it. On the guest's thread that draws, in
+ * the middle of its eglSwapBuffers(): what the guest had current on the old
+ * screen is to be the new one. */
+static int turn_screen(void *dpy, void **was_draw, void **was_read)
+{
+	void *old = screen, *fresh;
+
+	MakeCurrent(dpy, NULL, NULL, NULL);
+	DestroySurface(dpy, old);
+	screen_portrait = wl_height > wl_width;
+	screen_w = SCREEN_W;
+	screen_h = SCREEN_H;
+	fresh = host->screen(dpy, screen_config);
+	if (!fresh) {
+		host_log("gx: gl: the screen could not be made again\n");
+		failed = 1;
+		return -1;
+	}
+	screen = fresh;
+	if (*was_draw == old)
+		*was_draw = screen;
+	if (*was_read == old)
+		*was_read = screen;
+	host_log("gx: gl: the screen is %s, %dx%d\n", screen_portrait ? "portrait" : "landscape",
+		 screen_w, screen_h);
+	return MakeCurrent(dpy, screen, screen, context) ? 0 : -1;
 }
 
 /* The screen, from all the windows there are; keeping first what was just
@@ -329,6 +389,27 @@ static void present(void *dpy, struct window *presented, unsigned gone)
 			keep(presented);
 		if (gone)
 			DeleteTextures(1, &gone);
+		/* Turned (portrait), or made larger or smaller (the dock). */
+		if (((wl_height > wl_width) != screen_portrait || SCREEN_W != screen_w ||
+		     SCREEN_H != screen_h) && screen_config &&
+		    turn_screen(dpy, &was_draw, &was_read)) {
+			MakeCurrent(dpy, was_draw, was_read, was_context);
+			return;
+		}
+		/* Portrait: the screen is a square, as long as its long side
+		 * (the client draws its tall window in it), of which the
+		 * console shows the top as it is held flat (gl_screen()); the
+		 * picture is turned there, its top to the left. A TV shows no
+		 * picture the console turns itself, and one taller than it. */
+		if (screen_portrait) {
+			int side = screen_h > screen_w ? screen_h : screen_w;
+
+			Viewport(0, side - screen_w, screen_h, screen_w);
+			Uniform4f(turn, 0, -1, 1, 0);
+		} else {
+			Viewport(0, 0, SCREEN_W, SCREEN_H);
+			Uniform4f(turn, 1, 0, 0, 1);
+		}
 		ClearColor(0, 0, 0, 1);
 		Clear(GL_COLOR_BUFFER_BIT);
 		/* The window, then the popups in the order wl.c has them, which
@@ -365,9 +446,13 @@ void *glwin_create(void *dpy, void *config, void *guest_window)
 		void *was_context = GetCurrentContext();
 		void *was_draw = GetCurrentSurface(EGL_DRAW), *was_read = GetCurrentSurface(EGL_READ);
 
+		screen_portrait = wl_height > wl_width;
+		screen_w = SCREEN_W;
+		screen_h = SCREEN_H;
 		screen = host->screen(dpy, config);
 		if (!screen)
 			return NULL;
+		screen_config = config;
 		prepare(dpy, config);
 		MakeCurrent(dpy, was_draw, was_read, was_context);
 	}
@@ -395,7 +480,7 @@ int glwin_swap(void *dpy, void *surface)
 	}
 	/* A popup that is drawn this way has no picture of the other kind to
 	 * give wl.c its size, which it needs to tell what a finger is on. */
-	wl_surface_size(w->id, w->width, w->height);
+	wl_surface_size(w->id, (int)(w->width / wl_scale + 0.5f), (int)(w->height / wl_scale + 0.5f));
 	present(dpy, w, 0);
 	return 1;
 }

@@ -28,6 +28,13 @@ static int next_id = 1;
 static int window;          /* Chromium shows itself: see cdp_start() */
 static int ask, wanted, page_action;   /* between wl.c's thread and ours */
 static int repaint = -1;               /* cdp_repaint(): 1 on, 0 off, -1 nothing to do */
+/* A page's file chooser (<input type=file>): Chromium has no dialog of its
+ * own to show here, so it says when one is wanted (Page.fileChooserOpened)
+ * and the file is given back to it (cdp_file_chosen()). */
+static char chooser_session[64];
+static int chooser_node, chooser_wanted, chosen_ready;
+static char chosen[1024];
+static char start_url[1024];   /* cdp_start_url() */
 /* With a window there may be several pages, one per tab, each with a session
  * of its own; they come and go as tabs do. */
 #define MAX_PAGES 16
@@ -300,6 +307,7 @@ static void handle_window_message(const char *message)
 		 * sites that look for a robot (YouTube) can tell it is on. */
 		send_command(id, "Runtime.addBinding", "{\"name\":\"gxEdit\"}");
 		send_command(id, "Page.enable", "{}");
+		send_command(id, "Page.setInterceptFileChooserDialog", "{\"enabled\":true}");
 		/* For the log: requests that fail or are refused (a video that
 		 * stops is a server saying no, or a connection that broke). */
 		if (cdp_network_log) {
@@ -314,14 +322,32 @@ static void handle_window_message(const char *message)
 		send_command(id, "Runtime.evaluate", params);
 		/* The first page has the keyboard from the start, not the
 		 * address above it. */
-		if (!__atomic_fetch_add(&page_count, 1, __ATOMIC_SEQ_CST))
+		if (!__atomic_fetch_add(&page_count, 1, __ATOMIC_SEQ_CST)) {
 			send_command(id, "Page.bringToFront", "{}");
+			/* The page to start on that the command line could not
+			 * give (chrome:// pages are refused there on Linux). */
+			if (start_url[0]) {
+				char url[1100];
+
+				json_escape(url, sizeof(url), start_url);
+				snprintf(params, sizeof(params), "{\"url\":\"%s\"}", url);
+				send_command(id, "Page.navigate", params);
+				start_url[0] = 0;
+			}
+		}
 	} else if (strstr(message, "\"method\":\"Target.detachedFromTarget\"")) {
 		if (string_value(message, "sessionId", id, sizeof(id)) <= 0)
 			return;
 		for (int i = 0; i < MAX_PAGES; i++)
 			if (!strcmp(pages[i], id))
 				pages[i][0] = 0;
+	} else if (strstr(message, "\"method\":\"Page.fileChooserOpened\"")) {
+		const char *node = strstr(message, "\"backendNodeId\":");
+
+		if (node && string_value(message, "sessionId", chooser_session, sizeof(chooser_session)) > 0) {
+			chooser_node = atoi(node + 16);
+			__atomic_store_n(&chooser_wanted, 1, __ATOMIC_SEQ_CST);
+		}
 	} else if (strstr(message, "\"method\":\"Network.responseReceived\"")) {
 		const char *status = strstr(message, "\"status\":");
 		char url[160];
@@ -557,6 +583,14 @@ static void cdp_thread(void *arg)
 				page_command("Page.bringToFront", "{}");
 				break;
 			}
+			if (__atomic_exchange_n(&chosen_ready, 0, __ATOMIC_SEQ_CST) && chooser_session[0]) {
+				char file[1100], text[1300];
+
+				json_escape(file, sizeof(file), chosen);
+				snprintf(text, sizeof(text), "{\"files\":[\"%s\"],\"backendNodeId\":%d}", file,
+					 chooser_node);
+				send_command(chooser_session, "DOM.setFileInputFiles", text);
+			}
 			switch (__atomic_exchange_n(&repaint, -1, __ATOMIC_SEQ_CST)) {
 			case 1:
 				/* A speck that never stops changing: the page is
@@ -621,6 +655,22 @@ int cdp_page(int what)
 		return 0;
 	__atomic_store_n(&page_action, what, __ATOMIC_SEQ_CST);
 	return 1;
+}
+
+void cdp_start_url(const char *url)
+{
+	snprintf(start_url, sizeof(start_url), "%s", url);
+}
+
+int cdp_file_wanted(void)
+{
+	return __atomic_exchange_n(&chooser_wanted, 0, __ATOMIC_SEQ_CST);
+}
+
+void cdp_file_chosen(const char *guest_path)
+{
+	snprintf(chosen, sizeof(chosen), "%s", guest_path);
+	__atomic_store_n(&chosen_ready, 1, __ATOMIC_SEQ_CST);
 }
 
 void cdp_repaint(int on)

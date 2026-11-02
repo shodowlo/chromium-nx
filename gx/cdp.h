@@ -29,11 +29,14 @@ enum {
 	CDP_KEY_UP,       /* x: a key let go */
 	CDP_BUTTON,       /* x: a mouse button (Linux's BTN_*), y: 1 pressed, 0 let go */
 	CDP_MOTION,       /* x, y: how far the mouse moves, in pixels */
+	CDP_CONTROL_KEY,  /* x: a key pressed with Control held (Ctrl+C, Ctrl+V), with a window */
+	CDP_SCROLL_FINE,  /* as CDP_SCROLL, in 256ths of Wayland's unit (Chromium makes one ~13 pixels) */
 };
 
 struct cdp_input {
 	int type;
 	int x, y;
+	int finger;   /* CDP_TOUCH_*, with a window: which finger, 0 to WL_FINGERS - 1 */
 	char text[512];
 };
 
@@ -60,6 +63,13 @@ int cdp_page(int what);
 /* The page drawn again at every frame (on), so that what glwin.c lays over it
  * is seen even when the page does not change; or no longer. */
 void cdp_repaint(int on);
+/* A page asked for a file (<input type=file>): 1 once, when it has. The file
+ * chosen is given to it by its path in the guest. */
+int cdp_file_wanted(void);
+/* A page for the first tab to go to once it is there: what Chromium refuses
+ * from its command line (chrome://settings). Before cdp_start(). */
+void cdp_start_url(const char *url);
+void cdp_file_chosen(const char *guest_path);
 
 /* Pictures shown during the last whole second, for a host that wants to
  * display it. */

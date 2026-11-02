@@ -3,7 +3,7 @@
  *
  * Each release (scripts/release.py) has, besides its files, manifest.txt:
  *
- *	version=0.3
+ *	version=0.3.0
  *	tag=v0.3
  *	file=chromium-nx.nro <size> <sha-256>
  *	file=chromium-full.ext4 <size> <sha-256>
@@ -213,7 +213,7 @@ static const struct entry *find(const struct manifest *m, const char *name)
 	return NULL;
 }
 
-/* -1, 0 or 1, as a is older, the same or newer than b ("0.10" > "0.9"). */
+/* -1, 0 or 1, as a is older, the same or newer than b ("0.10.0" > "0.9.2"). */
 static int version_compare(const char *a, const char *b)
 {
 	for (;;) {

@@ -22,14 +22,17 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <dirent.h>
+#include <strings.h>
+#include <sys/stat.h>
 #include "../keys.h"
 #include "../version.h"
 #include "update.h"
 
 #define W 1280
 #define H 720
-#define DIR "sdmc:/switch/chromium-nx"
-#define SELF DIR "/" UPDATE_PROGRAM
+#define APP_DIR "sdmc:/switch/chromium-nx"
+#define SELF APP_DIR "/" UPDATE_PROGRAM
 
 /* The browser's command line, as gx has it (host_nx.c). */
 const char *gx_default_command(void);
@@ -293,11 +296,12 @@ static struct {
 	int priorities;      /* not -xp */
 	int keys[GX_INPUTS]; /* -K: the keyboard and mouse mode's, by input of keys.h */
 	int check_updates;   /* update.c, when the launcher starts */
-} settings = { 0, 1, 1, { 0 }, 1 };
+	int hires;           /* 1080p on a TV; not: gx's -l */
+} settings = { 0, 1, 1, { 0 }, 1, 1 };
 
 static void load_settings(void)
 {
-	FILE *f = fopen(DIR "/settings.ini", "r");
+	FILE *f = fopen(APP_DIR "/settings.ini", "r");
 	char line[600];
 
 	for (int i = 0; i < GX_INPUTS; i++)
@@ -317,6 +321,8 @@ static void load_settings(void)
 			settings.priorities = !!atoi(v);
 		else if (!strcmp(line, "check_updates"))
 			settings.check_updates = !!atoi(v);
+		else if (!strcmp(line, "hires"))
+			settings.hires = !!atoi(v);
 		else if (!strncmp(line, "key_", 4))
 			for (int i = 0; i < GX_INPUTS; i++)
 				if (!strcmp(line + 4, gx_inputs[i].setting))
@@ -328,12 +334,13 @@ static void load_settings(void)
 
 static void save_settings(void)
 {
-	FILE *f = fopen(DIR "/settings.ini", "w");
+	FILE *f = fopen(APP_DIR "/settings.ini", "w");
 
 	if (!f)
 		return;
-	fprintf(f, "diagnostics=%d\nasync_disk=%d\npriorities=%d\ncheck_updates=%d\n",
-		settings.diagnostics, settings.async_disk, settings.priorities, settings.check_updates);
+	fprintf(f, "diagnostics=%d\nasync_disk=%d\npriorities=%d\ncheck_updates=%d\nhires=%d\n",
+		settings.diagnostics, settings.async_disk, settings.priorities, settings.check_updates,
+		settings.hires);
 	for (int i = 0; i < GX_INPUTS; i++)
 		fprintf(f, "key_%s=%d\n", gx_inputs[i].setting, settings.keys[i]);
 	fclose(f);
@@ -385,12 +392,13 @@ static void to_url(const char *in, char *out, size_t len)
 /* ---------- launching ---------- */
 
 static char launch_error[160];
+static int go_full, go_mode, go_portrait;   /* the site being opened: full screen, the pad's mode, portrait (-F, -M, -R) */
 
 /* This program again, as the browser: what launch.txt says is run. */
 static int start_browser(void)
 {
 	if (R_FAILED(envSetNextLoad(SELF, SELF " --browser"))) {
-		remove(DIR "/launch.txt");
+		remove(APP_DIR "/launch.txt");
 		snprintf(launch_error, sizeof(launch_error), "the loader cannot start the browser");
 		return -1;
 	}
@@ -415,6 +423,20 @@ static int launch(const char *url, int tv)
 		strcat(opts, "-p ");
 	if (tv)
 		strcat(opts, "-T ");   /* YouTube's TV page, full screen */
+	if (go_full)
+		strcat(opts, "-F ");   /* a site full screen */
+	if (!settings.hires)
+		strcat(opts, "-l ");   /* 720p on a TV too */
+	if (go_mode)
+		snprintf(opts + strlen(opts), sizeof(opts) - strlen(opts), "-M%d ", go_mode);
+	if (go_portrait)
+		strcat(opts, "-R ");   /* a site in portrait */
+	/* Chromium opens no chrome:// page from its command line (on Linux): gx
+	 * takes it there once it has started (-N). */
+	if (!strncmp(url, "chrome://", 9) && strlen(url) < 128) {
+		snprintf(opts + strlen(opts), sizeof(opts) - strlen(opts), "-N%s ", url);
+		url = "";
+	}
 	for (int i = 0; i < GX_INPUTS; i++)
 		if (settings.keys[i] != gx_inputs[i].default_key) {
 			/* The keys, all of them, when one is not as gx has it. */
@@ -434,7 +456,7 @@ static int launch(const char *url, int tv)
 		strcat(opts, " ");
 	}
 	snprintf(out, sizeof(out), "%s%s%s%s\n", opts, p, url[0] ? " " : "", url);
-	f = fopen(DIR "/launch.txt", "w");
+	f = fopen(APP_DIR "/launch.txt", "w");
 	if (!f || fputs(out, f) < 0) {
 		if (f)
 			fclose(f);
@@ -447,7 +469,7 @@ static int launch(const char *url, int tv)
 
 /* ---------- screens ---------- */
 
-enum { HOME, SETTINGS, KEYS };
+enum { HOME, SETTINGS, KEYS, DOWNLOADS, SITES, SITE_EDIT, HELP };
 static int screen = HOME, focus = 1, dialog, dialog_focus;
 /* The key picker, over KEYS: open, and the key it has the focus on (gx_keys). */
 static int picking, pick_focus;
@@ -458,6 +480,71 @@ static void say(const char *s)
 {
 	snprintf(toast, sizeof(toast), "%s", s);
 	toast_until = armGetSystemTick() + armNsToTicks(2500000000ULL);
+}
+
+/* The dialog over the screen, if any: what it asks. */
+enum { DIALOG_NONE, DIALOG_CLEAR, DIALOG_DELETE, DIALOG_DELETE_SITE, DIALOG_IMPORT, DIALOG_EXPORT, DIALOG_RESET };
+
+/* Export and import (Settings, Data): the profile, the settings and the
+ * sites, copied to a folder of the SD card or back. */
+#define BACKUP_DIR APP_DIR "/Backup"
+#define BACKUP_SHOWN "/switch/chromium-nx/Backup"
+
+/* Lists that scroll follow the focus, unless a finger moved them (main()). */
+static int follow_focus = 1;
+
+/* ---------- the downloads (the browser's, on the SD card) ---------- */
+
+#define DOWNLOADS_DIR APP_DIR "/Downloads"
+#define MAX_DOWNLOADS 256
+#define DOWNLOAD_ROW 64
+#define DOWNLOAD_TOP 126
+#define DOWNLOAD_ROWS 8
+
+static struct download {
+	char name[256];
+	long long size;
+} downloads[MAX_DOWNLOADS];
+static int download_count, download_scroll;
+
+static int by_name(const void *a, const void *b)
+{
+	return strcasecmp(((const struct download *)a)->name, ((const struct download *)b)->name);
+}
+
+static void load_downloads(void)
+{
+	DIR *d = opendir(DOWNLOADS_DIR);
+	struct dirent *e;
+
+	download_count = 0;
+	download_scroll = 0;
+	while (d && (e = readdir(d)) && download_count < MAX_DOWNLOADS) {
+		char path[512];
+		struct stat st;
+
+		snprintf(path, sizeof(path), DOWNLOADS_DIR "/%s", e->d_name);
+		if (e->d_name[0] == '.' || stat(path, &st) || !S_ISREG(st.st_mode))
+			continue;
+		snprintf(downloads[download_count].name, sizeof(downloads[0].name), "%s", e->d_name);
+		downloads[download_count++].size = st.st_size;
+	}
+	if (d)
+		closedir(d);
+	qsort(downloads, download_count, sizeof(downloads[0]), by_name);
+}
+
+static void delete_download(int i)
+{
+	char path[512];
+
+	if (i < 0 || i >= download_count)
+		return;
+	snprintf(path, sizeof(path), DOWNLOADS_DIR "/%s", downloads[i].name);
+	say(remove(path) ? "Could not delete it" : "Deleted");
+	load_downloads();
+	if (focus >= download_count)
+		focus = download_count ? download_count - 1 : 0;
 }
 
 static void status_bar(void)
@@ -489,16 +576,20 @@ static void status_bar(void)
 /* The places that can be touched or focused, by screen. */
 struct spot { int x, y, w, h; };
 
-#define APPS 5
-static const char *app_names[APPS] = { "Chromium", "YouTube", "Google", "Chromium settings", "Settings" };
+#define APPS 8
+enum { APP_CHROMIUM, APP_YOUTUBE, APP_SITES, APP_GITHUB, APP_DOWNLOADS, APP_HELP, APP_CHROMIUM_SETTINGS,
+       APP_SETTINGS };
+static const char *app_names[APPS] = { "Chromium", "YouTube", "My sites", "GitHub", "Downloads", "Help",
+				       "Chromium settings", "Settings" };
+#define SPAN 156
 
 static struct spot home_spot(int i)
 {
 	if (i == 0)
 		return (struct spot){ 240, 300, 800, 72 };
-	int span = 200, x0 = W / 2 - APPS * span / 2;
+	int x0 = W / 2 - APPS * SPAN / 2;
 
-	return (struct spot){ x0 + (i - 1) * span + 30, 440, 140, 170 };
+	return (struct spot){ x0 + (i - 1) * SPAN + 8, 440, 140, 170 };
 }
 
 static void gear(int cx, int cy, float s, u32 color, u32 hole)
@@ -516,8 +607,57 @@ static void gear(int cx, int cy, float s, u32 color, u32 hole)
 static void draw_app_icon(int i, int cx, int cy)
 {
 	switch (i) {
-	case 3:   /* Chromium's settings: its icon, a gear on it */
-		draw_app_icon(0, cx, cy);
+	case APP_SITES: {   /* My sites: orange, a white star */
+		float px[10], py[10];
+
+		circle(cx, cy, 50, RGB(0xF2, 0x99, 0x1F));
+		/* A star of five points: ten corners, out and in by turns. */
+		for (int k = 0; k < 10; k++) {
+			float a = -(float)M_PI / 2 + k * (float)M_PI / 5, r = k % 2 ? 11.5f : 27;
+
+			px[k] = cx + cosf(a) * r;
+			py[k] = cy + 3 + sinf(a) * r;
+		}
+		for (int y = cy - 28; y <= cy + 30; y++)
+			for (int x = cx - 28; x <= cx + 28; x++) {
+				int in = 0;
+
+				for (int k = 0, j = 9; k < 10; j = k++)
+					if ((py[k] > y + 0.5f) != (py[j] > y + 0.5f) &&
+					    x + 0.5f < px[k] + (y + 0.5f - py[k]) * (px[j] - px[k]) / (py[j] - py[k]))
+						in = !in;
+				if (in)
+					blend(x, y, TEXT, 255);
+			}
+		break;
+	}
+	case APP_HELP:   /* Help: teal, a question mark */
+		circle(cx, cy, 50, RGB(0x12, 0x8C, 0x7E));
+		text(cx, cy + 20, 58, TEXT, CENTER, "?");
+		break;
+	case APP_GITHUB: {   /* GitHub: dark, a branch of white */
+		u32 dark = RGB(0x24, 0x29, 0x2F);
+
+		circle(cx, cy, 50, dark);
+		line(cx - 12, cy - 22, cx - 12, cy + 22, 6, TEXT);
+		line(cx + 14, cy - 10, cx - 12, cy + 12, 6, TEXT);
+		circle(cx - 12, cy - 22, 9, TEXT);
+		circle(cx - 12, cy - 22, 4, dark);
+		circle(cx - 12, cy + 24, 9, TEXT);
+		circle(cx - 12, cy + 24, 4, dark);
+		circle(cx + 14, cy - 14, 9, TEXT);
+		circle(cx + 14, cy - 14, 4, dark);
+		break;
+	}
+	case APP_DOWNLOADS:   /* Downloads: blue, an arrow down onto a line */
+		circle(cx, cy, 50, RGB(0x1A, 0x73, 0xE8));
+		line(cx, cy - 24, cx, cy + 10, 7, TEXT);
+		line(cx - 15, cy - 4, cx, cy + 12, 7, TEXT);
+		line(cx + 15, cy - 4, cx, cy + 12, 7, TEXT);
+		line(cx - 20, cy + 26, cx + 20, cy + 26, 6, TEXT);
+		break;
+	case APP_CHROMIUM_SETTINGS:   /* Chromium's settings: its icon, a gear on it */
+		draw_app_icon(APP_CHROMIUM, cx, cy);
 		circle(cx + 32, cy + 32, 24, RGB(0x5F, 0x63, 0x68));
 		gear(cx + 32, cy + 32, 0.6f, TEXT, RGB(0x5F, 0x63, 0x68));
 		break;
@@ -545,11 +685,7 @@ static void draw_app_icon(int i, int cx, int cy)
 				if (fabsf((float)y) <= 18 * (1 - (x + 12) / 32.0f))
 					blend(cx + x, cy + y, RGB(0xFF, 0xFF, 0xFF), 255);
 		break;
-	case 2:   /* Google: white, a blue G */
-		circle(cx, cy, 50, RGB(0xFF, 0xFF, 0xFF));
-		text(cx, cy + 20, 58, RGB(0x42, 0x85, 0xF4), CENTER, "G");
-		break;
-	case 4:   /* Settings: a gear */
+	case APP_SETTINGS:   /* Settings: a gear */
 		circle(cx, cy, 50, RGB(0x5F, 0x63, 0x68));
 		gear(cx, cy, 1, TEXT, RGB(0x5F, 0x63, 0x68));
 		break;
@@ -592,18 +728,18 @@ static void draw_home(void)
 		draw_app_icon(i, cx, cy);
 		int size = 24;
 
-		while (size > 16 && text_width(app_names[i], size) > 190)
+		while (size > 16 && text_width(app_names[i], size) > SPAN - 6)
 			size--;
 		text(cx, a.y + 150, size, focus == i + 1 ? TEXT : TEXT_DIM, CENTER, app_names[i]);
 	}
 }
 
 /* Settings: rows, some under a heading. */
-enum { S_KEYS, S_UPDATES, S_CHECK, S_DIAG, S_DISK, S_PRIO, S_CLEAR, ROWS };
+enum { S_KEYS, S_UPDATES, S_CHECK, S_HIRES, S_DIAG, S_DISK, S_PRIO, S_CLEAR, S_EXPORT, S_IMPORT, S_RESET, ROWS };
 
 /* Where the rows are on the page of the settings, which is taller than the
  * screen: it scrolls so that the row with the focus is seen. */
-static const int settings_top[ROWS] = { 156, 288, 368, 500, 580, 660, 792 };
+static const int settings_top[ROWS] = { 156, 288, 368, 500, 632, 712, 792, 924, 1004, 1084, 1164 };
 static int settings_scroll;
 
 static int row_y(int i)
@@ -647,20 +783,24 @@ static void draw_settings(void)
 	line(64, 88, 82, 70, 5, TEXT);
 	line(64, 88, 82, 106, 5, TEXT);
 	text(104, 100, 36, TEXT, LEFT, "Settings");
-	if (settings_top[focus] + 78 - settings_scroll > SETTINGS_BOTTOM)
+	if (follow_focus && settings_top[focus] + 78 - settings_scroll > SETTINGS_BOTTOM)
 		settings_scroll = settings_top[focus] + 78 - SETTINGS_BOTTOM;
-	if (settings_top[focus] - 40 - settings_scroll < SETTINGS_TOP)
+	if (follow_focus && settings_top[focus] - 40 - settings_scroll < SETTINGS_TOP)
 		settings_scroll = settings_top[focus] - 40 - SETTINGS_TOP > 0 ? settings_top[focus] - 40 - SETTINGS_TOP : 0;
 
 	text(192, row_y(S_KEYS) - 14, 20, ACCENT, LEFT, "Controls");
 	row(S_KEYS, "Keyboard & mouse keys", "What the pad's buttons are in that mode of the + menu");
-	line(1064, 182, 1078, 196, 4, TEXT_DIM);
-	line(1064, 210, 1078, 196, 4, TEXT_DIM);
+	line(1064, row_y(S_KEYS) + 26, 1078, row_y(S_KEYS) + 40, 4, TEXT_DIM);
+	line(1064, row_y(S_KEYS) + 54, 1078, row_y(S_KEYS) + 40, 4, TEXT_DIM);
 
 	text(192, row_y(S_UPDATES) - 14, 20, ACCENT, LEFT, "Updates");
 	row(S_UPDATES, "Check for updates", "When the launcher starts, on github.com/" UPDATE_REPO);
 	switch_widget(1024, row_y(S_UPDATES) + 21, settings.check_updates);
 	row(S_CHECK, "Check now", "Chromium NX " GX_VERSION);
+
+	text(192, row_y(S_HIRES) - 14, 20, ACCENT, LEFT, "Screen");
+	row(S_HIRES, "1080p on a TV", "Sharper in the dock; 720p is faster");
+	switch_widget(1024, row_y(S_HIRES) + 21, settings.hires);
 
 	text(192, row_y(S_DIAG) - 14, 20, ACCENT, LEFT, "Advanced");
 	row(S_DIAG, "Diagnostics", "Profiler and network errors in chromium-nx.log");
@@ -672,6 +812,9 @@ static void draw_settings(void)
 
 	text(192, row_y(S_CLEAR) - 14, 20, ACCENT, LEFT, "Data");
 	row(S_CLEAR, "Clear browsing data", "Cookies, history, cache and logins");
+	row(S_EXPORT, "Export profile", "Browsing data, settings and sites, to " BACKUP_SHOWN);
+	row(S_IMPORT, "Import profile", "What was exported, in place of what there is now");
+	row(S_RESET, "Reset settings", "These settings and the keys as they first were");
 
 	/* The rows that went under the title or the hints are covered. */
 	background_band(0, SETTINGS_TOP);
@@ -740,22 +883,464 @@ static struct spot dialog_spot(int i)
 	return (struct spot){ i ? 650 : 450, 430, 180, 56 };
 }
 
+/* s, cut to fit in width at size, with an ellipsis if it had to be. */
+static const char *fit(const char *s, int size, int width)
+{
+	static char out[300];
+	size_t n = strlen(s);
+
+	snprintf(out, sizeof(out), "%s", s);
+	if (text_width(out, size) <= width)
+		return out;
+	while (n > 1) {
+		/* Not in the middle of a character of UTF-8. */
+		while (n > 1 && ((unsigned char)s[n - 1] & 0xC0) == 0x80)
+			n--;
+		n--;
+		snprintf(out, sizeof(out), "%.*s...", (int)n, s);
+		if (text_width(out, size) <= width)
+			break;
+	}
+	return out;
+}
+
+static const char *size_text(long long bytes)
+{
+	static char s[32];
+
+	if (bytes < 1024)
+		snprintf(s, sizeof(s), "%lld B", bytes);
+	else if (bytes < (1LL << 20))
+		snprintf(s, sizeof(s), "%.0f KB", bytes / 1024.0);
+	else if (bytes < (1LL << 30))
+		snprintf(s, sizeof(s), "%.1f MB", bytes / 1048576.0);
+	else
+		snprintf(s, sizeof(s), "%.2f GB", bytes / 1073741824.0);
+	return s;
+}
+
+static struct spot download_row(int i)
+{
+	return (struct spot){ 150, DOWNLOAD_TOP + (i - download_scroll) * DOWNLOAD_ROW, 980, DOWNLOAD_ROW - 8 };
+}
+
+/* The cross that deletes a download, at the end of its row. */
+static struct spot download_cross(int i)
+{
+	struct spot r = download_row(i);
+
+	if (i < download_scroll || i >= download_scroll + DOWNLOAD_ROWS)
+		return (struct spot){ 0, 0, 0, 0 };
+	return (struct spot){ r.x + r.w - 64, r.y, 64, r.h };
+}
+
+static void draw_downloads(void)
+{
+	line(64, 88, 82, 70, 5, TEXT);
+	line(64, 88, 82, 106, 5, TEXT);
+	text(104, 100, 36, TEXT, LEFT, "Downloads");
+	text(W - 40, 98, 20, TEXT_DIM, RIGHT, "/switch/chromium-nx/Downloads");
+	if (!download_count) {
+		text(W / 2, 360, 26, TEXT_DIM, CENTER, "Nothing downloaded yet");
+		return;
+	}
+	if (follow_focus && focus < download_scroll)
+		download_scroll = focus;
+	if (follow_focus && focus >= download_scroll + DOWNLOAD_ROWS)
+		download_scroll = focus - DOWNLOAD_ROWS + 1;
+	for (int i = download_scroll; i < download_count && i < download_scroll + DOWNLOAD_ROWS; i++) {
+		struct spot r = download_row(i), c = download_cross(i);
+		int cx = c.x + c.w / 2, cy = c.y + c.h / 2;
+
+		if (focus == i)
+			rrect(r.x, r.y, r.w, r.h, 16, SURFACE_HI);
+		text(r.x + 24, r.y + 37, 23, TEXT, LEFT, fit(downloads[i].name, 23, 680));
+		text(c.x - 16, r.y + 37, 20, TEXT_DIM, RIGHT, size_text(downloads[i].size));
+		circle(cx, cy, 18, focus == i ? RGB(0xF2, 0x8B, 0x82) : SURFACE);
+		line(cx - 7, cy - 7, cx + 7, cy + 7, 3.5f, focus == i ? ACCENT_DARK : TEXT_DIM);
+		line(cx - 7, cy + 7, cx + 7, cy - 7, 3.5f, focus == i ? ACCENT_DARK : TEXT_DIM);
+	}
+	if (download_count > DOWNLOAD_ROWS) {
+		char s[48];
+
+		snprintf(s, sizeof(s), "%d files", download_count);
+		text(W / 2, 668, 18, TEXT_DIM, CENTER, s);
+	}
+}
+
+/* ---------- the user's own sites ---------- */
+
+#define MAX_SITES 32
+#define SITES_FILE APP_DIR "/sites.ini"
+#define SITE_ROW 180       /* a row of the grid */
+#define SITE_TOP 130
+#define SITE_ROWS 3        /* rows seen at once */
+#define SITE_COLS 6
+#define SITE_SPAN 170
+#define EDIT_ROW 78
+#define EDIT_TOP 130
+
+enum { E_NAME, E_URL, E_FULL, E_MODE, E_SCREEN, E_SAVE, E_DELETE };
+
+static const char *const mode_names[] = { "Browser", "Keyboard & mouse", "Controller" };
+
+static struct site {
+	char name[64], url[512];
+	int full, mode;   /* full screen; the + menu's Controls (overlay.h) */
+	int portrait;     /* the + menu's Screen */
+} sites[MAX_SITES], editing;
+static int site_count, site_scroll, edit_index, sites_focus;
+
+static void load_sites(void)
+{
+	FILE *f = fopen(SITES_FILE, "r");
+	char line[700];
+
+	site_count = 0;
+	while (f && site_count < MAX_SITES && fgets(line, sizeof(line), f)) {
+		struct site *s = &sites[site_count];
+		char *name = strtok(line, "\t\r\n"), *url = strtok(NULL, "\t\r\n");
+		char *full = strtok(NULL, "\t\r\n"), *mode = strtok(NULL, "\t\r\n");
+		char *portrait = strtok(NULL, "\t\r\n");
+
+		if (!name || !url)
+			continue;
+		snprintf(s->name, sizeof(s->name), "%s", name);
+		snprintf(s->url, sizeof(s->url), "%s", url);
+		s->full = full && atoi(full);
+		s->mode = mode ? atoi(mode) : 0;
+		if (s->mode < 0 || s->mode > 2)
+			s->mode = 0;
+		s->portrait = portrait && atoi(portrait);
+		site_count++;
+	}
+	if (f)
+		fclose(f);
+}
+
+static void save_sites(void)
+{
+	FILE *f = fopen(SITES_FILE, "w");
+
+	for (int i = 0; f && i < site_count; i++)
+		fprintf(f, "%s\t%s\t%d\t%d\t%d\n", sites[i].name, sites[i].url, sites[i].full, sites[i].mode,
+			sites[i].portrait);
+	if (f)
+		fclose(f);
+}
+
+/* What the keyboard gave, without what would break a line of sites.ini. */
+static void clean_copy(char *out, size_t room, const char *in)
+{
+	snprintf(out, room, "%s", in);
+	for (char *p = out; *p; p++)
+		if (*p == '\t' || *p == '\n' || *p == '\r')
+			*p = ' ';
+}
+
+/* The sites as tiles, as the home screen's: "Add a site" first. */
+static struct spot site_tile(int i)
+{
+	int x0 = (W - SITE_COLS * SITE_SPAN) / 2;
+
+	return (struct spot){ x0 + i % SITE_COLS * SITE_SPAN + 10, SITE_TOP + (i / SITE_COLS - site_scroll) * SITE_ROW,
+			      SITE_SPAN - 20, 170 };
+}
+
+static int site_seen(int i)
+{
+	return i / SITE_COLS >= site_scroll && i / SITE_COLS < site_scroll + SITE_ROWS;
+}
+
+/* The first letter of a name, as a capital when it is one of ASCII's. */
+static const char *initial(const char *name)
+{
+	static char out[8];
+	const unsigned char *p = (const unsigned char *)name;
+	int n = *p < 0x80 ? 1 : *p >= 0xF0 ? 4 : *p >= 0xE0 ? 3 : 2;
+
+	snprintf(out, sizeof(out), "%.*s", n, name);
+	if (out[0] >= 'a' && out[0] <= 'z')
+		out[0] -= 32;
+	return out;
+}
+
+static u32 site_color(const char *name)
+{
+	static const u32 colors[] = {
+		RGB(0x1A, 0x73, 0xE8), RGB(0xE3, 0x74, 0x08), RGB(0x18, 0x80, 0x38), RGB(0x8E, 0x44, 0xD8),
+		RGB(0xD9, 0x30, 0x25), RGB(0x00, 0x89, 0x7B), RGB(0xC2, 0x18, 0x5B), RGB(0x5F, 0x63, 0x68),
+	};
+	unsigned h = 0;
+
+	for (; *name; name++)
+		h = h * 31 + (unsigned char)*name;
+	return colors[h % (sizeof(colors) / sizeof(colors[0]))];
+}
+
+static void draw_sites(void)
+{
+	line(64, 88, 82, 70, 5, TEXT);
+	line(64, 88, 82, 106, 5, TEXT);
+	text(104, 100, 36, TEXT, LEFT, "My sites");
+	if (follow_focus && focus / SITE_COLS < site_scroll)
+		site_scroll = focus / SITE_COLS;
+	if (follow_focus && focus / SITE_COLS >= site_scroll + SITE_ROWS)
+		site_scroll = focus / SITE_COLS - SITE_ROWS + 1;
+	for (int i = 0; i <= site_count; i++) {
+		struct spot t = site_tile(i);
+		int cx = t.x + t.w / 2, cy = t.y + 60;
+
+		if (!site_seen(i))
+			continue;
+		if (focus == i)
+			rrect(t.x - 6, t.y - 6, t.w + 12, t.h + 12, 28, SURFACE_HI);
+		if (!i) {
+			circle(cx, cy, 50, SURFACE_HI);
+			circle(cx, cy, 48, SURFACE);
+			line(cx, cy - 20, cx, cy + 20, 6, ACCENT);
+			line(cx - 20, cy, cx + 20, cy, 6, ACCENT);
+			text(cx, t.y + 150, 22, focus == i ? TEXT : TEXT_DIM, CENTER, "Add a site");
+			continue;
+		}
+		const struct site *s = &sites[i - 1];
+
+		circle(cx, cy, 50, site_color(s->name));
+		text(cx, cy + 19, 52, TEXT, CENTER, initial(s->name));
+		text(cx, t.y + 150, 22, focus == i ? TEXT : TEXT_DIM, CENTER, fit(s->name, 22, t.w));
+	}
+	/* What the site with the focus is. */
+	background_band(SETTINGS_BOTTOM - 8, H);
+	if (focus >= 1 && focus <= site_count) {
+		const struct site *s = &sites[focus - 1];
+		char about[700];
+
+		snprintf(about, sizeof(about), "%s%s%s  \xC2\xB7  %s", s->url, s->full ? "  \xC2\xB7  Full screen" : "",
+			 s->portrait ? "  \xC2\xB7  Portrait" : "", mode_names[s->mode]);
+		text(W / 2, 664, 18, TEXT_DIM, CENTER, fit(about, 18, 1100));
+	} else if (!site_count) {
+		text(W / 2, 664, 18, TEXT_DIM, CENTER,
+		     "Your own pages, each opened full screen or not, with the controls you choose");
+	} else if (!focus) {
+		text(W / 2, 664, 18, TEXT_DIM, CENTER, "X, or a finger held on a site, to edit it");
+	}
+}
+
+static int edit_rows(void)
+{
+	return edit_index >= 0 ? E_DELETE + 1 : E_SAVE + 1;
+}
+
+static struct spot edit_row(int i)
+{
+	return (struct spot){ 160, EDIT_TOP + i * EDIT_ROW, 960, EDIT_ROW - 8 };
+}
+
+static void draw_site_edit(void)
+{
+	line(64, 88, 82, 70, 5, TEXT);
+	line(64, 88, 82, 106, 5, TEXT);
+	text(104, 100, 36, TEXT, LEFT, edit_index >= 0 ? "Edit a site" : "Add a site");
+	for (int i = 0; i < edit_rows(); i++) {
+		struct spot r = edit_row(i);
+		static const char *const titles[] = { "Name", "Address", "Full screen", "Controls", "Screen", "Save",
+						      "Delete" };
+
+		if (focus == i)
+			rrect(r.x, r.y, r.w, r.h, 18, i == E_SAVE ? ACCENT : SURFACE_HI);
+		else if (i == E_SAVE)
+			rrect(r.x, r.y, r.w, r.h, 18, SURFACE);
+		if (i >= E_SAVE) {
+			text(r.x + r.w / 2, r.y + 45, 26, i == E_DELETE ? RGB(0xF2, 0x8B, 0x82) :
+							  focus == i ? ACCENT_DARK : TEXT, CENTER, titles[i]);
+			continue;
+		}
+		text(r.x + 32, r.y + 45, 26, TEXT, LEFT, titles[i]);
+		switch (i) {
+		case E_NAME:
+			text(r.x + r.w - 32, r.y + 45, 22, editing.name[0] ? TEXT : TEXT_DIM, RIGHT,
+			     editing.name[0] ? fit(editing.name, 22, 600) : "A to type it");
+			break;
+		case E_URL:
+			text(r.x + r.w - 32, r.y + 45, 22, editing.url[0] ? TEXT : TEXT_DIM, RIGHT,
+			     editing.url[0] ? fit(editing.url, 22, 640) : "A to type it");
+			break;
+		case E_FULL:
+			switch_widget(r.x + r.w - 96, r.y + 17, editing.full);
+			break;
+		case E_MODE: {
+			char s[48];
+
+			snprintf(s, sizeof(s), "< %s >", mode_names[editing.mode]);
+			text(r.x + r.w - 32, r.y + 45, 22, ACCENT, RIGHT, s);
+			break;
+		}
+		case E_SCREEN:
+			text(r.x + r.w - 32, r.y + 45, 22, ACCENT, RIGHT,
+			     editing.portrait ? "< Portrait >" : "< Landscape >");
+			break;
+		}
+	}
+}
+
+/* ---------- help ---------- */
+
+static const struct {
+	int heading;
+	const char *a, *b;
+} help_lines[] = {
+	{ 1, "Faster when overclocked", NULL },
+	{ 0, "", "Pages load and scroll better with the CPU overclocked (sys-clk)" },
+	{ 1, "In the browser", NULL },
+	{ 0, "Touch", "Tap, drag to scroll, two fingers to zoom" },
+	{ 0, "Right edge", "A finger there drags the scroll bar" },
+	{ 0, "Left stick", "A mouse pointer: A clicks where it is" },
+	{ 0, "Right stick", "Scrolls the page" },
+	{ 0, "D-pad", "Moves from link to link" },
+	{ 0, "A", "Opens the link, or the keyboard on a text field" },
+	{ 0, "B / X", "Back / reload" },
+	{ 0, "Y", "The keyboard, to type an address" },
+	{ 0, "L / R", "Backspace / Enter" },
+	{ 0, "+", "The menu" },
+	{ 1, "The + menu", NULL },
+	{ 0, "Full screen", "Hides the tabs and the address bar" },
+	{ 0, "Screen", "Portrait: hold the console turned, its left side up" },
+	{ 0, "Controls", "Browser, Keyboard & mouse or Controller (below)" },
+	{ 0, "Keyboard", "Types text into the page" },
+	{ 0, "Clipboard", "Copies what is selected, pastes where the text cursor is" },
+	{ 0, "Leave", "Launcher comes back here, Quit closes Chromium NX" },
+	{ 1, "Games", NULL },
+	{ 0, "Keyboard & mouse", "The pad is a keyboard and a mouse; its keys are in Settings" },
+	{ 0, "Controller", "Pages see an Xbox controller: the Switch's B is its A" },
+	{ 0, "", "In that mode, hold + for the menu (a short press is Start)" },
+	{ 1, "Files", NULL },
+	{ 0, "Downloads", "Saved in /switch/chromium-nx/Downloads on the SD card" },
+	{ 0, "Sending a file", "A page's file button shows the SD card's folders" },
+};
+#define HELP_COUNT ((int)(sizeof(help_lines) / sizeof(help_lines[0])))
+static int help_scroll;
+
+static int help_height(void)
+{
+	int h = 0;
+
+	for (int i = 0; i < HELP_COUNT; i++)
+		h += help_lines[i].heading ? (i ? 58 : 40) : 36;
+	return h + 20;
+}
+
+static void draw_help(void)
+{
+	int y = SETTINGS_TOP + 20 - help_scroll;
+
+	for (int i = 0; i < HELP_COUNT; i++) {
+		if (help_lines[i].heading) {
+			y += i ? 58 : 40;
+			text(160, y, 22, ACCENT, LEFT, help_lines[i].a);
+		} else {
+			y += 36;
+			text(180, y, 21, TEXT, LEFT, help_lines[i].a);
+			text(440, y, 20, TEXT_DIM, LEFT, help_lines[i].b);
+		}
+	}
+	background_band(0, SETTINGS_TOP);
+	background_band(SETTINGS_BOTTOM, H);
+	status_bar();
+	line(64, 88, 82, 70, 5, TEXT);
+	line(64, 88, 82, 106, 5, TEXT);
+	text(104, 100, 36, TEXT, LEFT, "Help");
+}
+
+/* ---------- scrolling by touch ---------- */
+
+static int scrolls(void)
+{
+	return !dialog && !picking &&
+	       (screen == SETTINGS || screen == DOWNLOADS || screen == SITES || screen == HELP);
+}
+
+/* How far the screen's list is scrolled, in pixels. */
+static int get_scroll(void)
+{
+	switch (screen) {
+	case SETTINGS:
+		return settings_scroll;
+	case DOWNLOADS:
+		return download_scroll * DOWNLOAD_ROW;
+	case SITES:
+		return site_scroll * SITE_ROW;
+	case HELP:
+		return help_scroll;
+	}
+	return 0;
+}
+
+static int clamp(int v, int max)
+{
+	return v < 0 || max <= 0 ? 0 : v > max ? max : v;
+}
+
+static void set_scroll(int px)
+{
+	follow_focus = 0;
+	switch (screen) {
+	case SETTINGS:
+		settings_scroll = clamp(px, settings_top[ROWS - 1] + 98 - SETTINGS_BOTTOM);
+		break;
+	case DOWNLOADS:
+		download_scroll = clamp((px + DOWNLOAD_ROW / 2) / DOWNLOAD_ROW, download_count - DOWNLOAD_ROWS);
+		break;
+	case SITES:
+		site_scroll = clamp((px + SITE_ROW / 2) / SITE_ROW, (site_count + SITE_COLS) / SITE_COLS - SITE_ROWS);
+		break;
+	case HELP:
+		help_scroll = clamp(px, help_height() - (SETTINGS_BOTTOM - SETTINGS_TOP));
+		break;
+	}
+}
+
 static void draw_dialog(void)
 {
+	char s[300];
+
 	/* Darken what is under it. */
 	for (int y = 0; y < H; y++)
 		for (int x = 0; x < W; x++)
 			blend(x, y, RGB(0, 0, 0), 140);
 	rrect(340, 230, 600, 290, 28, SURFACE);
-	text(W / 2, 300, 32, TEXT, CENTER, "Clear browsing data?");
-	text(W / 2, 350, 22, TEXT_DIM, CENTER, "Cookies, history, cache and logins are deleted.");
-	text(W / 2, 382, 22, TEXT_DIM, CENTER, "This cannot be undone.");
+	if (dialog == DIALOG_DELETE_SITE) {
+		text(W / 2, 300, 32, TEXT, CENTER, "Delete this site?");
+		text(W / 2, 350, 22, TEXT_DIM, CENTER, fit(editing.name, 22, 520));
+		text(W / 2, 382, 22, TEXT_DIM, CENTER, "It goes from My sites.");
+	} else if (dialog == DIALOG_DELETE) {
+		text(W / 2, 300, 32, TEXT, CENTER, "Delete this file?");
+		snprintf(s, sizeof(s), "%s", focus < download_count ? fit(downloads[focus].name, 22, 520) : "");
+		text(W / 2, 350, 22, TEXT_DIM, CENTER, s);
+		text(W / 2, 382, 22, TEXT_DIM, CENTER, "It is deleted from the SD card.");
+	} else if (dialog == DIALOG_IMPORT) {
+		text(W / 2, 300, 32, TEXT, CENTER, "Import the profile?");
+		text(W / 2, 350, 22, TEXT_DIM, CENTER, "Browsing data, settings and sites now here");
+		text(W / 2, 382, 22, TEXT_DIM, CENTER, "are replaced by those of the backup.");
+	} else if (dialog == DIALOG_EXPORT) {
+		text(W / 2, 300, 32, TEXT, CENTER, "Replace the backup?");
+		text(W / 2, 350, 22, TEXT_DIM, CENTER, "There is one already in " BACKUP_SHOWN ".");
+		text(W / 2, 382, 22, TEXT_DIM, CENTER, "It is replaced by what there is now.");
+	} else if (dialog == DIALOG_RESET) {
+		text(W / 2, 300, 32, TEXT, CENTER, "Reset the settings?");
+		text(W / 2, 350, 22, TEXT_DIM, CENTER, "Settings and keys go back to their defaults.");
+		text(W / 2, 382, 22, TEXT_DIM, CENTER, "Browsing data and sites are kept.");
+	} else {
+		text(W / 2, 300, 32, TEXT, CENTER, "Clear browsing data?");
+		text(W / 2, 350, 22, TEXT_DIM, CENTER, "Cookies, history, cache and logins are deleted.");
+		text(W / 2, 382, 22, TEXT_DIM, CENTER, "This cannot be undone.");
+	}
 	for (int i = 0; i < 2; i++) {
 		struct spot b = dialog_spot(i);
 
 		rrect(b.x, b.y, b.w, b.h, 28, dialog_focus == i ? (i ? RGB(0xF2, 0x8B, 0x82) : ACCENT) : SURFACE_HI);
 		text(b.x + b.w / 2, b.y + 37, 24, dialog_focus == i ? ACCENT_DARK : TEXT, CENTER,
-		     i ? "Clear" : "Cancel");
+		     !i ? "Cancel" : dialog == DIALOG_CLEAR ? "Clear" : dialog == DIALOG_IMPORT ? "Import" :
+		     dialog == DIALOG_EXPORT ? "Replace" : dialog == DIALOG_RESET ? "Reset" : "Delete");
 	}
 }
 
@@ -793,7 +1378,7 @@ static struct spot upd_spot(int i)
 
 static void show_image_dialog(void)
 {
-	upd_missing = access(DIR "/" UPDATE_IMAGE, F_OK) != 0;
+	upd_missing = access(APP_DIR "/" UPDATE_IMAGE, F_OK) != 0;
 	upd = UD_IMAGE;
 	upd_focus = 1;
 }
@@ -952,7 +1537,12 @@ static void draw_hints(void)
 	const char *h = dialog ? "A  Select     B  Cancel" :
 			picking ? "A  Choose     B  Cancel" :
 			screen == HOME ? "A  Open     X  Settings     +  Exit" :
-			screen == KEYS ? "A  Change     Y  Reset all     B  Back" : "A  Change     B  Back     +  Exit";
+			screen == KEYS ? "A  Change     Y  Reset all     B  Back" :
+			screen == DOWNLOADS ? (download_count ? "A  Delete     B  Back" : "B  Back") :
+			screen == SITES ? (focus ? "A  Open     X  Edit     B  Back" : "A  Add     B  Back") :
+			screen == SITE_EDIT ? "A  Change     B  Cancel" :
+			screen == HELP ? "B  Back" :
+			"A  Change     B  Back     +  Exit";
 
 	text(W / 2, H - 18, 20, TEXT_DIM, CENTER, h);
 }
@@ -997,9 +1587,181 @@ static void clear_data(void)
 		cleared = 1;
 	if (fs)
 		fsFsDeleteFile(fs, "/switch/chromium-nx/.gx-links");
-	if (!remove(DIR "/profile.ext4"))
+	if (!remove(APP_DIR "/profile.ext4"))
 		cleared = 1;
 	say(cleared ? "Browsing data cleared" : "Nothing to clear");
+}
+
+static void reset_settings(void)
+{
+	memset(&settings, 0, sizeof(settings));
+	settings.async_disk = settings.priorities = settings.hires = settings.check_updates = 1;
+	for (int i = 0; i < GX_INPUTS; i++)
+		settings.keys[i] = gx_inputs[i].default_key;
+	save_settings();
+	say("Settings reset");
+}
+
+/* Export and import: the files copied a piece at a time, a frame's worth
+ * each frame, so that the screen says how far it has come. Each goes to a
+ * file of its own first, which takes its name once it is whole. */
+static const char *const backup_files[] = { "profile.ext4", "settings.ini", "sites.ini" };
+#define BACKUP_FILES 3
+#define COPY_CHUNK (1 << 20)
+
+static struct {
+	int active, importing, file;
+	FILE *in, *out;
+	uint64_t done, total;
+	char *buffer;
+} job;
+
+static void job_path(char *out, size_t room, int to, int file)
+{
+	/* to: where the file goes (1), or where it comes from (0). */
+	int backup = to != job.importing;
+
+	snprintf(out, room, "%s/%s", backup ? BACKUP_DIR : APP_DIR, backup_files[file]);
+}
+
+static long long file_size(const char *path)
+{
+	struct stat st;
+
+	return stat(path, &st) ? -1 : (long long)st.st_size;
+}
+
+static int backup_exists(void)
+{
+	char path[256];
+
+	for (int i = 0; i < BACKUP_FILES; i++) {
+		snprintf(path, sizeof(path), "%s/%s", BACKUP_DIR, backup_files[i]);
+		if (file_size(path) >= 0)
+			return 1;
+	}
+	return 0;
+}
+
+static void job_end(const char *said)
+{
+	char part[300];
+
+	if (job.in)
+		fclose(job.in);
+	if (job.out) {
+		fclose(job.out);
+		job_path(part, sizeof(part) - 8, 1, job.file);
+		strcat(part, ".part");
+		remove(part);
+	}
+	job.in = job.out = NULL;
+	free(job.buffer);
+	job.buffer = NULL;
+	job.active = 0;
+	if (job.importing) {
+		load_settings();
+		load_sites();
+	}
+	say(said);
+}
+
+static void start_job(int importing)
+{
+	char path[300];
+
+	memset(&job, 0, sizeof(job));
+	job.importing = importing;
+	for (int i = 0; i < BACKUP_FILES; i++) {
+		long long n;
+
+		job_path(path, sizeof(path), 0, i);
+		n = file_size(path);
+		if (n > 0)
+			job.total += n;
+	}
+	if (!importing)
+		mkdir(BACKUP_DIR, 0777);
+	job.buffer = malloc(COPY_CHUNK);
+	if (!job.buffer) {
+		say("Not enough memory");
+		return;
+	}
+	job.active = 1;
+}
+
+/* Each frame: a little more of the copy. */
+static void job_step(void)
+{
+	char from[300], to[300], part[310];
+
+	for (int pieces = 0; job.active && pieces < 16; pieces++) {
+		if (job.file >= BACKUP_FILES) {
+			job_end(job.importing ? "Profile imported" : "Profile exported to " BACKUP_SHOWN);
+			return;
+		}
+		job_path(from, sizeof(from), 0, job.file);
+		job_path(to, sizeof(to), 1, job.file);
+		snprintf(part, sizeof(part), "%s.part", to);
+		if (!job.in) {
+			/* What the source has not, the copy has not either: it is
+			 * what was there, in place of what there is. */
+			if (!(job.in = fopen(from, "rb"))) {
+				remove(to);
+				job.file++;
+				continue;
+			}
+			if (!(job.out = fopen(part, "wb"))) {
+				job_end("Cannot write to the SD card");
+				return;
+			}
+		}
+		size_t n = fread(job.buffer, 1, COPY_CHUNK, job.in);
+
+		if (n && fwrite(job.buffer, 1, n, job.out) != n) {
+			job_end("Cannot write to the SD card (is it full?)");
+			return;
+		}
+		job.done += n;
+		if (n < COPY_CHUNK) {
+			int failed = ferror(job.in);
+
+			fclose(job.in);
+			job.in = NULL;
+			if (fclose(job.out) || failed) {
+				job.out = NULL;
+				remove(part);
+				job_end(failed ? "Cannot read a file" : "Cannot write to the SD card");
+				return;
+			}
+			job.out = NULL;
+			remove(to);
+			if (rename(part, to)) {
+				job_end("Cannot write to the SD card");
+				return;
+			}
+			job.file++;
+		}
+	}
+}
+
+static void draw_job(void)
+{
+	char s[120];
+	uint64_t total = job.total ? job.total : 1;
+	int w = (int)(640 * (job.done > total ? total : job.done) / total);
+
+	for (int y = 0; y < H; y++)
+		for (int x = 0; x < W; x++)
+			blend(x, y, RGB(0, 0, 0), 140);
+	rrect(220, 210, 840, 290, 28, SURFACE);
+	text(W / 2, 282, 32, TEXT, CENTER, job.importing ? "Importing the profile" : "Exporting the profile");
+	text(W / 2, 326, 22, TEXT_DIM, CENTER, job.file < BACKUP_FILES ? backup_files[job.file] : "");
+	rrect(320, 360, 640, 16, 8, SURFACE_HI);
+	if (job.done)
+		rrect(320, 360, w < 16 ? 16 : w, 16, 8, ACCENT);
+	snprintf(s, sizeof(s), "%s of %s", megabytes(job.done), megabytes(job.total));
+	text(W / 2, 430, 22, TEXT_DIM, CENTER, s);
 }
 
 static int activate(void)
@@ -1007,9 +1769,96 @@ static int activate(void)
 	char in[512] = "";
 
 	if (dialog) {
-		if (dialog_focus)
+		if (dialog_focus && dialog == DIALOG_DELETE) {
+			delete_download(focus);
+		} else if (dialog_focus && dialog == DIALOG_DELETE_SITE) {
+			memmove(&sites[edit_index], &sites[edit_index + 1], (site_count - edit_index - 1) * sizeof(sites[0]));
+			site_count--;
+			save_sites();
+			screen = SITES;
+			focus = 0;
+			follow_focus = 1;
+			say("Site deleted");
+		} else if (dialog_focus && dialog == DIALOG_IMPORT) {
+			start_job(1);
+		} else if (dialog_focus && dialog == DIALOG_EXPORT) {
+			start_job(0);
+		} else if (dialog_focus && dialog == DIALOG_RESET) {
+			reset_settings();
+		} else if (dialog_focus) {
 			clear_data();
+		}
 		dialog = 0;
+		return NONE;
+	}
+	if (screen == SITES) {
+		if (!focus) {
+			memset(&editing, 0, sizeof(editing));
+			edit_index = -1;
+			sites_focus = 0;
+			screen = SITE_EDIT;
+			focus = E_NAME;
+			return NONE;
+		}
+		snprintf(go_url, sizeof(go_url), "%s", sites[focus - 1].url);
+		go_full = sites[focus - 1].full;
+		go_mode = sites[focus - 1].mode;
+		go_portrait = sites[focus - 1].portrait;
+		go_tv = 0;
+		return GO;
+	}
+	if (screen == SITE_EDIT) {
+		switch (focus) {
+		case E_NAME:
+			if (ask("Name", "The site's name", editing.name, in, sizeof(in)))
+				clean_copy(editing.name, sizeof(editing.name), in);
+			break;
+		case E_URL:
+			if (ask("Address", "https://...", editing.url[0] ? editing.url : NULL, in, sizeof(in))) {
+				char url[600];
+
+				snprintf(url, sizeof(url), "%s%s", strstr(in, "://") ? "" : "https://", in);
+				clean_copy(editing.url, sizeof(editing.url), url);
+			}
+			break;
+		case E_FULL:
+			editing.full = !editing.full;
+			break;
+		case E_MODE:
+			editing.mode = (editing.mode + 1) % 3;
+			break;
+		case E_SCREEN:
+			editing.portrait = !editing.portrait;
+			break;
+		case E_SAVE:
+			if (!editing.name[0] || !editing.url[0]) {
+				say("A site needs a name and an address");
+				break;
+			}
+			if (edit_index < 0 && site_count >= MAX_SITES) {
+				say("There is no room for more sites");
+				break;
+			}
+			if (edit_index < 0)
+				edit_index = site_count++;
+			sites[edit_index] = editing;
+			save_sites();
+			screen = SITES;
+			focus = edit_index + 1;
+			follow_focus = 1;
+			break;
+		case E_DELETE:
+			dialog = DIALOG_DELETE_SITE;
+			dialog_focus = 0;
+			break;
+		}
+		return NONE;
+	}
+	if (screen == DOWNLOADS) {
+		if (focus < download_count) {
+			dialog = DIALOG_DELETE;
+			dialog_focus = 0;
+		}
 		return NONE;
 	}
 	if (picking) {
@@ -1027,27 +1876,44 @@ static int activate(void)
 		return NONE;
 	}
 	if (screen == HOME) {
-		go_tv = focus == 2;
-		switch (focus) {
-		case 0:
+		go_tv = focus == 1 + APP_YOUTUBE;
+		go_full = go_mode = go_portrait = 0;
+		follow_focus = 1;
+		switch (focus - 1) {
+		case -1:
 			if (ask("Search", "Search or type a web address", NULL, in, sizeof(in))) {
 				to_url(in, go_url, sizeof(go_url));
 				return GO;
 			}
 			return NONE;
-		case 1:
+		case APP_CHROMIUM:
 			go_url[0] = 0;
 			return GO;
-		case 2:
+		case APP_YOUTUBE:
 			snprintf(go_url, sizeof(go_url), "https://www.youtube.com/tv");
 			return GO;
-		case 3:
-			snprintf(go_url, sizeof(go_url), "https://www.google.com/");
+		case APP_SITES:
+			load_sites();
+			screen = SITES;
+			focus = 0;
+			site_scroll = 0;
+			return NONE;
+		case APP_HELP:
+			screen = HELP;
+			help_scroll = 0;
+			return NONE;
+		case APP_GITHUB:
+			snprintf(go_url, sizeof(go_url), "https://github.com/" UPDATE_REPO);
 			return GO;
-		case 4:
+		case APP_DOWNLOADS:
+			load_downloads();
+			screen = DOWNLOADS;
+			focus = 0;
+			return NONE;
+		case APP_CHROMIUM_SETTINGS:
 			snprintf(go_url, sizeof(go_url), "chrome://settings/");
 			return GO;
-		case 5:
+		case APP_SETTINGS:
 			screen = SETTINGS;
 			focus = 0;
 			return NONE;
@@ -1065,6 +1931,9 @@ static int activate(void)
 	case S_CHECK:
 		check_now();
 		return NONE;
+	case S_HIRES:
+		settings.hires = !settings.hires;
+		break;
 	case S_DIAG:
 		settings.diagnostics = !settings.diagnostics;
 		break;
@@ -1075,12 +1944,43 @@ static int activate(void)
 		settings.priorities = !settings.priorities;
 		break;
 	case S_CLEAR:
-		dialog = 1;
+		dialog = DIALOG_CLEAR;
+		dialog_focus = 0;
+		return NONE;
+	case S_EXPORT:
+		if (backup_exists()) {
+			dialog = DIALOG_EXPORT;
+			dialog_focus = 0;
+		} else {
+			start_job(0);
+		}
+		return NONE;
+	case S_IMPORT:
+		if (backup_exists()) {
+			dialog = DIALOG_IMPORT;
+			dialog_focus = 0;
+		} else {
+			say("No backup in " BACKUP_SHOWN);
+		}
+		return NONE;
+	case S_RESET:
+		dialog = DIALOG_RESET;
 		dialog_focus = 0;
 		return NONE;
 	}
 	save_settings();
 	return NONE;
+}
+
+/* The site at row i of the list, to the form. */
+static void edit_site(int i)
+{
+	if (i < 1 || i > site_count)
+		return;
+	editing = sites[i - 1];
+	edit_index = i - 1;
+	screen = SITE_EDIT;
+	focus = E_NAME;
 }
 
 static void back(void)
@@ -1092,6 +1992,19 @@ static void back(void)
 	else if (screen == KEYS) {
 		screen = SETTINGS;
 		focus = S_KEYS;
+	} else if (screen == DOWNLOADS) {
+		screen = HOME;
+		focus = 1 + APP_DOWNLOADS;
+	} else if (screen == SITE_EDIT) {
+		screen = SITES;
+		focus = edit_index >= 0 ? edit_index + 1 : 0;
+		follow_focus = 1;
+	} else if (screen == SITES) {
+		screen = HOME;
+		focus = 1 + APP_SITES;
+	} else if (screen == HELP) {
+		screen = HOME;
+		focus = 1 + APP_HELP;
 	} else if (screen == SETTINGS) {
 		screen = HOME;
 		focus = APPS;
@@ -1110,6 +2023,38 @@ static void move(int dx, int dy)
 
 		if (to >= 0 && to < GX_KEY_COUNT && (dy || to / PICK_COLUMNS == pick_focus / PICK_COLUMNS))
 			pick_focus = to;
+		return;
+	}
+	follow_focus = 1;
+	if (screen == HELP) {
+		set_scroll(help_scroll + dy * 72);
+		return;
+	}
+	if (screen == SITES) {
+		int to = focus + dx + dy * SITE_COLS;
+
+		if (to >= 0 && to <= site_count && (dy || to / SITE_COLS == focus / SITE_COLS))
+			focus = to;
+		else if (dy > 0 && focus / SITE_COLS < site_count / SITE_COLS)
+			focus = site_count;   /* the last row, shorter */
+		return;
+	}
+	if (screen == SITE_EDIT) {
+		if (dy)
+			focus = focus + dy < 0 ? 0 : focus + dy >= edit_rows() ? edit_rows() - 1 : focus + dy;
+		else if (dx && focus == E_MODE)
+			editing.mode = (editing.mode + 3 + dx) % 3;
+		else if (dx && focus == E_FULL)
+			editing.full = dx > 0;
+		else if (dx && focus == E_SCREEN)
+			editing.portrait = !editing.portrait;
+		return;
+	}
+	if (screen == DOWNLOADS) {
+		if (dy)
+			focus = focus + dy < 0 ? 0 : focus + dy >= download_count ? download_count - 1 : focus + dy;
+		if (focus < 0)
+			focus = 0;
 		return;
 	}
 	if (screen == KEYS) {
@@ -1153,6 +2098,50 @@ static int tap(int x, int y)
 			picking = 0;
 		return NONE;
 	}
+	if (screen == HELP) {
+		if (x < 140 && y < 150)
+			back();
+		return NONE;
+	}
+	if (screen == SITES) {
+		if (x < 140 && y < 150) {
+			back();
+			return NONE;
+		}
+		for (int i = 0; i <= site_count && y < SETTINGS_BOTTOM - 8; i++) {
+			if (!site_seen(i))
+				continue;
+			if (inside(site_tile(i), x, y)) {
+				focus = i;
+				return activate();
+			}
+		}
+		return NONE;
+	}
+	if (screen == SITE_EDIT) {
+		if (x < 140 && y < 150) {
+			back();
+			return NONE;
+		}
+		for (int i = 0; i < edit_rows(); i++)
+			if (inside(edit_row(i), x, y)) {
+				focus = i;
+				return activate();
+			}
+		return NONE;
+	}
+	if (screen == DOWNLOADS) {
+		if (x < 140 && y < 150) {
+			back();
+			return NONE;
+		}
+		for (int i = 0; i < download_count; i++)
+			if (inside(download_cross(i), x, y)) {
+				focus = i;
+				return activate();
+			}
+		return NONE;
+	}
 	if (screen == KEYS) {
 		if (x < 140 && y < 150) {
 			back();
@@ -1192,28 +2181,33 @@ int launcher_main(int argc, char **argv)
 	Framebuffer fb;
 	PadState pad;
 	PlFontData font;
-	int touching = 0, result = NONE;
+	int touching = 0, result = NONE, touch_x0 = 0, touch_y0 = 0, dragged = 0, scroll0 = 0, deferred = 0;
+	int held = 0;   /* the finger was held long enough to do what that does */
+	u64 touch_t0 = 0;
 	FILE *old;
 
 	/* Left by an older version, when the browser was a program of its own
 	 * and its command line a file the build wrote (not DEV=1's menu). */
-	remove(DIR "/gx.nro");
-	if ((old = fopen(DIR "/programs.txt", "r"))) {
+	remove(APP_DIR "/gx.nro");
+	if ((old = fopen(APP_DIR "/programs.txt", "r"))) {
 		char first[32] = "";
 		int built = fgets(first, sizeof(first), old) && !strncmp(first, "[Chromium NX]", 13);
 
 		fclose(old);
 		if (built)
-			remove(DIR "/programs.txt");
+			remove(APP_DIR "/programs.txt");
 	}
 	/* A launch asked for and not carried out (a test writes one): it is. */
-	if (!access(DIR "/launch.txt", F_OK) && !start_browser())
+	if (!access(APP_DIR "/launch.txt", F_OK) && !start_browser())
 		return 0;
 
 	plInitialize(PlServiceType_User);
 	psmInitialize();
-	padConfigureInput(1, HidNpadStyleSet_NpadStandard);
-	padInitializeDefault(&pad);
+	/* Any number of players, so that Joy-Con taken off, put back or paired
+	 * while we run are let in (with one, only the HOME menu takes them);
+	 * all of them read as one pad. */
+	padConfigureInput(8, HidNpadStyleSet_NpadStandard);
+	padInitializeAny(&pad);
 	hidInitializeTouchScreen();
 	load_settings();
 
@@ -1228,7 +2222,7 @@ int launcher_main(int argc, char **argv)
 	framebufferMakeLinear(&fb);
 	if (settings.check_updates)
 		update_check();
-	else if (access(DIR "/" UPDATE_IMAGE, F_OK))
+	else if (access(APP_DIR "/" UPDATE_IMAGE, F_OK))
 		show_image_dialog();
 
 	while (appletMainLoop()) {
@@ -1237,6 +2231,11 @@ int launcher_main(int argc, char **argv)
 
 		padUpdate(&pad);
 		down = padGetButtonsDown(&pad);
+		if (job.active) {
+			/* An export or import has the pad and the screen. */
+			job_step();
+			down = 0;
+		}
 		if (update_tick()) {
 			/* The new program, in this one's place. */
 			envSetNextLoad(SELF, SELF);
@@ -1281,21 +2280,56 @@ int launcher_main(int argc, char **argv)
 			save_settings();
 			say("Keys reset");
 		}
+		if ((down & HidNpadButton_X) && screen == SITES && !dialog)
+			edit_site(focus);
 		if ((down & HidNpadButton_X) && screen == HOME && !dialog) {
 			screen = SETTINGS;
 			focus = 0;
 		}
 		if (down & HidNpadButton_A)
 			result = activate();
-		if (!upd && hidGetTouchScreenStates(&touch, 1) && touch.count > 0) {
-			if (!touching)
-				result = tap(touch.touches[0].x, touch.touches[0].y);
-			touching = 1;
+		/* A finger: on a list that scrolls, a tap is a finger lifted where
+		 * it went down, and one that moved scrolls the list; elsewhere, a
+		 * tap is a finger put down. */
+		if (job.active) {
+			touching = 0;
+		} else if (!upd && hidGetTouchScreenStates(&touch, 1) && touch.count > 0) {
+			int x = touch.touches[0].x, y = touch.touches[0].y;
+
+			if (!touching) {
+				touching = 1;
+				touch_x0 = x;
+				touch_y0 = y;
+				dragged = 0;
+				held = 0;
+				touch_t0 = armGetSystemTick();
+				scroll0 = get_scroll();
+				deferred = scrolls();
+				if (!deferred)
+					result = tap(x, y);
+			} else if (deferred) {
+				if (abs(y - touch_y0) > 12 || abs(x - touch_x0) > 12)
+					dragged = 1;
+				if (dragged)
+					set_scroll(scroll0 - (y - touch_y0));
+				/* Held on a site without moving: its form. */
+				if (!dragged && !held && screen == SITES &&
+				    armTicksToNs(armGetSystemTick() - touch_t0) > 500000000ULL) {
+					held = 1;
+					for (int i = 1; i <= site_count && touch_y0 < SETTINGS_BOTTOM - 8; i++)
+						if (site_seen(i) && inside(site_tile(i), touch_x0, touch_y0)) {
+							focus = i;
+							edit_site(i);
+						}
+				}
+			}
 		} else if (!upd) {
+			if (touching && deferred && !dragged && !held)
+				result = tap(touch_x0, touch_y0);
 			touching = 0;
 		}
 		/* No browser without its image: what to do about it instead. */
-		if (result == GO && access(DIR "/" UPDATE_IMAGE, F_OK)) {
+		if (result == GO && access(APP_DIR "/" UPDATE_IMAGE, F_OK)) {
 			show_image_dialog();
 			result = NONE;
 		}
@@ -1317,6 +2351,14 @@ int launcher_main(int argc, char **argv)
 			draw_home();
 		else if (screen == KEYS)
 			draw_keys();
+		else if (screen == DOWNLOADS)
+			draw_downloads();
+		else if (screen == SITES)
+			draw_sites();
+		else if (screen == SITE_EDIT)
+			draw_site_edit();
+		else if (screen == HELP)
+			draw_help();
 		else
 			draw_settings();
 		if (picking)
@@ -1326,6 +2368,8 @@ int launcher_main(int argc, char **argv)
 			draw_dialog();
 		if (upd)
 			draw_update();
+		if (job.active)
+			draw_job();
 		draw_toast();
 		framebufferEnd(&fb);
 	}

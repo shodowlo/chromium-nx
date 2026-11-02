@@ -891,16 +891,43 @@ static void discard_shared(struct shared *s)
 	memset(s, 0, sizeof(*s));
 }
 
+/* What the kernel has free (not counting what it could drop of its caches). */
+static uint64_t kernel_free(void)
+{
+	struct lkl_sysinfo info;
+	long params[6] = { (long)&info };
+
+	if (lkl_syscall(__lkl__NR_sysinfo, params))
+		return ~0ULL;
+	return (uint64_t)info.freeram * (info.mem_unit ? info.mem_unit : 1);
+}
+
+#define KERNEL_RESERVE (64UL << 20)
+
 /* The files without a view are too many: the dead go, then the oldest in the
- * table until half are left. */
+ * table until half are left. A small file of the memory filesystem that was
+ * written stays a copy of ours, though, while the kernel is short: given
+ * back, its contents would be the kernel's, every page of it (the memory
+ * filesystem drops none), and a page that loads many at once (GitHub's) had
+ * half of them given back together, which filled the kernel's 188 MB in three
+ * seconds; it panicked. Our memory has room. Not so the host's shared memory
+ * objects, which large files take one each: those go back all the same, and
+ * so does everything once four times as many are kept. */
 static void collect_shared(void)
 {
 	for (int i = 0; i < MAX_SHARED; i++)
 		if (shared[i].kept && is_dead(&shared[i]))
 			discard_shared(&shared[i]);
-	for (int i = 0; i < MAX_SHARED && kept_count > KEEP_MAX / 2; i++)
-		if (shared[i].kept)
-			close_shared(&shared[i]);
+	for (int i = 0; i < MAX_SHARED && kept_count > KEEP_MAX / 2; i++) {
+		struct shared *s = &shared[i];
+
+		if (!s->kept)
+			continue;
+		if (s->written && s->chunk && s->chunk->pooled && kept_count < KEEP_MAX * 4 &&
+		    kernel_free() < s->size + KERNEL_RESERVE && gmem_in_memory_fs(s->fd))
+			continue;
+		close_shared(s);
+	}
 }
 
 /* The last view of a shared file is gone. The copy stays for a while: shared
