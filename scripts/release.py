@@ -46,8 +46,11 @@ def main():
     p.add_argument('--dry-run', action='store_true')
     p.add_argument('--local')
     p.add_argument('--notes', default='', help='what is new, for the release page')
+    p.add_argument('--notes-file', help='the same, from a file (Markdown)')
     p.add_argument('--zip', action='store_true')
     a = p.parse_args()
+    if a.notes_file:   # read now: it may be in OUT, which is made again below
+        a.notes = open(a.notes_file, encoding='utf-8').read()
 
     v = version()
     tag = 'v' + v
@@ -98,8 +101,12 @@ def main():
         'Copy chromium-nx.nro to /switch/chromium-nx/ on the SD card: the launcher downloads '
         'Chromium\'s image (chromium-full.ext4) the first time.\n\n'
         'Already installed: the launcher offers the update itself.')
-    subprocess.run(['gh', 'release', 'create', tag, '--title', 'Chromium NX ' + v, '--notes', notes]
-                   + assets, check=True)
+    # Through a file: a long text of several lines on the command line is
+    # lost on the way to gh on Windows.
+    notes_path = os.path.join(OUT, 'notes.md')
+    open(notes_path, 'w', encoding='utf-8', newline='\n').write(notes)
+    subprocess.run(['gh', 'release', 'create', tag, '--title', 'Chromium NX ' + v,
+                    '--notes-file', notes_path] + assets, check=True)
 
 
 if __name__ == '__main__':
