@@ -1,3 +1,5 @@
+<img src="https://github.com/shodowlo/chromium-nx/blob/main/assets/chromium-nx-banner.png?raw=true" alt="NX Torrent Player" width="640">
+
 # Chromium NX
 
 **The Chromium web browser as a homebrew app Nintendo Switch.**
