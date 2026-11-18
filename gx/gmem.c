@@ -211,6 +211,9 @@ static void count_committed(int64_t pages, uint64_t last_page)
 /* Where the time of mapping files goes: reading them, and patching their
  * code. */
 static uint64_t file_read_ns, file_read_bytes, patch_ns;
+#ifdef __SWITCH2__
+static uint64_t counter_reads_patched;   /* cntvct_el0 made cntpct_el0 (patch_syscalls()) */
+#endif
 
 /* Where the committed memory is, when there is a lot of it: the largest runs
  * of committed pages and the 4 GB pieces of the arena they are in (each of
@@ -274,6 +277,10 @@ void gmem_report(void)
 		host_log("gx: mapped files: %lu MB read in %lu ms, %lu ms patching code\n",
 			 (unsigned long)(file_read_bytes >> 20), (unsigned long)(file_read_ns / 1000000),
 			 (unsigned long)(patch_ns / 1000000));
+#ifdef __SWITCH2__
+	host_log("gx: reads of the virtual counter made reads of the physical one: %lu\n",
+		 (unsigned long)counter_reads_patched);
+#endif
 	host_log("gx: guest memory: %lu MB committed at most, %lu MB at exit, %lu MB of addresses, "
 		 "%d pieces of shared memory at most\n",
 		 (unsigned long)(committed_peak >> 8), (unsigned long)(committed_pages >> 8),
@@ -608,6 +615,58 @@ static struct image *adopt_image(uint64_t addr, uint64_t len)
 	return NULL;
 }
 
+/*
+ * Fixes to programs, for a host without shared memory (the Switch 2), where
+ * every mapping of a shared file is at the same address (map_shared()). Each
+ * is a word at an offset of a file, changed only if it and the words around
+ * it are what this build of the program has there.
+ *
+ * Chromium's base::SharedMemoryTracker counts mappings by address: the second
+ * mapping of a region found its address already counted, and the second
+ * unmapping found it gone and stopped the browser (CHECK(it !=
+ * usages_.end()) in DecrementMemoryUsage, a brk). The brk becomes a branch to
+ * the function's own way out, which unlocks its mutex: an unmapping it does
+ * not know of is let go. Debian's chromium 156.0.8078.73-1~deb12u1, arm64.
+ */
+static const struct program_fix {
+	const char *path;
+	uint64_t offset;          /* in the file */
+	uint32_t before[8];       /* the words up to it, the last being it */
+	uint32_t word;            /* what it becomes */
+} program_fixes[] = {
+	{ "/usr/lib/chromium/chromium", 0x94ac238,
+	  { 0x91002260u /* add x0, x19, #0x8 */, 0xa9424ff4u, 0xf9400bf5u, 0xa8c37bfdu,
+	    0xd50323bfu /* autiasp */, 0x14000000u /* b ... (any) */, 0xd4200020u /* brk #1 */,
+	    0xd4200000u /* brk #0 */ },
+	  0x17fffff9u /* b -0x1c: to the add x0, x19, #0x8 */ },
+};
+
+static void fix_program(const char *path, uint64_t addr, uint64_t off, uint64_t len)
+{
+	for (size_t i = 0; i < sizeof(program_fixes) / sizeof(program_fixes[0]); i++) {
+		const struct program_fix *f = &program_fixes[i];
+		uint32_t *site;
+		int same = 1;
+
+		if (strcmp(path, f->path) || f->offset < off + 7 * 4 || f->offset + 4 > off + len)
+			continue;
+		site = (uint32_t *)(addr + (f->offset - off));
+		for (int k = 0; k < 8; k++) {
+			uint32_t w = site[k - 7];
+
+			/* The tail call's offset is the program's own. */
+			if (k == 5 ? (w & 0xFC000000u) != 0x14000000u : w != f->before[k])
+				same = 0;
+		}
+		if (!same) {
+			host_log("gx: %s is not the build its fix %zu is for; left as it is\n", path, i);
+			continue;
+		}
+		*site = f->word;
+		host_log("gx: %s fixed at %#lx (fix %zu)\n", path, (unsigned long)f->offset, i);
+	}
+}
+
 /* Replaces each svc #0 in [addr, addr+len) by a branch to a veneer. The pool
  * is not executable while veneers are added to it: that is safe as long as an
  * image is mapped entirely before any of it runs, which is what ld.so does. */
@@ -622,6 +681,18 @@ static int patch_syscalls(uint64_t addr, uint64_t len)
 		uint32_t *v;
 		int64_t to_veneer, back;
 
+#ifdef __SWITCH2__
+		/* mrs xN, cntvct_el0, which Horizon traps, becomes mrs xN,
+		 * cntpct_el0, which it lets programs read: the two count the
+		 * same. On the Switch 1 the trap is emulated (nx/exception.S);
+		 * on the Switch 2 no fault reaches gx, and the first read
+		 * ended the process (Chromium reads it for its clocks). */
+		if ((code[k] & 0xFFFFFFE0u) == 0xD53BE040u) {
+			code[k] = 0xD53BE020u | (code[k] & 31);
+			counter_reads_patched++;
+			continue;
+		}
+#endif
 		if (code[k] != SVC0)
 			continue;
 		if (!img)
@@ -1237,6 +1308,8 @@ static long do_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd, ui
 			release(addr, size);
 			return -GX_ENOMEM;
 		}
+		if (n > 0)
+			fix_program(path, addr, off, len);
 		patch_ns += host_now_ns() - t0;
 		host_flush_icache((void *)addr, size);
 	}

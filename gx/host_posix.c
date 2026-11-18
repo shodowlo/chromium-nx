@@ -127,7 +127,13 @@ size_t host_shared_chunk(void)
 
 int host_shared_new(size_t len)
 {
-	int fd = memfd_create("gx-shared", MFD_CLOEXEC);
+	int fd;
+
+	/* GX_NO_SHARED=1: none, as on the Switch 2, where the process may not
+	 * create shared memory (gmem.c then keeps one copy of a shared file). */
+	if (getenv("GX_NO_SHARED"))
+		return -1;
+	fd = memfd_create("gx-shared", MFD_CLOEXEC);
 
 	if (fd >= 0 && ftruncate(fd, len)) {
 		close(fd);
@@ -609,6 +615,13 @@ static void *audio_symbol(const char *name)
 		if (!strcmp(name, ours[i].name))
 			return ours[i].fn;
 	return NULL;
+}
+
+/* The tracing of host calls (tramp.S) is the Switch's (host_nx.c): never on here. */
+volatile int gx_hostcall_tracing;
+void gx_hostcall_trace(void *fn)
+{
+	(void)fn;
 }
 
 void *host_symbol(const char *name)

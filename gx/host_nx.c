@@ -41,6 +41,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <switch.h>
+#include <sys/iosupport.h>
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
 #include <png.h>
@@ -65,6 +66,18 @@
  * (-w) and the debugging pipe (-b), drawing with the GPU, V8 with its
  * compilers. build-nx.sh writes the same line, with the flags of its build of
  * the image, in programs.txt. */
+/* V8's. On the Switch 2, no compiled code at all (--jitless, the
+ * interpreter): its code memory is writable and executable by turns, each
+ * turn a fault that gx handles (gmem_fault()), and there a fault never
+ * reaches the program. Homebrew there runs in a game's process on the stock
+ * kernel, which kills the process instead (seen: a read of an unmapped page
+ * on purpose ended it; on the Switch 1, Atmosphere enables user exception
+ * handlers). */
+#ifdef __SWITCH2__
+#define JS_FLAGS "--js-flags=--jitless "
+#else
+#define JS_FLAGS "--js-flags=--no-sparkplug "
+#endif
 #define DEFAULT_COMMAND \
 	"-w -b -c3 @chromium-full.ext4 =profile.ext4 -A225,46,1150,80 /usr/lib/chromium/chromium " \
 	"--no-sandbox --single-process --no-zygote --ozone-platform=wayland --user-data-dir=/root/profile " \
@@ -80,7 +93,7 @@
 	   leaves fullscreen after 1.5 s. */ \
 	"--disable-gl-extensions=GL_EXT_disjoint_timer_query,GL_EXT_disjoint_timer_query_webgl2," \
 	"GL_ARB_timer_query,GL_EXT_timer_query " \
-	"--js-flags=--no-sparkplug " \
+	JS_FLAGS \
 	"--use-gl=angle --use-angle=gles-egl --ignore-gpu-blocklist --disable-gpu-sandbox --in-process-gpu " \
 	"https://www.google.com/"
 /* The kernel's memory holds every file that is not on the root image (its
@@ -119,9 +132,18 @@ extern int lkl_blk_sync;   /* gx/lkl/virtio_blk.c */
 #define HEAP_KEPT_SMALL (48UL << 20)
 #define POOL_WORTH_IT (192UL << 20)
 #define POOL_MAX ((2048UL - 16) << 20)   /* see host_reserve() */
-/* Host functions called for the guest (the GL driver) run on these too. */
+/* Host functions called for the guest (the GL driver) run on these too. On
+ * the Switch 2 the driver is Zink over NVK, whose shader compiler (NIR, NAK)
+ * wants much more than Mesa for the Switch did, and an overflow there is a
+ * fault, which ends the process without a word (see JS_FLAGS): 8 MB, as on
+ * Linux. */
+#ifdef __SWITCH2__
+#define MAIN_STACK (8UL << 20)
+#define THREAD_STACK (8UL << 20)
+#else
 #define MAIN_STACK (4UL << 20)
 #define THREAD_STACK (1UL << 20)
+#endif
 /* The only priority Horizon time-slices: guest threads may spin. */
 #define GUEST_PRIO 0x3B
 
@@ -160,7 +182,7 @@ static void console_off(void)
 	mutexUnlock(&screen_lock);
 }
 
-static void console_back(void)
+static __attribute__((unused)) void console_back(void)
 {
 	if (!mutexTryLock(&screen_lock))
 		return;
@@ -227,6 +249,14 @@ void host_console_write(int fd, const void *buf, size_t len)
 	print_stage = 0;
 	mutexUnlock(&print_lock);
 }
+
+#ifdef __SWITCH2__
+static ssize_t stderr_to_log(struct _reent *r, void *fd, const char *ptr, size_t len)
+{
+	host_console_write(2, ptr, len);
+	return len;
+}
+#endif
 
 static void sync_log(void)
 {
@@ -318,6 +348,92 @@ static int set_page(size_t p, uint32_t src, uint8_t flags)
 static uint8_t *pool, *pool_used;
 static size_t pool_pages, pool_hint, pool_free;
 static Handle self;
+
+/*
+ * The code mapping syscalls. On the Switch 2, homebrew runs in a game's
+ * process, whose policy has none of them (kaiHEN's JIT.md): kaiHEN's RO,
+ * which holds this process's handle, makes them for us, through the gx
+ * commands of its ldr:ro session (65100 on, in a build of kaiHEN's RO that
+ * has them: github.com/ouncebrew/kaihen, branch gx-memory). The session is
+ * the one hbloader hands every NRO, as its "ldr:ro" service override.
+ */
+#ifdef __SWITCH2__
+enum {
+	RO_GX_GET_VERSION = 65100,
+	RO_GX_MAP_CODE = 65101,
+	RO_GX_UNMAP_CODE = 65102,
+	RO_GX_SET_PERMISSION = 65103,
+};
+static Service ro;
+
+static int ro_open(void)
+{
+	Handle session = smGetServiceOverride(smEncodeName("ldr:ro"));
+	u64 version = 0;
+	Result rc;
+
+	if (session == INVALID_HANDLE) {
+		host_log("gx: no ldr:ro session from the Homebrew loader: start Chromium NX from hbmenu\n");
+		return -1;
+	}
+	serviceCreate(&ro, session);
+	ro.own_handle = 0;   /* hbloader's: never closed here */
+	{
+		const u64 pid_placeholder = 0;
+
+		rc = serviceDispatchInOut(&ro, RO_GX_GET_VERSION, pid_placeholder, version,
+					  .in_send_pid = true);
+	}
+	if (R_FAILED(rc)) {
+		host_log("gx: kaiHEN's RO cannot map memory for gx (%#x): it needs the RO of the "
+			 "gx-memory branch of kaiHEN in sdmc:/kaihen/bin/ro/exefs.nsp\n", rc);
+		return -1;
+	}
+	host_log("gx: memory mapped by kaiHEN's RO (gx commands version %lu)\n", (unsigned long)version);
+	return 0;
+}
+
+static Result ro_call3(u32 cmd, u64 a, u64 b, u64 c)
+{
+	const struct {
+		u64 pid_placeholder, a, b, c;
+	} in = { 0, a, b, c };
+
+	return serviceDispatchIn(&ro, cmd, in, .in_send_pid = true);
+}
+
+static Result code_map(u64 dst, u64 src, u64 len)
+{
+	return ro_call3(RO_GX_MAP_CODE, dst, src, len);
+}
+
+static Result code_unmap(u64 dst, u64 src, u64 len)
+{
+	return ro_call3(RO_GX_UNMAP_CODE, dst, src, len);
+}
+
+static Result code_permission(u64 addr, u64 len, u32 perm)
+{
+	return ro_call3(RO_GX_SET_PERMISSION, addr, len, perm);
+}
+#else
+static int ro_open(void) { return 0; }
+
+static Result code_map(u64 dst, u64 src, u64 len)
+{
+	return svcMapProcessCodeMemory(self, dst, src, len);
+}
+
+static Result code_unmap(u64 dst, u64 src, u64 len)
+{
+	return svcUnmapProcessCodeMemory(self, dst, src, len);
+}
+
+static Result code_permission(u64 addr, u64 len, u32 perm)
+{
+	return svcSetProcessMemoryPermission(self, addr, len, perm);
+}
+#endif
 
 /*
  * Where the arena goes. The address space of the process is 512 GB with a
@@ -428,6 +544,11 @@ static void choose_window(u64 len)
 	host_log("gx: %lu GB of addresses free in %d runs, between %#lx and %#lx\n",
 		 (unsigned long)(total >> 30), span_count, (unsigned long)window_start,
 		 (unsigned long)window_end);
+	/* Each: a guest wants some large ones in one piece (Chromium's heaps,
+	 * 16 to 32 GB, aligned). */
+	for (int i = 0; i < span_count; i++)
+		host_log("gx:   run %d: %#lx, %lu MB\n", i, (unsigned long)spans[i].start,
+			 (unsigned long)((spans[i].end - spans[i].start) >> 20));
 }
 
 /* The holes are what lies between the free runs of the window. */
@@ -445,6 +566,8 @@ void *host_reserve(size_t *len)
 	size_t size = 0, kept = HEAP_KEPT;
 	void *addr;
 
+	if (ro_open())
+		return NULL;
 	find_spans();
 	choose_window(*len);
 	if (!span_count)
@@ -482,7 +605,11 @@ void *host_reserve(size_t *len)
 			size += 16UL << 20;   /* the loop went one step past it */
 	}
 	if (!leaves || !pool) {
-		host_log("gx: not enough memory for the guest\n");
+		extern char *fake_heap_start, *fake_heap_end;
+
+		host_log("gx: not enough memory for the guest (heap %lu MB at %p, %lu MB of it in use)\n",
+			 (unsigned long)((fake_heap_end - fake_heap_start) >> 20), fake_heap_start,
+			 (unsigned long)(mallinfo().uordblks >> 20));
 		return NULL;
 	}
 	pool_pages = pool_free = size / GX_PAGE;
@@ -595,7 +722,7 @@ static int unmap_pages(size_t p, size_t n)
 			continue;
 		}
 		run = run_of(p, n);
-		rc = svcUnmapProcessCodeMemory(self, (u64)(arena + p * GX_PAGE),
+		rc = code_unmap((u64)(arena + p * GX_PAGE),
 					       (u64)(pool + (u64)src_at(p) * GX_PAGE),
 					       run * GX_PAGE);
 		if (R_FAILED(rc)) {
@@ -629,7 +756,7 @@ static int set_protection(size_t p, size_t n, int prot)
 		if ((flags_at(p) & PG_PERM) == code) {
 			rc = 0;
 		} else if (!(flags_at(p) & PG_DATA)) {
-			rc = svcSetProcessMemoryPermission(self, addr, len, perm);
+			rc = code_permission(addr, len, perm);
 			if (R_SUCCEEDED(rc))
 				set_flags(p, run, PG_MAPPED | (write ? PG_DATA : 0) | code);
 		} else if (!exec) {
@@ -647,12 +774,12 @@ static int set_protection(size_t p, size_t n, int prot)
 			 * mapped and executable). */
 			if (exec)
 				armDCacheFlush((void *)addr, len);
-			rc = svcUnmapProcessCodeMemory(self, addr, src, len);
+			rc = code_unmap(addr, src, len);
 			if (R_SUCCEEDED(rc))
-				rc = svcMapProcessCodeMemory(self, addr, src, len);
+				rc = code_map(addr, src, len);
 			if (R_SUCCEEDED(rc)) {
 				set_flags(p, run, PG_MAPPED | P_FRESH);
-				rc = svcSetProcessMemoryPermission(self, addr, len, perm);
+				rc = code_permission(addr, len, perm);
 			}
 			if (R_SUCCEEDED(rc)) {
 				set_flags(p, run, PG_MAPPED | code);
@@ -704,7 +831,7 @@ int host_commit(void *addr, size_t len, int prot)
 
 		/* The pool is ordinary memory until it is mapped: zero it here. */
 		memset(pool + src * GX_PAGE, 0, run * GX_PAGE);
-		rc = svcMapProcessCodeMemory(self, (u64)addr + done * GX_PAGE,
+		rc = code_map((u64)addr + done * GX_PAGE,
 					     (u64)(pool + src * GX_PAGE), run * GX_PAGE);
 		if (R_FAILED(rc)) {
 			MemoryInfo si = { 0 }, di = { 0 };
@@ -852,7 +979,15 @@ void host_shared_free(int handle)
  * through the Homebrew Menu is no longer possible after that (it believes the
  * heap is whole), which is why gx always ends the process. */
 #define SHARED_BUDGET (384UL << 20)
+#ifdef __SWITCH2__
+/* None on the Switch 2: the game's process homebrew runs in may not create
+ * shared memory (no svcCreateSharedMemory in its policy, nor in RO's or
+ * HEN's), so the heap keeps it all and shared files get one copy each
+ * (gmem.c, alloc_shared() failing). */
+#define HEAP_WORTH_SHARING (~0UL)
+#else
 #define HEAP_WORTH_SHARING (1UL << 30)
+#endif
 
 /* The program is the launcher too (gx/launcher/main.c), which loads it again
  * as the browser with --browser. The launcher hands the process back to the
@@ -1037,6 +1172,91 @@ static int start_thread(void (*fn)(void *), void *arg, size_t stack)
 	return 0;
 }
 
+#ifdef __SWITCH2__
+/* Threads that libraries start with pthread_create() and no stack size
+ * (the GL driver's shader compilers) get 128 KB from libounce: 4 MB here,
+ * for the reason of THREAD_STACK. build-nx.sh links with
+ * --wrap=__syscall_thread_create. */
+struct __pthread_t;
+int __real___syscall_thread_create(struct __pthread_t **thread, void *(*func)(void *), void *arg,
+				   void *stack_addr, size_t stack_size);
+
+int __wrap___syscall_thread_create(struct __pthread_t **thread, void *(*func)(void *), void *arg,
+				   void *stack_addr, size_t stack_size)
+{
+	if (!stack_addr && !stack_size)
+		stack_size = 4UL << 20;
+	/* Which, by the address of its function (gx.map names it from the
+	 * base the fault reports give): the driver's threads are among them. */
+	extern char _start[];
+
+	host_log("gx: a library starts a thread at %p (gx at %p), %lu KB of stack\n", (void *)func,
+		 (void *)_start, (unsigned long)(stack_size >> 10));
+	return __real___syscall_thread_create(thread, func, arg, stack_addr, stack_size);
+}
+#endif
+
+#ifdef __SWITCH2__
+/*
+ * Ends of the process on purpose: abort() (a Rust panic of the GL driver's
+ * shader compiler ends there), a failed assert(), diagAbortWithResult(),
+ * exit(). On the Switch 2 the system then says only that the program
+ * closed: the log is told who called first, with the frames above as far
+ * as they can be followed, for gx.map to name (addresses from gx's base).
+ * build-nx.sh links with --wrap for each.
+ */
+static void say_who_ends(const char *what, void *caller)
+{
+	extern char _start[];
+	uintptr_t *fp = __builtin_frame_address(0);
+
+	host_log("\ngx: %s, called from %p (gx at %p), on thread %p\n", what, caller, (void *)_start,
+		 (void *)threadGetSelf());
+	for (int i = 0; i < 24 && fp && !((uintptr_t)fp & 15); i++) {
+		uintptr_t *next = (uintptr_t *)fp[0];
+
+		host_log("gx:   frame %d: return to %p\n", i, (void *)fp[1]);
+		if (next <= fp || (uintptr_t)next - (uintptr_t)fp > (16UL << 20))
+			break;
+		fp = next;
+	}
+	sync_log();
+}
+
+void __real_abort(void) __attribute__((noreturn));
+void __wrap_abort(void)
+{
+	say_who_ends("abort()", __builtin_return_address(0));
+	__real_abort();
+}
+
+void __real___assert_func(const char *file, int line, const char *func, const char *expr)
+	__attribute__((noreturn));
+void __wrap___assert_func(const char *file, int line, const char *func, const char *expr)
+{
+	host_log("\ngx: assertion failed: %s, %s:%d (%s)\n", expr ? expr : "?", file ? file : "?", line,
+		 func ? func : "?");
+	say_who_ends("assert()", __builtin_return_address(0));
+	__real___assert_func(file, line, func, expr);
+}
+
+void __real_diagAbortWithResult(Result res) __attribute__((noreturn));
+void __wrap_diagAbortWithResult(Result res)
+{
+	host_log("\ngx: diagAbortWithResult(%#x)\n", res);
+	say_who_ends("diagAbortWithResult()", __builtin_return_address(0));
+	__real_diagAbortWithResult(res);
+}
+
+void __real_exit(int code) __attribute__((noreturn));
+void __wrap_exit(int code)
+{
+	host_log("\ngx: exit(%d)\n", code);
+	say_who_ends("exit()", __builtin_return_address(0));
+	__real_exit(code);
+}
+#endif
+
 int host_thread_start(void (*fn)(void *), void *arg)
 {
 	return start_thread(fn, arg, THREAD_STACK);
@@ -1187,14 +1407,85 @@ extern const struct gx_gl_entry {
 	void (*fn)(void);
 } gx_gl_table[];
 
+/* Whatever the guest asks for, the console's own display. Said once in the
+ * log, with what came of it, and whenever it fails. */
+static EGLDisplay gl_display_for(const char *how, unsigned platform)
+{
+	static int said;
+	EGLDisplay dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+
+	if (dpy == EGL_NO_DISPLAY || !said++)
+		host_log("gx: gl: %s (platform %#x): display %p (%#x)\n", how, platform, dpy,
+			 dpy == EGL_NO_DISPLAY ? eglGetError() : EGL_SUCCESS);
+	/* ANGLE takes the display only if eglGetError() then says
+	 * EGL_SUCCESS: no error left by an earlier call (the driver's own
+	 * device query). Reading it clears it. */
+	if (dpy != EGL_NO_DISPLAY)
+		eglGetError();
+	return dpy;
+}
+
 static EGLDisplay gl_get_display(void *native)
 {
-	return eglGetDisplay(EGL_DEFAULT_DISPLAY);
+	return gl_display_for("eglGetDisplay", 0);
+}
+
+/*
+ * EGL devices. ANGLE (Chromium's GL) on Wayland reaches a display only
+ * through a device: eglQueryDevicesEXT(), then eglGetPlatformDisplayEXT()
+ * with EGL_PLATFORM_DEVICE_EXT, which gl_get_platform_display() answers with
+ * the console's display. Mesa for the Switch lists a device; OunceVK, the
+ * Switch 2's, lists none, and ANGLE then gives up ("Failed to get system egl
+ * display") without asking for a display at all. A driver without one gets
+ * this one, which is nothing else: no DRM file (ANGLE then skips its choice
+ * of a DRM device), no attributes.
+ */
+#define GX_EGL_DEVICE ((void *)0x67786576)   /* "gxev" */
+
+static EGLBoolean gl_query_devices(EGLint max, void **devices, EGLint *count)
+{
+	EGLBoolean (*real)(EGLint, void **, EGLint *) =
+		(EGLBoolean (*)(EGLint, void **, EGLint *))eglGetProcAddress("eglQueryDevicesEXT");
+	EGLint n = 0;
+	EGLBoolean ret = real ? real(max, devices, &n) : EGL_FALSE;
+	static int said;
+
+	if (!said++)
+		host_log("gx: gl: the driver lists %d EGL devices%s\n", ret ? n : -1,
+			 ret && n ? "" : ": the guest gets gx's");
+	if (ret && n) {
+		*count = n;
+		return ret;
+	}
+	if (devices && max > 0)
+		devices[0] = GX_EGL_DEVICE;
+	*count = 1;
+	return EGL_TRUE;
+}
+
+static const char *gl_query_device_string(void *device, EGLint name)
+{
+	const char *(*real)(void *, EGLint) =
+		(const char *(*)(void *, EGLint))eglGetProcAddress("eglQueryDeviceStringEXT");
+
+	if (device == GX_EGL_DEVICE || !real)
+		return NULL;
+	return real(device, name);
+}
+
+static EGLBoolean gl_query_device_attrib(void *device, EGLint attribute, EGLAttrib *value)
+{
+	EGLBoolean (*real)(void *, EGLint, EGLAttrib *) =
+		(EGLBoolean (*)(void *, EGLint, EGLAttrib *))eglGetProcAddress("eglQueryDeviceAttribEXT");
+
+	if (device == GX_EGL_DEVICE || !real)
+		return EGL_FALSE;
+	return real(device, attribute, value);
 }
 
 static EGLDisplay gl_get_platform_display(EGLenum platform, void *native, const EGLAttrib *attribs)
 {
-	return eglGetDisplay(EGL_DEFAULT_DISPLAY);
+	return gl_display_for("eglGetPlatformDisplay", platform);
 }
 
 static EGLSurface window_surface = EGL_NO_SURFACE;
@@ -1324,7 +1615,11 @@ static EGLBoolean gl_terminate(EGLDisplay dpy)
 {
 	EGLBoolean ret = eglTerminate(dpy);
 
+#ifndef __SWITCH2__
+	/* Not on the Switch 2: the console's frame registration would stand in
+	 * the way of the GPU's next one (gl_initialize()). The log has it all. */
 	console_back();
+#endif
 	return ret;
 }
 
@@ -1346,7 +1641,19 @@ static EGLBoolean gl_swap_buffers_with_damage(EGLDisplay dpy, EGLSurface surface
 
 static EGLBoolean gl_initialize(EGLDisplay dpy, EGLint *major, EGLint *minor)
 {
-	EGLBoolean ret = eglInitialize(dpy, major, minor);
+	EGLBoolean ret;
+
+#ifdef __SWITCH2__
+	/* The console first: on the Switch 2 its framebuffer (libounce's CPU
+	 * window) holds the GPU service's frame registration, which a process
+	 * makes once, and the driver's own registration (OunceVK's GPU
+	 * bootstrap) was refused (stage 4, error 10, 0x200f3). */
+	console_off();
+	/* Setting gx_hostcall_tracing here puts each call the guest makes from
+	 * here on in the log (gx_hostcall_trace()): the way to find a fault on
+	 * the Switch 2, which ends the process without a word. Slow: off. */
+#endif
+	ret = eglInitialize(dpy, major, minor);
 
 	if (!ret)
 		host_log("gx: gl: eglInitialize failed (%#x)\n", eglGetError());
@@ -1414,6 +1721,40 @@ static EGLBoolean gl_make_current(EGLDisplay dpy, EGLSurface draw, EGLSurface re
 static void gl_debug_message_callback(void *callback, const void *param)
 {
 }
+
+/*
+ * The sample counts of a format, which ANGLE asks of every format it knows
+ * when it starts. OunceVK (Zink over NVK, the Switch 2's) ended the process
+ * in there (traced: the last call of the log, in a run of them), so they are
+ * not asked of it: none, which GLES allows (no multisampling), and Chromium
+ * does without. Anything else asked goes to the driver, said in the log
+ * first while the calls are traced.
+ */
+#ifdef __SWITCH2__
+#define GX_GL_SAMPLES 0x80A9
+#define GX_GL_NUM_SAMPLE_COUNTS 0x9380
+
+static void gl_get_internalformativ(GLenum target, GLenum internalformat, GLenum pname,
+				    GLsizei count, GLint *params)
+{
+	extern volatile int gx_hostcall_tracing;
+	void (*real)(GLenum, GLenum, GLenum, GLsizei, GLint *) =
+		(void (*)(GLenum, GLenum, GLenum, GLsizei, GLint *))eglGetProcAddress("glGetInternalformativ");
+
+	if (pname == GX_GL_NUM_SAMPLE_COUNTS) {
+		if (count > 0 && params)
+			params[0] = 0;
+		return;
+	}
+	if (pname == GX_GL_SAMPLES)
+		return;   /* none to write */
+	if (gx_hostcall_tracing)
+		host_log("gx: gl: glGetInternalformativ(%#x, %#x, %#x, %d)\n", target, internalformat,
+			 pname, count);
+	if (real)
+		real(target, internalformat, pname, count, params);
+}
+#endif
 
 /* Textures of 32 MB or more: the GPU's memory comes out of the host's heap
  * in one piece, which a heap in pieces may not have although it has as much
@@ -1586,7 +1927,7 @@ static void gx_audio_close(void)
 	gx_audio_drop();
 }
 
-void *host_symbol(const char *name)
+static void *host_symbol_find(const char *name)
 {
 	static const struct {
 		const char *name;
@@ -1595,6 +1936,9 @@ void *host_symbol(const char *name)
 		{ "eglGetDisplay", gl_get_display },
 		{ "eglGetPlatformDisplay", gl_get_platform_display },
 		{ "eglGetPlatformDisplayEXT", gl_get_platform_display },
+		{ "eglQueryDevicesEXT", gl_query_devices },
+		{ "eglQueryDeviceStringEXT", gl_query_device_string },
+		{ "eglQueryDeviceAttribEXT", gl_query_device_attrib },
 		{ "eglCreateWindowSurface", gl_create_window_surface },
 		{ "eglCreatePlatformWindowSurface", gl_create_window_surface },
 		{ "eglCreatePlatformWindowSurfaceEXT", gl_create_window_surface },
@@ -1615,6 +1959,9 @@ void *host_symbol(const char *name)
 		{ "glDebugMessageCallbackKHR", gl_debug_message_callback },
 		{ "glTexStorage2D", gl_tex_storage_2d },
 		{ "glTexImage2D", gl_tex_image_2d },
+#ifdef __SWITCH2__
+		{ "glGetInternalformativ", gl_get_internalformativ },
+#endif
 	};
 
 	if (!strcmp(name, "gx_audio_open"))
@@ -1638,7 +1985,69 @@ void *host_symbol(const char *name)
 	for (const struct gx_gl_entry *e = gx_gl_table; e->name; e++)
 		if (!strcmp(name, e->name))
 			return (void *)e->fn;
-	return (void *)eglGetProcAddress(name);
+	{
+		void *fn = (void *)eglGetProcAddress(name);
+
+		/* An EGL function the driver does not have (GL ones are many). */
+		if (!fn && !strncmp(name, "egl", 3))
+			host_log("gx: gl: the driver has no %s\n", name);
+		return fn;
+	}
+}
+
+/*
+ * Calls named in the log as the guest makes them, while gx_hostcall_tracing
+ * is set (tramp.S calls gx_hostcall_trace() before each): on the Switch 2 a
+ * fault ends the process without a word, and the last line says what it was
+ * in. The names are those of what host_symbol() handed out.
+ */
+volatile int gx_hostcall_tracing;
+static struct {
+	void *fn;
+	char *name;
+} handed[3072];
+static int handed_count;
+static Mutex handed_lock;
+
+void *host_symbol(const char *name)
+{
+	void *fn = host_symbol_find(name);
+
+	if (fn) {
+		mutexLock(&handed_lock);
+		if (handed_count < (int)(sizeof(handed) / sizeof(handed[0])) &&
+		    (handed[handed_count].name = strdup(name)))
+			handed[handed_count++].fn = fn;
+		mutexUnlock(&handed_lock);
+	}
+	return fn;
+}
+
+void gx_hostcall_trace(void *fn)
+{
+	static void *last;
+	static unsigned repeated, lines;
+	const char *name = "?";
+
+	if (fn == last) {
+		repeated++;
+		return;
+	}
+	for (int i = 0; i < handed_count; i++)
+		if (handed[i].fn == fn) {
+			name = handed[i].name;
+			break;
+		}
+	host_log("gx: call %s (%p) on %p, after %u more of the one before\n", name, fn,
+		 (void *)threadGetSelf(), repeated);
+	sync_log();
+	last = fn;
+	repeated = 0;
+	/* Enough to see where it stops, not a whole session's worth. */
+	if (++lines > 6000) {
+		gx_hostcall_tracing = 0;
+		host_log("gx: no more calls traced\n");
+	}
 }
 
 /* ---------- network ---------- */
@@ -3617,6 +4026,9 @@ static void run(void *arg)
 		host_log("gx: cannot set up the pipe to Chromium\n");
 	if (wayland && wl_start())
 		host_log("gx: cannot open the Wayland display\n");
+#ifdef __SWITCH2__
+	host_log("gx: no faults on the Switch 2: V8 without compiled code (--jitless)\n");
+#endif
 	host_log("gx: running %s\n\n", guest_argv[0]);
 	gx_exec(guest_argv[0], guest_argc, guest_argv, guest_env);
 	host_exit(1);
@@ -3923,6 +4335,26 @@ static void watchdog(void *arg)
 	}
 }
 
+#ifdef __SWITCH2__
+/* On the Switch 2 a fault ends the process without a word, and the browser
+ * was seen to end about 13 s in, whatever it was doing: from 10 s to 30 s,
+ * where every guest thread is, twice a second, so that the last of these
+ * in the log is from just before. */
+static void beacon(void *arg)
+{
+	u64 start = armGetSystemTick();
+
+	svcSleepThread(10000000000ULL);
+	while (!finished && armTicksToNs(armGetSystemTick() - start) < 30000000000ULL) {
+		host_log("gx: beacon at %lu ms\n",
+			 (unsigned long)(armTicksToNs(armGetSystemTick() - start) / 1000000));
+		gx_report_threads();
+		sync_log();
+		svcSleepThread(500000000ULL);
+	}
+}
+#endif
+
 /* The only thread that draws: consoleUpdate() is not thread-safe, and the
  * console may stop for good in there (see console_off()). */
 static void display(void *arg)
@@ -4017,6 +4449,18 @@ int main(int argc, char **argv)
 	/* Written in large pieces once things run: see host_console_write(). */
 	if (log_file)
 		setvbuf(log_file, NULL, _IOFBF, 64 << 10);
+#ifdef __SWITCH2__
+	/* What the GL driver (OunceVK, Mesa) says goes to stderr: into the log,
+	 * with its EGL messages in full, while EGL on the Switch 2 is new. */
+	{
+		static const devoptab_t dotab_log = { .name = "log", .write_r = stderr_to_log };
+
+		devoptab_list[STD_ERR] = &dotab_log;
+		setenv("EGL_LOG_LEVEL", "debug", 1);
+		/* NVK's own errors, with the stage the GPU failed to open at. */
+		setenv("NVK_DEBUG", "errors", 1);
+	}
+#endif
 
 	if (commands[choice][0] == '[' && strchr(commands[choice], ']'))
 		memmove(commands[choice], strchr(commands[choice], ']') + 1,
@@ -4145,6 +4589,20 @@ int main(int argc, char **argv)
 		know_thread(probe_thread.handle, "probe");
 		threadStart(&probe_thread);
 	}
+#ifdef __SWITCH2__
+	{
+		static Thread beacon_thread;
+
+		/* Above the guest's threads, to be heard when they are busy. Only
+		 * with GX_BEACON in the environment of gx: it is slow. */
+		if (getenv("GX_BEACON") &&
+		    R_SUCCEEDED(threadCreate(&beacon_thread, beacon, NULL, NULL, 0x10000, 0x2C, -2))) {
+			free_cores(beacon_thread.handle);
+			know_thread(beacon_thread.handle, "beacon");
+			threadStart(&beacon_thread);
+		}
+	}
+#endif
 	if (profiling) {
 		static Thread profiler_thread;
 

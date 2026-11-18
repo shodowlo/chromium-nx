@@ -10,16 +10,36 @@
 #       devkitpro/devkita64:latest sleep infinity
 #   docker exec lkl-gx-nx apt-get install -y flex bison bc libelf-dev cpio rsync build-essential
 # The guest programs come from the sysroot build-pc.sh made (/work/gx-out).
+#
+# SWITCH2=1 builds for the Switch 2 instead, with libounce (libnx for the
+# Switch 2) and OunceVK (its EGL and GLES) from ounce-devkit
+# (https://github.com/ouncebrew/ounce-devkit), in a container made from that
+# repository's Dockerfile:
+#   docker run -d --name cnx-nx2 -v <repository>:/project -v cnxwork:/work \
+#       ounce-devkit sleep infinity
+#   docker exec cnx-nx2 apt-get install -y flex bison bc libelf-dev cpio rsync build-essential python3
+#   docker exec -e SWITCH2=1 cnx-nx2 bash /project/gx/build-nx.sh
+# Its kernel, objects and card are apart: /work/linux-nx2, /work/gx-nx2 and
+# gx/dist-nx2.
 set -eu
 
 export DEVKITPRO=/opt/devkitpro
 export PATH=$DEVKITPRO/devkitA64/bin:$DEVKITPRO/tools/bin:$PATH
 
+SWITCH2=${SWITCH2:-}
+if [ -n "$SWITCH2" ]; then
+	[ -e "$DEVKITPRO/libounce/switch2_cpu.mk" ] ||
+		{ echo "SWITCH2=1 needs ounce-devkit (libounce) in $DEVKITPRO"; exit 1; }
+	SFX=2
+else
+	SFX=
+fi
+
 SRC=$(cd "$(dirname "$0")" && pwd)
-LINUX=${LINUX:-/work/linux-nx}
+LINUX=${LINUX:-/work/linux-nx$SFX}
 LKL=$LINUX/tools/lkl
-OUT=${OUT:-/work/gx-nx}
-DIST=$SRC/dist-nx
+OUT=${OUT:-/work/gx-nx$SFX}
+DIST=$SRC/dist-nx$SFX
 PC_OUT=${PC_OUT:-/work/gx-out}
 PC_SYSROOT=$PC_OUT/sysroot
 CROSS=aarch64-none-elf-
@@ -115,12 +135,43 @@ cat "$SRC/lkl/virtio-defer.c" >>"$OUT/lkl/virtio.c"
 # The EGL and GLES functions the guest can reach: those of its thunk libraries
 # (lists made by build-pc.sh) that Mesa for the Switch has.
 PORTLIBS=$DEVKITPRO/portlibs/switch
+# The Switch 2's: OunceVK's EGL and GLES, in portlibs/switch2, in place of
+# Mesa's; the rest of the portlibs (FFmpeg, curl, FreeType...) are the
+# Switch's, which need only the C library and libnx (libounce here).
+if [ -n "$SWITCH2" ]; then
+	LIBNX=$DEVKITPRO/libounce
+	GLLIBS=$DEVKITPRO/portlibs/switch2
+	CPU=$(sed -n 's/^SWITCH2_CPU[[:space:]]*:=[[:space:]]*//p' "$LIBNX/switch2_cpu.mk")
+	PLATFORM="-D__SWITCH__ -D__SWITCH2__ -I$GLLIBS/include"
+	GL_LINK="-lEGL -lGLESv2 -lglapi"
+	# Its libEGL.a is a linker script for libouncevk-gl.a, which has them all.
+	GL_NM="$GLLIBS/lib/libouncevk-gl.a"
+	# libounce_core, not libounce (-lnx): libounce's start hands the whole
+	# heap to its own allocator (mimalloc) and leaves fake_heap_start at
+	# fake_heap_end, and the guest's pool, carved out of that heap by
+	# host_reserve() (host_nx.c), found nothing. libounce_core keeps
+	# newlib's malloc, the one gx is written for.
+	# And threads started without a stack size get more than libounce's
+	# 128 KB (host_nx.c, __wrap___syscall_thread_create).
+	NX_LINK="-lounce_core -Wl,--wrap=__syscall_thread_create"
+	# The ends on purpose (abort, assert, diagAbortWithResult, exit) say who
+	# called them in the log first (host_nx.c, say_who_ends()).
+	NX_LINK="$NX_LINK -Wl,--wrap=abort -Wl,--wrap=__assert_func -Wl,--wrap=diagAbortWithResult -Wl,--wrap=exit"
+else
+	LIBNX=$DEVKITPRO/libnx
+	GLLIBS=$PORTLIBS
+	CPU="-march=armv8-a+crc+crypto -mtune=cortex-a57"
+	PLATFORM="-D__SWITCH__"
+	GL_LINK="-lEGL -lGLESv2 -lglapi -ldrm_nouveau"
+	GL_NM="$GLLIBS/lib/libEGL.a $GLLIBS/lib/libGLESv2.a"
+	NX_LINK="-lnx"
+fi
 {
 	echo "/* Made by build-nx.sh. */"
 	echo "struct gx_gl_entry { const char *name; void (*fn)(void); };"
 	names=$(comm -12 \
 		<( (sed 's/GX_THUNK(\(.*\))/\1/' "$PC_OUT/egl.list" "$PC_OUT/gles.list"; echo eglGetProcAddress) | sort -u) \
-		<(${CROSS}nm "$PORTLIBS/lib/libEGL.a" "$PORTLIBS/lib/libGLESv2.a" 2>/dev/null |
+		<(${CROSS}nm $GL_NM 2>/dev/null |
 			awk '$2 == "T" { print $3 }' | sort -u))
 	for n in $names; do echo "void $n(void);"; done
 	echo "const struct gx_gl_entry gx_gl_table[] = {"
@@ -128,7 +179,9 @@ PORTLIBS=$DEVKITPRO/portlibs/switch
 	echo "	{ 0, 0 },"
 	echo "};"
 } >"$OUT/gl_table.c"
-echo "$(grep -c '^	{ "' "$OUT/gl_table.c") EGL and GLES functions"
+n=$(grep -c '^	{ "' "$OUT/gl_table.c") || true
+echo "$n EGL and GLES functions"
+[ "$n" -gt 0 ] || { echo "no EGL or GLES function found in $GL_NM"; exit 1; }
 
 # The profile's empty image, packed (build-chromium.sh makes it): in the
 # program, which unpacks it next to itself the first time (profile.ext4), so
@@ -143,12 +196,12 @@ with open(sys.argv[2], 'w') as f:
 PY
 
 echo "== gx"
-ARCH="-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE"
+ARCH="$CPU -mtp=soft -fPIE"
 # -iquote: LKL's host sources find their own headers, and nothing else does.
 # The arena is as large as on the PC (Chromium fills 120 GB of addresses) if
 # the console has that much to reserve.
-CFLAGS="-g -O2 -Wall -ffunction-sections $ARCH -D__SWITCH__ -DGX_ARENA_SIZE=(256UL<<30) \
-	-I$DEVKITPRO/libnx/include -I$PORTLIBS/include -I$PORTLIBS/include/freetype2 -I$OUT/include -I$SRC/nx -I$SRC \
+CFLAGS="-g -O2 -Wall -ffunction-sections $ARCH $PLATFORM -DGX_ARENA_SIZE=(256UL<<30) \
+	-I$LIBNX/include -I$PORTLIBS/include -I$PORTLIBS/include/freetype2 -I$OUT/include -I$SRC/nx -I$SRC \
 	-iquote $OUT/lkl"
 objs=
 for f in "$SRC"/tramp.S "$SRC"/nx/exception.S "$SRC"/gmem.c "$SRC"/gelf.c "$SRC"/gsys.c "$SRC"/nat.c "$SRC"/cdp.c "$SRC"/wl.c "$SRC"/glwin.c "$SRC"/video.c "$SRC"/overlay.c "$SRC"/hostfs_nx.c "$SRC"/host_nx.c \
@@ -171,7 +224,7 @@ with open(sys.argv[2], 'w') as f:
     f.write('const unsigned char icon_jpg[] = {%s};\n' % ','.join(str(b) for b in data))
     f.write('const unsigned int icon_jpg_len = %d;\n' % len(data))
 PY
-LCFLAGS="-O2 -Wall $ARCH -D__SWITCH__ -I$DEVKITPRO/libnx/include -I$PORTLIBS/include -I$PORTLIBS/include/freetype2"
+LCFLAGS="-O2 -Wall $ARCH $PLATFORM -I$LIBNX/include -I$PORTLIBS/include -I$PORTLIBS/include/freetype2"
 # For a test of the updates: UPDATE_RELEASES=http://<pc>:<port>/releases/ (a
 # folder made by scripts/release.py --local) and GX_VERSION=<version>.
 [ -z "${UPDATE_RELEASES:-}" ] || LCFLAGS="$LCFLAGS -DUPDATE_RELEASES=\"$UPDATE_RELEASES\""
@@ -183,11 +236,11 @@ for f in "$SRC/launcher/main.c" "$SRC/launcher/update.c" "$OUT/launcher/icon.c";
 done
 VERSION=${GX_VERSION:-$(sed -n 's/^#define GX_VERSION "\(.*\)"$/\1/p' "$SRC/version.h")}
 # Mesa is C++ inside.
-${CROSS}g++ -specs=$DEVKITPRO/libnx/switch.specs -g $ARCH -Wl,-Map,"$OUT/gx.map" -Wl,--wrap=lkl_syscall \
-	$objs "$OUT/lkl-nro.o" -L$PORTLIBS/lib -L$DEVKITPRO/libnx/lib \
+${CROSS}g++ -specs=$LIBNX/switch.specs -g $ARCH -Wl,-Map,"$OUT/gx.map" -Wl,--wrap=lkl_syscall \
+	$objs "$OUT/lkl-nro.o" -L$GLLIBS/lib -L$PORTLIBS/lib -L$LIBNX/lib \
 	-lavcodec -ldav1d -lswresample -lavutil \
-	-lEGL -lGLESv2 -lglapi -ldrm_nouveau -lcurl -lfreetype -lharfbuzz -lfreetype -lbz2 -lpng -lturbojpeg -lz \
-	-lnx -lm -o "$OUT/gx.elf"
+	$GL_LINK -lcurl -lfreetype -lharfbuzz -lfreetype -lbz2 -lpng -lturbojpeg -lz \
+	$NX_LINK -lm -o "$OUT/gx.elf"
 nacptool --create "Chromium NX" "shodowlo" "$VERSION" "$OUT/gx.nacp"
 elf2nro "$OUT/gx.elf" "$OUT/chromium-nx.nro" --nacp="$OUT/gx.nacp" --icon="$SRC/nx/icon.jpg"
 
@@ -217,6 +270,9 @@ NX_FLAGS="--disable-blink-features=AutomationControlled \
 --disable-features=OptimizationHints,OptimizationGuideModelDownloading,OptimizationGuideOnDeviceModel,OnDeviceModelBackgroundDownload,MediaRouter,DialMediaRouteProvider,BackForwardCache \
 --force-gpu-mem-available-mb=128 --force-gpu-mem-discardable-limit-mb=32 --force-max-texture-size=4096 --disable-gl-extensions=GL_EXT_disjoint_timer_query,GL_EXT_disjoint_timer_query_webgl2,GL_ARB_timer_query,GL_EXT_timer_query \
 --js-flags=--no-sparkplug"
+# The Switch 2: no compiled code at all, since no fault reaches gx there
+# (host_nx.c, JS_FLAGS).
+[ -z "$SWITCH2" ] || NX_FLAGS="${NX_FLAGS%--js-flags=--no-sparkplug}--js-flags=--jitless"
 
 echo "== SD card"
 # Everything is in one folder of the card, sdmc:/switch/chromium-nx: the
@@ -268,4 +324,4 @@ if [ -e "$PC_OUT/chromium-full-switch.ext4" ] && [ -e "$PC_OUT/chromium-full.cmd
 	fi
 fi
 ls -la "$APP"
-echo "copy the contents of gx/dist-nx to the root of the SD card"
+echo "copy the contents of gx/dist-nx$SFX to the root of the SD card"

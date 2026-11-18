@@ -27,6 +27,8 @@ nro/busybox-sd
 
 # gx: what build-nx.sh and build-hbl.sh lay out for the SD card (regenerated)
 gx/dist-nx/
+gx/dist-nx2/
 gx/dist-hbl/
 # what scripts/release.py publishes (regenerated)
 gx/dist-release/
+/chromium-nx.nro
