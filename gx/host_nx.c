@@ -1713,6 +1713,19 @@ static int start_thread(void (*fn)(void *), void *arg, size_t stack)
 	s->fn = fn;
 	s->arg = arg;
 	rc = threadCreate(&s->thread, thread_start, s, NULL, stack, GUEST_PRIO, core);
+	/* Horizon has 96 threads for the whole process, and a browser of
+	 * a few tabs with Discord's workers went past them: refused, its
+	 * pthread_create() failed and it ended. Its pools give back the
+	 * threads they no longer use: one of them is waited for, a while. */
+	for (int tries = 0; rc == 0x10801 /* the kernel's LimitReached */ && tries < 100; tries++) {
+		if (!tries)
+			host_log("gx: no thread left (%d of them): waiting for one\n", count_threads());
+		svcSleepThread(100000000ULL);
+		bury_threads();
+		rc = threadCreate(&s->thread, thread_start, s, NULL, stack, GUEST_PRIO, core);
+		if (R_SUCCEEDED(rc))
+			host_log("gx: a thread was free after %d ms\n", (tries + 1) * 100);
+	}
 	if (R_SUCCEEDED(rc)) {
 		/* It starts on its core but may run on any of the three: a thread
 		 * tied to one core waits for the others tied to it, a time slice
