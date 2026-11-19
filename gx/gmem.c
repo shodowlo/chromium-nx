@@ -672,7 +672,7 @@ static struct image *adopt_image(uint64_t addr, uint64_t len)
  * unmapping found it gone and stopped the browser (CHECK(it !=
  * usages_.end()) in DecrementMemoryUsage, a brk). The brk becomes a branch to
  * the function's own way out, which unlocks its mutex: an unmapping it does
- * not know of is let go. Debian's chromium 156.0.8078.73-1~deb12u1, arm64.
+ * not know of is let go.
  */
 /*
  * Also, on any host: Chromium (from 151) leaves full screen when the bubble
@@ -683,20 +683,25 @@ static struct image *adopt_image(uint64_t addr, uint64_t len)
  * fell back after 1.5 s): its test for a headless browser, which arms none,
  * is made to say yes there, and the timer is never armed. The bubble itself
  * is still shown.
+ *
+ * Each fix is at its own offset in each build: the builds of Debian's chromium
+ * (arm64) it knows, in offsets[] (156.0.8078.73-1~deb12u1, then .79). A new
+ * build wants its offsets added (the words around them are the same):
+ * otherwise the browser stops on the Switch 2 at the first unmapping.
  */
 static const struct program_fix {
 	const char *path;
-	uint64_t offset;          /* in the file */
+	uint64_t offsets[4];      /* in the file, one per build; 0 ends */
 	uint32_t before[8];       /* the words up to it, the last being it */
 	int any_branch;           /* the one of them that is a b of any offset, or -1 */
 	uint32_t word;            /* what it becomes */
 } program_fixes[] = {
-	{ "/usr/lib/chromium/chromium", 0x94ac238,
+	{ "/usr/lib/chromium/chromium", { 0x94ac238, 0x946bd68 },
 	  { 0x91002260u /* add x0, x19, #0x8 */, 0xa9424ff4u, 0xf9400bf5u, 0xa8c37bfdu,
 	    0xd50323bfu /* autiasp */, 0x14000000u /* b ... (any) */, 0xd4200020u /* brk #1 */,
 	    0xd4200000u /* brk #0 */ },
 	  5, 0x17fffff9u /* b -0x1c: to the add x0, x19, #0x8 */ },
-	{ "/usr/lib/chromium/chromium", 0x8bd3370,
+	{ "/usr/lib/chromium/chromium", { 0x8bd3370, 0x8b930d4 },
 	  { 0xf9403508u, 0xd63f0100u, 0xf9408660u /* ldr x0, [x19, #264] */, 0xf9400008u,
 	    0xf9402d08u, 0xd63f0100u /* blr x8 */, 0x979e29f4u /* bl: headless? */,
 	    0x370005c0u /* tbnz w0, #0, +0xb8: no watchdog */ },
@@ -707,25 +712,34 @@ static void fix_program(const char *path, uint64_t addr, uint64_t off, uint64_t 
 {
 	for (size_t i = 0; i < sizeof(program_fixes) / sizeof(program_fixes[0]); i++) {
 		const struct program_fix *f = &program_fixes[i];
-		uint32_t *site;
-		int same = 1;
+		int seen = 0, done = 0;
 
-		if (strcmp(path, f->path) || f->offset < off + 7 * 4 || f->offset + 4 > off + len)
+		if (strcmp(path, f->path))
 			continue;
-		site = (uint32_t *)(addr + (f->offset - off));
-		for (int k = 0; k < 8; k++) {
-			uint32_t w = site[k - 7];
+		for (int b = 0; b < 4 && f->offsets[b] && !done; b++) {
+			uint64_t at = f->offsets[b];
+			uint32_t *site;
+			int same = 1;
 
-			/* The tail call's offset is the program's own. */
-			if (k == f->any_branch ? (w & 0xFC000000u) != 0x14000000u : w != f->before[k])
-				same = 0;
+			if (at < off + 7 * 4 || at + 4 > off + len)
+				continue;
+			seen = 1;
+			site = (uint32_t *)(addr + (at - off));
+			for (int k = 0; k < 8; k++) {
+				uint32_t w = site[k - 7];
+
+				/* The tail call's offset is the program's own. */
+				if (k == f->any_branch ? (w & 0xFC000000u) != 0x14000000u : w != f->before[k])
+					same = 0;
+			}
+			if (!same)
+				continue;
+			*site = f->word;
+			done = 1;
+			host_log("gx: %s fixed at %#lx (fix %zu)\n", path, (unsigned long)at, i);
 		}
-		if (!same) {
-			host_log("gx: %s is not the build its fix %zu is for; left as it is\n", path, i);
-			continue;
-		}
-		*site = f->word;
-		host_log("gx: %s fixed at %#lx (fix %zu)\n", path, (unsigned long)f->offset, i);
+		if (seen && !done)
+			host_log("gx: %s is not a build its fix %zu knows; left as it is\n", path, i);
 	}
 }
 
