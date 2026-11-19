@@ -5,6 +5,11 @@
     python scripts/release.py --dry-run    # makes gx/dist-release only
     python scripts/release.py --local DIR  # lays a release out in DIR as GitHub does, to
                                            # serve to a launcher built with UPDATE_RELEASES
+    python scripts/release.py --switch2    # the same for the Switch 2 (SWITCH2=1 build-nx.sh,
+                                           # gx/dist-nx2), on shodowlo/chromium-nx2
+
+Each console has its own repository, where its launcher looks for updates
+(UPDATE_REPO, gx/launcher/update.h): the program is not the same, the image is.
 
 The version is gx/version.h's. The release has the program, Chromium's image
 and manifest.txt (what the launcher reads: gx/launcher/update.c); --zip adds a
@@ -21,8 +26,7 @@ import sys
 import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-APP = os.path.join(ROOT, 'gx', 'dist-nx', 'switch', 'chromium-nx')
-OUT = os.path.join(ROOT, 'gx', 'dist-release')
+REPOS = {False: 'shodowlo/chromium-nx', True: 'shodowlo/chromium-nx2'}
 FILES = ['chromium-nx.nro', 'chromium-full.ext4']
 
 
@@ -48,7 +52,14 @@ def main():
     p.add_argument('--notes', default='', help='what is new, for the release page')
     p.add_argument('--notes-file', help='the same, from a file (Markdown)')
     p.add_argument('--zip', action='store_true')
+    p.add_argument('--switch2', action='store_true', help='the Switch 2 build, to its repository')
     a = p.parse_args()
+    sfx = '2' if a.switch2 else ''
+    global APP, OUT
+    APP = os.path.join(ROOT, 'gx', 'dist-nx' + sfx, 'switch', 'chromium-nx')
+    OUT = os.path.join(ROOT, 'gx', 'dist-release' + sfx)
+    repo = REPOS[a.switch2]
+    console = 'Switch 2' if a.switch2 else 'Switch'
     if a.notes_file:   # read now: it may be in OUT, which is made again below
         a.notes = open(a.notes_file, encoding='utf-8').read()
 
@@ -56,7 +67,8 @@ def main():
     tag = 'v' + v
     for name in FILES:
         if not os.path.exists(os.path.join(APP, name)):
-            sys.exit('%s is missing: run build-nx.sh first' % os.path.join(APP, name))
+            sys.exit('%s is missing: run %sbuild-nx.sh first' %
+                     (os.path.join(APP, name), 'SWITCH2=1 ' if a.switch2 else ''))
 
     shutil.rmtree(OUT, ignore_errors=True)
     os.makedirs(OUT)
@@ -85,27 +97,28 @@ def main():
 
     assets = [manifest] + [os.path.join(APP, name) for name in FILES]
     if a.zip:
-        z = os.path.join(OUT, 'chromium-nx-%s.zip' % v)
+        z = os.path.join(OUT, 'chromium-nx%s-%s.zip' % (sfx, v))
         print('zipping', z)
         with zipfile.ZipFile(z, 'w', zipfile.ZIP_STORED) as f:
             for name in FILES:
                 f.write(os.path.join(APP, name), 'switch/chromium-nx/' + name)
         assets.append(z)
     if a.dry_run:
-        print('dry run: nothing published')
+        print('dry run: nothing published (it would go to %s)' % repo)
         return
 
-    if subprocess.run(['gh', 'release', 'view', tag], capture_output=True).returncode == 0:
-        sys.exit('%s exists already: change GX_VERSION in gx/version.h' % tag)
+    if subprocess.run(['gh', 'release', 'view', tag, '-R', repo], capture_output=True).returncode == 0:
+        sys.exit('%s exists already on %s: change GX_VERSION in gx/version.h' % (tag, repo))
     notes = a.notes or (
-        'Copy chromium-nx.nro to /switch/chromium-nx/ on the SD card: the launcher downloads '
+        'For the ' + console + '. Copy chromium-nx.nro to /switch/chromium-nx/ on the SD card: the launcher downloads '
         'Chromium\'s image (chromium-full.ext4) the first time.\n\n'
         'Already installed: the launcher offers the update itself.')
     # Through a file: a long text of several lines on the command line is
     # lost on the way to gh on Windows.
     notes_path = os.path.join(OUT, 'notes.md')
     open(notes_path, 'w', encoding='utf-8', newline='\n').write(notes)
-    subprocess.run(['gh', 'release', 'create', tag, '--title', 'Chromium NX ' + v,
+    title = 'Chromium NX ' + v + (' for Switch 2' if a.switch2 else '')
+    subprocess.run(['gh', 'release', 'create', tag, '-R', repo, '--title', title,
                     '--notes-file', notes_path] + assets, check=True)
 
 

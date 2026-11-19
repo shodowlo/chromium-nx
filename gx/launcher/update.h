@@ -7,7 +7,13 @@
 
 #include <stdint.h>
 
+/* Each console has its own releases: the program is not the same (the image
+ * is). */
+#ifdef __SWITCH2__
+#define UPDATE_REPO "shodowlo/chromium-nx2"
+#else
 #define UPDATE_REPO "shodowlo/chromium-nx"
+#endif
 #define UPDATE_IMAGE "chromium-full.ext4"
 #define UPDATE_PROGRAM "chromium-nx.nro"
 

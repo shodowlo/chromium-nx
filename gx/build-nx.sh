@@ -232,6 +232,9 @@ LCFLAGS="-O2 -Wall $ARCH $PLATFORM -I$LIBNX/include -I$PORTLIBS/include -I$PORTL
 # For a test of the updates: UPDATE_RELEASES=http://<pc>:<port>/releases/ (a
 # folder made by scripts/release.py --local) and GX_VERSION=<version>.
 [ -z "${UPDATE_RELEASES:-}" ] || LCFLAGS="$LCFLAGS -DUPDATE_RELEASES=\"$UPDATE_RELEASES\""
+# Or UPDATE_SERVER=http://<pc>:<port>/: <server><repository>/releases/, as on
+# GitHub (each console its own repository: gx/launcher/update.h).
+[ -z "${UPDATE_SERVER:-}" ] || LCFLAGS="$LCFLAGS -DUPDATE_SERVER=\"$UPDATE_SERVER\""
 [ -z "${GX_VERSION:-}" ] || LCFLAGS="$LCFLAGS -DGX_VERSION=\"$GX_VERSION\""
 for f in "$SRC/launcher/main.c" "$SRC/launcher/update.c" "$OUT/launcher/icon.c"; do
 	o=$OUT/launcher/$(basename "${f%.*}").o

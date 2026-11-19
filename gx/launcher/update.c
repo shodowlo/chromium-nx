@@ -39,10 +39,15 @@
 #include "../version.h"
 
 #define APP_DIR "sdmc:/switch/chromium-nx"
-/* Where the releases are; a test build is given a server of its own
- * (build-nx.sh, UPDATE_RELEASES; scripts/release.py --local). */
+/* Where the releases are: <server><repository>/releases/. A test build is
+ * given a server of its own (build-nx.sh, UPDATE_SERVER, which keeps the
+ * repository of the console; or UPDATE_RELEASES, the whole of it;
+ * scripts/release.py --local). */
+#ifndef UPDATE_SERVER
+#define UPDATE_SERVER "https://github.com/"
+#endif
 #ifndef UPDATE_RELEASES
-#define UPDATE_RELEASES "https://github.com/" UPDATE_REPO "/releases/"
+#define UPDATE_RELEASES UPDATE_SERVER UPDATE_REPO "/releases/"
 #endif
 #define RELEASES UPDATE_RELEASES
 #define MAX_FILES 8
