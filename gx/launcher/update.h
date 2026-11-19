@@ -7,15 +7,16 @@
 
 #include <stdint.h>
 
-/* Each console has its own releases: the program is not the same (the image
- * is). */
-#ifdef __SWITCH2__
-#define UPDATE_REPO "shodowlo/chromium-nx2"
-#else
 #define UPDATE_REPO "shodowlo/chromium-nx"
-#endif
 #define UPDATE_IMAGE "chromium-full.ext4"
+/* A release has a program for each console, under its name on the card
+ * (the image is the same for both): the Switch 1's keeps the name the
+ * launchers before 0.2.0 look for. */
+#ifdef __SWITCH2__
+#define UPDATE_PROGRAM "chromium-nx2.nro"
+#else
 #define UPDATE_PROGRAM "chromium-nx.nro"
+#endif
 
 /* The image next to the program, against what a release has. */
 enum {

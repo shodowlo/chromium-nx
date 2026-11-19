@@ -6,7 +6,12 @@
  *	version=0.3.0
  *	tag=v0.3
  *	file=chromium-nx.nro <size> <sha-256>
+ *	file=chromium-nx2.nro <size> <sha-256>
  *	file=chromium-full.ext4 <size> <sha-256>
+ *
+ * Each console takes its own program (UPDATE_PROGRAM, update.h: the Switch
+ * 2's is chromium-nx2.nro) and the image; a file it does not know is left
+ * alone.
  *
  * When the launcher starts it reads the newest release's (GitHub sends
  * releases/latest/download/<name> to it) and, if that is not this version,
@@ -21,7 +26,7 @@
  * takes the file's place only once all of the release's files are there and
  * each has the SHA-256 the release says: an update cut short leaves the
  * program and the image as they were. The program's previous version is kept
- * as chromium-nx.nro.old. The profile, the settings and the downloads are
+ * as <program>.old. The profile, the settings and the downloads are
  * never touched.
  *
  * curl does HTTPS with the console's own TLS (libnx), and runs on a thread
@@ -40,9 +45,8 @@
 
 #define APP_DIR "sdmc:/switch/chromium-nx"
 /* Where the releases are: <server><repository>/releases/. A test build is
- * given a server of its own (build-nx.sh, UPDATE_SERVER, which keeps the
- * repository of the console; or UPDATE_RELEASES, the whole of it;
- * scripts/release.py --local). */
+ * given a server of its own (build-nx.sh, UPDATE_SERVER; or UPDATE_RELEASES,
+ * the whole of it; scripts/release.py --local). */
 #ifndef UPDATE_SERVER
 #define UPDATE_SERVER "https://github.com/"
 #endif
@@ -562,7 +566,8 @@ static void install_latest(void *unused)
 		if (!strcmp(e->name, UPDATE_IMAGE) && have && !strcmp(sha, e->sha))
 			continue;
 		if (strcmp(e->name, UPDATE_PROGRAM) && strcmp(e->name, UPDATE_IMAGE))
-			continue;   /* not a file this version knows what to do with */
+			continue;   /* the other console's program, or a file this
+				     * version knows nothing of */
 		files[count++] = e;
 	}
 	install_files(&latest, files, count);

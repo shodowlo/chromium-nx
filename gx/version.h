@@ -5,5 +5,5 @@
  * major.minor.patch: patch for fixes, minor for what is new.
  */
 #ifndef GX_VERSION
-#define GX_VERSION "0.1.0"
+#define GX_VERSION "0.2.0"
 #endif

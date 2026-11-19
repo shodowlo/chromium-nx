@@ -233,7 +233,7 @@ LCFLAGS="-O2 -Wall $ARCH $PLATFORM -I$LIBNX/include -I$PORTLIBS/include -I$PORTL
 # folder made by scripts/release.py --local) and GX_VERSION=<version>.
 [ -z "${UPDATE_RELEASES:-}" ] || LCFLAGS="$LCFLAGS -DUPDATE_RELEASES=\"$UPDATE_RELEASES\""
 # Or UPDATE_SERVER=http://<pc>:<port>/: <server><repository>/releases/, as on
-# GitHub (each console its own repository: gx/launcher/update.h).
+# GitHub.
 [ -z "${UPDATE_SERVER:-}" ] || LCFLAGS="$LCFLAGS -DUPDATE_SERVER=\"$UPDATE_SERVER\""
 [ -z "${GX_VERSION:-}" ] || LCFLAGS="$LCFLAGS -DGX_VERSION=\"$GX_VERSION\""
 for f in "$SRC/launcher/main.c" "$SRC/launcher/update.c" "$OUT/launcher/icon.c"; do
@@ -293,8 +293,9 @@ for log in "$APP"/*.log; do
 done
 rm -rf "$DIST"
 mkdir -p "$APP"
-# The tile opens chromium-nx.nro: the launcher, then the browser.
-cp "$OUT/chromium-nx.nro" "$APP/chromium-nx.nro"
+# The tile opens chromium-nx.nro (chromium-nx2.nro on the Switch 2, its name
+# in the releases too: gx/launcher/update.h): the launcher, then the browser.
+cp "$OUT/chromium-nx.nro" "$APP/chromium-nx$SFX.nro"
 if [ -n "${DEV:-}" ]; then
 	[ -e "$PC_SYSROOT/bin/hello" ] ||
 		{ echo "run build-pc.sh first: it makes the guest programs"; exit 1; }
