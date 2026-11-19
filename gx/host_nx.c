@@ -89,6 +89,10 @@
 	"--test-type --password-store=basic --disable-background-networking --disable-component-update " \
 	"--disk-cache-size=33554432 --media-cache-size=33554432 --disable-quic --hide-crash-restore-bubble " \
 	"--enable-spatial-navigation --remote-debugging-pipe --disable-blink-features=AutomationControlled " \
+	/* One renderer for every site: in a single process Chromium stops \
+	   (GetProcessHostForSiteInstance) when a site wants one of its own, \
+	   as a download from "Save link as" did. */ \
+	"--disable-site-isolation-trials " \
 	"--disable-features=OptimizationHints,OptimizationGuideModelDownloading,OptimizationGuideOnDeviceModel," \
 	"OnDeviceModelBackgroundDownload,MediaRouter,DialMediaRouteProvider,BackForwardCache " \
 	"--force-gpu-mem-available-mb=128 --force-gpu-mem-discardable-limit-mb=32 " \

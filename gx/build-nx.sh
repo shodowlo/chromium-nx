@@ -273,7 +273,11 @@ elf2nro "$OUT/gx.elf" "$OUT/chromium-nx.nro" --nacp="$OUT/gx.nacp" --icon="$SRC/
 #   fault and a remapping (gmem.c). YouTube went from 5000 turns to 1900,
 #   from 2.2 s of them to 1.1, its video stuttering less, and no page or
 #   benchmark was slower for it: the faster compilers do the hot code.
-NX_FLAGS="--disable-blink-features=AutomationControlled \
+# - No site isolation: one renderer for every site. In a single process
+#   Chromium stops when a site wants a renderer of its own
+#   (RenderProcessHostImpl::GetProcessHostForSiteInstance), which a download
+#   from "Save link as" did.
+NX_FLAGS="--disable-blink-features=AutomationControlled --disable-site-isolation-trials \
 --disable-features=OptimizationHints,OptimizationGuideModelDownloading,OptimizationGuideOnDeviceModel,OnDeviceModelBackgroundDownload,MediaRouter,DialMediaRouteProvider,BackForwardCache \
 --force-gpu-mem-available-mb=128 --force-gpu-mem-discardable-limit-mb=32 --force-max-texture-size=4096 --disable-gl-extensions=GL_EXT_disjoint_timer_query,GL_EXT_disjoint_timer_query_webgl2,GL_ARB_timer_query,GL_EXT_timer_query \
 --js-flags=--no-sparkplug"

@@ -668,9 +668,16 @@ static void cdp_thread(void *arg)
 
 			/* Pages are handed to us as they appear, once the browser
 			 * has heard that we want them. */
-			if (!page_count && waited++ % 50 == 0)
+			if (!page_count && waited++ % 50 == 0) {
 				send_command("", "Target.setAutoAttach", "{\"autoAttach\":true,"
 					     "\"waitForDebuggerOnStart\":false,\"flatten\":true}");
+				/* Every download goes straight to the card's Downloads
+				 * (host_nx.c): "Save link as" and "Save image as" ask
+				 * where with a dialog Chromium has none of here, and
+				 * nothing happened. */
+				send_command("", "Browser.setDownloadBehavior", "{\"behavior\":\"allow\","
+					     "\"downloadPath\":\"/root/Downloads\"}");
+			}
 			switch (__atomic_exchange_n(&page_action, CDP_NONE, __ATOMIC_SEQ_CST)) {
 			case CDP_BACK:
 				snprintf(params, sizeof(params), "{\"expression\":\"if(%s)history.back()\"}", seen);
