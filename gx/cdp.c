@@ -20,6 +20,13 @@
 #include "gx.h"
 #include "cdp.h"
 
+/* The tallest video pages are offered: the screen's height (page_script). */
+#ifdef __SWITCH2__
+#define VIDEO_MAX_HEIGHT "1080"
+#else
+#define VIDEO_MAX_HEIGHT "720"
+#endif
+
 #define MESSAGE_MAX (8UL << 20)
 #define HOST_READ_FD 250    /* our ends, out of the way of the guest's */
 #define HOST_WRITE_FD 251
@@ -72,15 +79,38 @@ static const char page_script[] =
 	 * serves H.264 instead (what the h264ify extension does). */
 	"var no=/vp8|vp9|vp09|av01/i;"
 	/* Nor anything taller than the screen: every picture is copied out of
-	 * the decoder and into the GPU, for nothing if it is then shrunk. */
-	"function tall(t){var m=/height=(\\d+)/.exec(t);return m&&+m[1]>720}"
+	 * the decoder and into the GPU, for nothing if it is then shrunk. The
+	 * Switch 2's screen is 1080 high, the Switch's 720. */
+	"var tallest=" VIDEO_MAX_HEIGHT ";"
+	"function tall(t){var m=/height=(\\d+)/.exec(t);return m&&+m[1]>tallest}"
 	"function not(o,f){var g=o&&o[f];if(g)o[f]=hide(function(t){return no.test(t)||tall(t)?"
 	"(f=='canPlayType'?'':false):g.apply(this,arguments)},g)}"
 	"not(window.MediaSource,'isTypeSupported');not(window.ManagedMediaSource,'isTypeSupported');"
 	"not(HTMLMediaElement.prototype,'canPlayType');"
 	"var mc=navigator.mediaCapabilities,di=mc&&mc.decodingInfo;"
 	"if(di)mc.decodingInfo=hide(function(c){var v=c&&c.video;"
-	"if(v&&(no.test(v.contentType)||v.height>720))"
+	"if(v&&(no.test(v.contentType)||v.height>tallest))"
+	"return Promise.resolve({supported:false,smooth:false,powerEfficient:false});"
+	"return di.apply(this,arguments)},di)"
+	"})()";
+/* The same refusals in a page's workers: a player can make its MediaSource
+ * there (YouTube does, on its desktop site), where the page's own script does
+ * not reach; it then played AV1, which the processor decoded at a few
+ * pictures a second. Each worker is held at its start until this has run. */
+static const char worker_script[] =
+	"(function(){if(self.__gx)return;self.__gx=1;"
+	"var nat=new WeakMap(),fts=Function.prototype.toString;"
+	"function hide(w,g){nat.set(w,g);try{Object.defineProperty(w,'name',{value:g.name});"
+	"Object.defineProperty(w,'length',{value:g.length})}catch(e){}return w}"
+	"Function.prototype.toString=hide(function toString(){return fts.call(nat.get(this)||this)},fts);"
+	"var no=/vp8|vp9|vp09|av01/i,tallest=" VIDEO_MAX_HEIGHT ";"
+	"function tall(t){var m=/height=(\\d+)/.exec(t);return m&&+m[1]>tallest}"
+	"function not(o,f){var g=o&&o[f];if(g)o[f]=hide(function(t){return no.test(t)||tall(t)?false:"
+	"g.apply(this,arguments)},g)}"
+	"not(self.MediaSource,'isTypeSupported');not(self.ManagedMediaSource,'isTypeSupported');"
+	"var mc=self.navigator&&navigator.mediaCapabilities,di=mc&&mc.decodingInfo;"
+	"if(di)mc.decodingInfo=hide(function(c){var v=c&&c.video;"
+	"if(v&&(no.test(v.contentType)||v.height>tallest))"
 	"return Promise.resolve({supported:false,smooth:false,powerEfficient:false});"
 	"return di.apply(this,arguments)},di)"
 	"})()";
@@ -282,6 +312,28 @@ static void json_escape(char *out, size_t room, const char *text)
 
 /* With a window: pages that appear are given the script, and what they say
  * is passed on to wl.c. */
+/*
+ * The page's script once more, for the document it has now and for those
+ * after it. What was asked when the page was attached stopped reaching its
+ * documents once it went from Chromium's own new tab page (chrome://) to a
+ * site: its frame is then another, which has none of it (nor sends
+ * Page.frameNavigated), and YouTube, told it could play AV1, played it on the
+ * processor. Its load events do come: so at the DOM's, before a player is
+ * made. Twice in one document is nothing: the script looks for itself.
+ */
+static void inject_again(const char *message)
+{
+	char sid[128], script[4096], params[4300];
+
+	if (string_value(message, "sessionId", sid, sizeof(sid)) <= 0)
+		return;
+	json_escape(script, sizeof(script), page_script);
+	snprintf(params, sizeof(params), "{\"source\":\"%s\"}", script);
+	send_command(sid, "Page.addScriptToEvaluateOnNewDocument", params);
+	snprintf(params, sizeof(params), "{\"expression\":\"%s\"}", script);
+	send_command(sid, "Runtime.evaluate", params);
+}
+
 static void handle_window_message(const char *message)
 {
 	char id[128];
@@ -290,9 +342,23 @@ static void handle_window_message(const char *message)
 		char script[4096], params[4300];
 		int slot = -1;
 
-		if (!strstr(message, "\"type\":\"page\"") ||
-		    string_value(message, "sessionId", id, sizeof(id)) <= 0)
+		if (string_value(message, "sessionId", id, sizeof(id)) <= 0)
 			return;
+		if (!strstr(message, "\"type\":\"page\"")) {
+			/* Something of a page's (a worker, a frame), held at its
+			 * start: a worker gets the refusals, and all go on. */
+			if (strstr(message, "\"type\":\"worker\"")) {
+				static int said;
+
+				if (said++ < 10)
+					host_log("gx: a worker of a page: no VP9 or AV1 in it either\n");
+				json_escape(script, sizeof(script), worker_script);
+				snprintf(params, sizeof(params), "{\"expression\":\"%s\"}", script);
+				send_command(id, "Runtime.evaluate", params);
+			}
+			send_command(id, "Runtime.runIfWaitingForDebugger", "{}");
+			return;
+		}
 		for (int i = 0; i < MAX_PAGES; i++) {
 			if (!strcmp(pages[i], id))
 				return;
@@ -308,6 +374,9 @@ static void handle_window_message(const char *message)
 		send_command(id, "Runtime.addBinding", "{\"name\":\"gxEdit\"}");
 		send_command(id, "Page.enable", "{}");
 		send_command(id, "Page.setInterceptFileChooserDialog", "{\"enabled\":true}");
+		/* Its workers, each held at its start for worker_script. */
+		send_command(id, "Target.setAutoAttach", "{\"autoAttach\":true,"
+			     "\"waitForDebuggerOnStart\":true,\"flatten\":true}");
 		/* For the log: requests that fail or are refused (a video that
 		 * stops is a server saying no, or a connection that broke). */
 		if (cdp_network_log) {
@@ -378,12 +447,18 @@ static void handle_window_message(const char *message)
 				 strstr(message, "\"type\":\"Media\"") ? "media" :
 				 strstr(message, "\"type\":\"XHR\"") ? "xhr" :
 				 strstr(message, "\"type\":\"Fetch\"") ? "fetch" : "other");
+	} else if (strstr(message, "\"method\":\"Page.frameNavigated\"") &&
+		   !strstr(message, "\"parentId\"")) {
+		inject_again(message);
 	} else if (strstr(message, "\"method\":\"Page.frameStartedLoading\"")) {
 		/* How long pages take to load, for the log: from the first frame
 		 * that starts loading to the page's load event. */
-		if (!load_started)
+		if (!load_started) {
 			load_started = host_now_ns();
+			host_busy(1);
+		}
 	} else if (strstr(message, "\"method\":\"Page.domContentEventFired\"")) {
+		inject_again(message);
 		if (load_started)
 			host_log("gx: page: DOM ready after %lu ms\n",
 				 (unsigned long)((host_now_ns() - load_started) / 1000000));
@@ -392,6 +467,34 @@ static void handle_window_message(const char *message)
 			host_log("gx: page: loaded in %lu ms\n",
 				 (unsigned long)((host_now_ns() - load_started) / 1000000));
 		load_started = 0;
+		host_busy(0);
+		if (cdp_network_log) {
+			/* For the log (-p): whether the page's script took
+			 * (window.__gx), and what a player is told of AV1 and H.264. */
+			char sid[128] = "";
+
+			if (string_value(message, "sessionId", sid, sizeof(sid)) > 0)
+				send_command(sid, "Runtime.evaluate",
+					     "{\"expression\":\"'gxprobe '+location.host+' gx='+(typeof window.__gx)+"
+					     "' av1='+(window.MediaSource&&MediaSource.isTypeSupported("
+					     "'video/webm; codecs=\\\"av01.0.08M.08\\\"'))+' avc='+(window.MediaSource&&"
+					     "MediaSource.isTypeSupported('video/mp4; codecs=\\\"avc1.640028\\\"'))+"
+					     "' cpt='+document.createElement('video').canPlayType('video/webm; codecs=\\\"vp9\\\"')\","
+					     "\"returnByValue\":true}");
+		}
+	} else if (strstr(message, "\"error\":{") && strstr(message, "\"id\":")) {
+		static int said;
+
+		/* A command of ours refused: said, the first ones. */
+		if (said++ < 20)
+			host_log("gx: devtools refused: %.200s\n", message);
+	} else if (strstr(message, "\"value\":\"gxprobe ")) {
+		const char *at = strstr(message, "gxprobe ");
+		int n = 0;
+
+		while (at[n] && at[n] != '"' && n < 300)
+			n++;
+		host_log("gx: %.*s\n", n, at);
 	} else if (strstr(message, "\"method\":\"Runtime.bindingCalled\"") &&
 		   strstr(message, "\"name\":\"gxEdit\"")) {
 		__atomic_store_n(&wanted, CDP_KEYBOARD, __ATOMIC_SEQ_CST);

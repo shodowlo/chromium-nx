@@ -26,11 +26,15 @@
 #include "keys.h"
 #include "wl.h"
 
-/* The screen as the page has it: landscape or portrait (wl.h). The buffers
- * hold either, the same number of pixels. */
+/* The screen as the page has it, in the window's units: landscape or
+ * portrait (wl.h). Everything is laid out in those units and drawn at the
+ * screen's own size, wl_scale pixels to the unit (1920 x 1080 on a TV and
+ * on the Switch 2): the shapes and the text at that size, sharp, rather than
+ * a picture of 1280 x 720 made larger. The buffers hold the largest. */
 #define W wl_width
 #define H wl_height
-#define PIXELS (WL_SCREEN_WIDTH * WL_SCREEN_HEIGHT)
+#define MAX_SCALE 1.5f
+#define PIXELS ((int)(WL_SCREEN_WIDTH * MAX_SCALE) * (int)(WL_SCREEN_HEIGHT * MAX_SCALE))
 
 /* RGBA in memory, R first; colours multiplied by their opacity. */
 #define RGB(r, g, b) (0xFF000000u | ((uint32_t)(b) << 16) | ((uint32_t)(g) << 8) | (uint32_t)(r))
@@ -42,29 +46,63 @@ static const uint32_t TEXT = RGB(0xE8, 0xEA, 0xF0), TEXT_DIM = RGB(0x9A, 0xA0, 0
 static const uint32_t ACCENT = RGB(0x8A, 0xB4, 0xF8), ACCENT_DARK = RGB(0x1F, 0x3B, 0x63);
 
 static uint32_t *buffers[2], *pixels;
+static int buffer_w[2], buffer_h[2];   /* each one's picture, in pixels */
 static uint32_t *shown;            /* what overlay_picture() hands out; NULL when closed */
 static unsigned serial;
 
+/* The picture being drawn: pixels to the unit, and its size in pixels. */
+static float scale = 1;
+static int pw, ph;
+
 /* ---------- drawing ---------- */
 
-static inline void blend(int x, int y, uint32_t c, int a)
+/* Starts a picture in the buffer not shown, at the screen's scale, the page
+ * under it dimmed: black at 60%. */
+static void begin_picture(void)
+{
+	int b = shown == buffers[0];
+
+	scale = wl_scale < 1 ? 1 : wl_scale > MAX_SCALE ? MAX_SCALE : wl_scale;
+	pw = (int)(W * scale + 0.5f);
+	ph = (int)(H * scale + 0.5f);
+	pixels = buffers[b];
+	buffer_w[b] = pw;
+	buffer_h[b] = ph;
+	for (int i = 0; i < pw * ph; i++)
+		pixels[i] = 0x99000000u;
+}
+
+/* A pixel of the picture. */
+static inline void blend_px(int x, int y, uint32_t c, int a)
 {
 	uint32_t d, out = 0;
 
-	if (x < 0 || y < 0 || x >= W || y >= H || a <= 0)
+	if (x < 0 || y < 0 || x >= pw || y >= ph || a <= 0)
 		return;
 	if (a >= 255) {
-		pixels[y * W + x] = c;
+		pixels[y * pw + x] = c;
 		return;
 	}
-	d = pixels[y * W + x];
+	d = pixels[y * pw + x];
 	for (int s = 0; s < 32; s += 8)
 		out |= ((((c >> s) & 0xFF) * a + ((d >> s) & 0xFF) * (255 - a)) / 255) << s;
-	pixels[y * W + x] = out;
+	pixels[y * pw + x] = out;
+}
+
+/* In pixels, a length in units. */
+static inline int px(int v)
+{
+	return (int)(v * scale + 0.5f);
 }
 
 static void rrect(int x, int y, int w, int h, int r, uint32_t c)
 {
+	/* In units; the pixels it covers, its corners as much larger. */
+	w = px(x + w) - px(x);
+	h = px(y + h) - px(y);
+	x = px(x);
+	y = px(y);
+	r = px(r);
 	if (r * 2 > h)
 		r = h / 2;
 	if (r * 2 > w)
@@ -83,18 +121,22 @@ static void rrect(int x, int y, int w, int h, int r, uint32_t c)
 				if (d > r - 1)
 					a = (int)((r - d) * 255);
 			}
-			blend(x + i, y + j, c, a);
+			blend_px(x + i, y + j, c, a);
 		}
 }
 
+/* In units; drawn in pixels. */
 static void circle(float cx, float cy, float r, uint32_t c)
 {
+	cx *= scale;
+	cy *= scale;
+	r *= scale;
 	for (int y = (int)(cy - r - 1); y <= (int)(cy + r + 1); y++)
 		for (int x = (int)(cx - r - 1); x <= (int)(cx + r + 1); x++) {
 			float d = sqrtf((x + 0.5f - cx) * (x + 0.5f - cx) + (y + 0.5f - cy) * (y + 0.5f - cy));
 
 			if (d < r + 0.5f)
-				blend(x, y, c, d < r - 0.5f ? 255 : (int)((r + 0.5f - d) * 255));
+				blend_px(x, y, c, d < r - 0.5f ? 255 : (int)((r + 0.5f - d) * 255));
 		}
 }
 
@@ -186,10 +228,12 @@ static uint32_t next_cp(const char **s)
 	return cp;
 }
 
-static int text_width(const char *s, int size)
+/* In pixels, the text made at size in units. */
+static int text_width_px(const char *s, int size)
 {
 	int w = 0;
 
+	size = px(size);
 	while (*s) {
 		struct glyph *g = glyph(next_cp(&s), size);
 
@@ -199,13 +243,24 @@ static int text_width(const char *s, int size)
 	return w;
 }
 
+/* In units. */
+static int text_width(const char *s, int size)
+{
+	return (int)(text_width_px(s, size) / scale + 0.99f);
+}
+
 enum { LEFT, CENTER, RIGHT };
 
-/* y is the baseline. */
+/* y is the baseline; in units, the text made in pixels at its size. */
 static void text(int x, int y, int size, uint32_t c, int align, const char *s)
 {
+	int w = align != LEFT ? text_width_px(s, size) : 0;
+
+	x = px(x);
+	y = px(y);
+	size = px(size);
 	if (align != LEFT)
-		x -= align == CENTER ? text_width(s, size) / 2 : text_width(s, size);
+		x -= align == CENTER ? w / 2 : w;
 	while (*s) {
 		struct glyph *g = glyph(next_cp(&s), size);
 
@@ -213,7 +268,7 @@ static void text(int x, int y, int size, uint32_t c, int align, const char *s)
 			continue;
 		for (int j = 0; j < g->h; j++)
 			for (int i = 0; i < g->w; i++)
-				blend(x + g->left + i, y - g->top + j, c, g->bits[j * g->w + i]);
+				blend_px(x + g->left + i, y - g->top + j, c, g->bits[j * g->w + i]);
 		x += g->adv;
 	}
 }
@@ -232,6 +287,14 @@ enum { R_FULL_SCREEN, R_SCREEN, R_CONTROLS, R_KEYBOARD, R_CLIPBOARD, R_QUIT, ROW
 static int open_now, focus, full_screen, mode;
 static int clip_focus;   /* the Clipboard row's button: 0 Copy, 1 Paste */
 static int quit_focus = 1;   /* the last row's: 0 the launcher, 1 Quit */
+/* On the Switch 2 there is no going back to the launcher: the program can be
+ * started again only as its title is, which there is the game homebrew was
+ * started from (host_nx.c). Quit alone. */
+#ifdef __SWITCH2__
+#define FIRST_QUIT_BUTTON 1
+#else
+#define FIRST_QUIT_BUTTON 0
+#endif
 static int bindings[GX_INPUTS];
 
 static const char *const controller_help[] = {
@@ -287,10 +350,7 @@ static void draw(void)
 {
 	int x = panel_x(), y = panel_y(), h = panel_h();
 
-	pixels = buffers[shown == buffers[0]];
-	/* The page under it, dimmed: black at 60%. */
-	for (int i = 0; i < PIXELS; i++)
-		pixels[i] = 0x99000000u;
+	begin_picture();
 	rrect(x, y, PANEL_W, h, 28, SURFACE);
 	text(x + 44, y + 54, 30, TEXT, LEFT, "Chromium NX");
 
@@ -317,8 +377,9 @@ static void draw(void)
 		rrect(bx, by, 110, 36, 18, on ? ACCENT : BUTTON);
 		text(bx + 55, by + 25, 20, on ? ACCENT_DARK : TEXT, CENTER, i ? "Paste" : "Copy");
 	}
-	row(R_QUIT, "Leave", W < 900 ? "To the launcher, or close" : "Back to the launcher, or close Chromium NX");
-	for (int i = 0; i < 2; i++) {
+	row(R_QUIT, "Leave", FIRST_QUIT_BUTTON ? "Close Chromium NX" :
+			     W < 900 ? "To the launcher, or close" : "Back to the launcher, or close Chromium NX");
+	for (int i = FIRST_QUIT_BUTTON; i < 2; i++) {
 		int bx = x + PANEL_W - 44 - (2 - i) * 120 + 10, by = row_y(R_QUIT) + 12;
 		int on = focus == R_QUIT && quit_focus == i;
 
@@ -517,9 +578,7 @@ static void draw_picker(void)
 	int x = 40, y = 40, w = W - 80, h = H - 80, rows = picker_rows();
 	char size[32];
 
-	pixels = buffers[shown == buffers[0]];
-	for (int i = 0; i < PIXELS; i++)
-		pixels[i] = 0x99000000u;
+	begin_picture();
 	rrect(x, y, w, h, 28, SURFACE);
 	text(x + 36, y + 52, 30, TEXT, LEFT, "Choose a file");
 	text(x + 36, y + 86, 18, TEXT_DIM, LEFT, fit(pick_dir + 5, 18, w - 72));
@@ -693,7 +752,7 @@ int overlay_pad(uint64_t down)
 		clip_focus = !!(down & HidNpadButton_AnyRight);
 		draw();
 	} else if ((down & (HidNpadButton_AnyLeft | HidNpadButton_AnyRight)) && focus == R_QUIT) {
-		quit_focus = !!(down & HidNpadButton_AnyRight);
+		quit_focus = FIRST_QUIT_BUTTON || !!(down & HidNpadButton_AnyRight);
 		draw();
 	} else if ((down & (HidNpadButton_AnyLeft | HidNpadButton_AnyRight)) && focus == R_SCREEN) {
 		return OVERLAY_ORIENTATION;
@@ -725,7 +784,7 @@ int overlay_touch(int x, int y)
 				if (i == R_CLIPBOARD)
 					clip_focus = x >= first + 120;
 				else
-					quit_focus = x >= first + 120;
+					quit_focus = FIRST_QUIT_BUTTON || x >= first + 120;
 			}
 			draw();
 			return choose(i, 1);
@@ -776,10 +835,13 @@ const uint32_t *overlay_cursor(int *width, int *height)
 const uint32_t *overlay_picture(int *x, int *y, int *width, int *height, unsigned *serial_out)
 {
 	const uint32_t *picture = __atomic_load_n(&shown, __ATOMIC_SEQ_CST);
+	int b = picture == buffers[1];
 
+	/* At (0, 0), in pixels already: the size it was drawn at
+	 * (begin_picture()), which glwin.c lays as it is. */
 	*x = *y = 0;
-	*width = W;
-	*height = H;
+	*width = buffer_w[b];
+	*height = buffer_h[b];
 	*serial_out = __atomic_load_n(&serial, __ATOMIC_SEQ_CST);
 	return picture;
 }

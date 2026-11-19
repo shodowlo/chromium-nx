@@ -22,6 +22,7 @@
  * a host without such memory, every view of a file is at the same address.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <lkl.h>
 #include "gx.h"
@@ -53,6 +54,7 @@
  * 256 KB went through them. */
 #define DATA_UNIT (1UL << 20)
 #define DATA_PROT (GX_PROT_READ | GX_PROT_WRITE)
+#define LIBRARY_RESERVATION_MAX (64UL << 20)   /* see find_free_anonymous() */
 #define MAX_SHARED 512
 #define MAX_VIEWS 4096
 #define MAX_CHUNKS 256
@@ -109,7 +111,10 @@ static struct view views[MAX_VIEWS];
 static uint8_t *arena;
 static uint8_t page_state[ARENA_MAX_PAGES];
 static uint64_t arena_size;    /* what the host could reserve */
-static uint64_t search_hint;
+static uint64_t search_hint[2];
+/* Where each kind of memory goes (host_arena_window()), in pages of the
+ * arena: [window_lo, window_hi). */
+static uint64_t window_lo[2], window_hi[2];
 static struct image images[MAX_IMAGES];
 static uint64_t brk_start, brk_cur;
 static struct host_lock *lock;
@@ -139,28 +144,40 @@ int gmem_init(void)
 		if (in_arena(from, to - from))
 			memset(&page_state[page_of(from)], PG_USED | PG_HOLE, (to - from) / GX_PAGE);
 	}
+	for (int kind = GX_ARENA_DATA; kind <= GX_ARENA_IMAGES; kind++) {
+		uint64_t start = (uint64_t)arena, end = (uint64_t)arena + arena_size;
+
+		host_arena_window(kind, &start, &end);
+		if (start < (uint64_t)arena)
+			start = (uint64_t)arena;
+		if (end > (uint64_t)arena + arena_size || end <= start)
+			end = (uint64_t)arena + arena_size;
+		window_lo[kind] = search_hint[kind] = page_of(GX_PAGE_UP(start));
+		window_hi[kind] = page_of(GX_PAGE_DOWN(end));
+	}
 	lock = host_lock_new();
 	return 0;
 }
 
-/* Finds free pages at an address that is a multiple of align bytes. */
-static uint64_t find_free_aligned(uint64_t pages, uint64_t align)
+/* Finds free pages for a kind of memory at an address that is a multiple of
+ * align bytes. */
+static uint64_t find_free_aligned(uint64_t pages, uint64_t align, int kind)
 {
 	for (int pass = 0; pass < 2; pass++) {
-		uint64_t addr = (uint64_t)arena + (pass ? 0 : search_hint) * GX_PAGE;
+		uint64_t addr = (uint64_t)arena + (pass ? window_lo[kind] : search_hint[kind]) * GX_PAGE;
 
 		for (;;) {
 			uint64_t first, p;
 
 			addr = (addr + align - 1) & ~(align - 1);
 			first = page_of(addr);
-			if (first >= (arena_size / GX_PAGE) || pages > (arena_size / GX_PAGE) - first)
+			if (first >= window_hi[kind] || pages > window_hi[kind] - first)
 				break;
 			for (p = first; p < first + pages && !(page_state[p] & PG_USED); p++)
 				;
 			if (p == first + pages) {
 				if (align == GX_PAGE)
-					search_hint = p;
+					search_hint[kind] = p;
 				return addr;
 			}
 			addr = (uint64_t)arena + (p + 1) * GX_PAGE;
@@ -169,23 +186,43 @@ static uint64_t find_free_aligned(uint64_t pages, uint64_t align)
 	return 0;
 }
 
+/* Pages from first on are free again: the next search of their window may
+ * start there. */
+static void freed_from(uint64_t first)
+{
+	for (int kind = GX_ARENA_DATA; kind <= GX_ARENA_IMAGES; kind++)
+		if (first >= window_lo[kind] && first < window_hi[kind] && first < search_hint[kind])
+			search_hint[kind] = first;
+}
+
 static uint64_t find_free(uint64_t pages)
 {
-	return find_free_aligned(pages, GX_PAGE);
+	return find_free_aligned(pages, GX_PAGE, GX_ARENA_DATA);
 }
 
 /* Large anonymous mappings are given the alignment of their size: allocators
  * that need aligned memory (glibc's arenas, PartitionAlloc's pools of tens of
  * gigabytes) otherwise map twice as much to cut an aligned piece out of it,
- * which the arena may not have. */
-static uint64_t find_free_anonymous(uint64_t size)
+ * which the arena may not have. Executable ones go with the images: a host
+ * may have code only there. */
+static uint64_t find_free_anonymous(uint64_t size, int prot)
 {
-	uint64_t align = GX_PAGE;
+	uint64_t align = GX_PAGE, addr;
 
 	if (size >= (2UL << 20))
 		while (align * 2 <= size && align < (32UL << 30))
 			align *= 2;
-	return find_free_aligned(size / GX_PAGE, align);
+	if (prot & GX_PROT_EXEC)
+		return find_free_aligned(size / GX_PAGE, align, GX_ARENA_IMAGES);
+	/* A small reservation, nothing to be read or written yet, is where
+	 * ld.so puts a library (a file mapped with its code then goes inside
+	 * it, at a fixed address): with the images, while they have room.
+	 * The allocators' reservations are larger (V8's 4 GB, PartitionAlloc's
+	 * pools, glibc's arenas of 128 MB) and data. */
+	if (!(prot & PG_PROT) && size <= LIBRARY_RESERVATION_MAX &&
+	    (addr = find_free_aligned(size / GX_PAGE, align, GX_ARENA_IMAGES)))
+		return addr;
+	return find_free_aligned(size / GX_PAGE, align, GX_ARENA_DATA);
 }
 
 /* What a host that commits for real has to find: pages committed now and at
@@ -211,6 +248,9 @@ static void count_committed(int64_t pages, uint64_t last_page)
 /* Where the time of mapping files goes: reading them, and patching their
  * code. */
 static uint64_t file_read_ns, file_read_bytes, patch_ns;
+/* Of patch_ns: opening and closing veneer pools (their pages' protection,
+ * which on the Switch 2 is a request to another process), and how many. */
+static uint64_t pool_protect_ns, pools_opened;
 #ifdef __SWITCH2__
 static uint64_t counter_reads_patched;   /* cntvct_el0 made cntpct_el0 (patch_syscalls()) */
 #endif
@@ -274,9 +314,11 @@ static void report_regions(int now)
 void gmem_report(void)
 {
 	if (file_read_bytes)
-		host_log("gx: mapped files: %lu MB read in %lu ms, %lu ms patching code\n",
+		host_log("gx: mapped files: %lu MB read in %lu ms, %lu ms patching code (%lu ms of it "
+			 "opening and closing %lu veneer pools)\n",
 			 (unsigned long)(file_read_bytes >> 20), (unsigned long)(file_read_ns / 1000000),
-			 (unsigned long)(patch_ns / 1000000));
+			 (unsigned long)(patch_ns / 1000000), (unsigned long)(pool_protect_ns / 1000000),
+			 (unsigned long)pools_opened);
 #ifdef __SWITCH2__
 	host_log("gx: reads of the virtual counter made reads of the physical one: %lu\n",
 		 (unsigned long)counter_reads_patched);
@@ -377,8 +419,7 @@ static void release(uint64_t addr, uint64_t len)
 	if (committed)
 		host_decommit((void *)addr, len);
 	memset(&page_state[first], 0, n);
-	if (first < search_hint)
-		search_hint = first;
+	freed_from(first);
 }
 
 static int commit(uint64_t addr, uint64_t len, int prot)
@@ -592,7 +633,7 @@ static struct image *add_image(uint64_t addr, uint64_t len, uint64_t pool, uint6
 static uint64_t new_image(uint64_t len)
 {
 	uint64_t pool = pool_size_for(len);
-	uint64_t addr = find_free((len + pool) / GX_PAGE);
+	uint64_t addr = find_free_aligned((len + pool) / GX_PAGE, GX_PAGE, GX_ARENA_IMAGES);
 
 	if (!addr || !add_image(addr, len, addr + len, pool))
 		return 0;
@@ -607,7 +648,12 @@ static struct image *adopt_image(uint64_t addr, uint64_t len)
 {
 	uint64_t pool = pool_size_for(len), run = 0;
 
-	for (uint64_t p = page_of(addr + len); p < (arena_size / GX_PAGE); p++) {
+	/* After it, in the window of images when the mapping is there (the
+	 * code goes there on a host that has code only there). */
+	uint64_t end = page_of(addr) >= window_lo[GX_ARENA_IMAGES] && page_of(addr) < window_hi[GX_ARENA_IMAGES]
+		       ? window_hi[GX_ARENA_IMAGES] : arena_size / GX_PAGE;
+
+	for (uint64_t p = page_of(addr + len); p < end; p++) {
 		run = (page_state[p] & PG_USED) ? 0 : run + 1;
 		if (run == pool / GX_PAGE)
 			return add_image(addr, len, (uint64_t)arena + (p + 1) * GX_PAGE - pool, pool);
@@ -628,17 +674,33 @@ static struct image *adopt_image(uint64_t addr, uint64_t len)
  * the function's own way out, which unlocks its mutex: an unmapping it does
  * not know of is let go. Debian's chromium 156.0.8078.73-1~deb12u1, arm64.
  */
+/*
+ * Also, on any host: Chromium (from 151) leaves full screen when the bubble
+ * saying how to leave it is not seen presented within 1.5 s
+ * (ExclusiveAccessBubbleViews::Show() arms presentation_watchdog_timer_, of
+ * exclusive_access_bubble_views.cc line 475; only OnFirstPresentation stops
+ * it). Under gx the bubble's window never is (F11 and a video's full screen
+ * fell back after 1.5 s): its test for a headless browser, which arms none,
+ * is made to say yes there, and the timer is never armed. The bubble itself
+ * is still shown.
+ */
 static const struct program_fix {
 	const char *path;
 	uint64_t offset;          /* in the file */
 	uint32_t before[8];       /* the words up to it, the last being it */
+	int any_branch;           /* the one of them that is a b of any offset, or -1 */
 	uint32_t word;            /* what it becomes */
 } program_fixes[] = {
 	{ "/usr/lib/chromium/chromium", 0x94ac238,
 	  { 0x91002260u /* add x0, x19, #0x8 */, 0xa9424ff4u, 0xf9400bf5u, 0xa8c37bfdu,
 	    0xd50323bfu /* autiasp */, 0x14000000u /* b ... (any) */, 0xd4200020u /* brk #1 */,
 	    0xd4200000u /* brk #0 */ },
-	  0x17fffff9u /* b -0x1c: to the add x0, x19, #0x8 */ },
+	  5, 0x17fffff9u /* b -0x1c: to the add x0, x19, #0x8 */ },
+	{ "/usr/lib/chromium/chromium", 0x8bd3370,
+	  { 0xf9403508u, 0xd63f0100u, 0xf9408660u /* ldr x0, [x19, #264] */, 0xf9400008u,
+	    0xf9402d08u, 0xd63f0100u /* blr x8 */, 0x979e29f4u /* bl: headless? */,
+	    0x370005c0u /* tbnz w0, #0, +0xb8: no watchdog */ },
+	  -1, 0x1400002eu /* b +0xb8: never a watchdog */ },
 };
 
 static void fix_program(const char *path, uint64_t addr, uint64_t off, uint64_t len)
@@ -655,7 +717,7 @@ static void fix_program(const char *path, uint64_t addr, uint64_t off, uint64_t 
 			uint32_t w = site[k - 7];
 
 			/* The tail call's offset is the program's own. */
-			if (k == 5 ? (w & 0xFC000000u) != 0x14000000u : w != f->before[k])
+			if (k == f->any_branch ? (w & 0xFC000000u) != 0x14000000u : w != f->before[k])
 				same = 0;
 		}
 		if (!same) {
@@ -702,11 +764,18 @@ static int patch_syscalls(uint64_t addr, uint64_t len)
 			ret = -1;
 			break;
 		}
-		if (!patched && host_protect((void *)img->pool, img->pool_end - img->pool,
-					     GX_PROT_READ | GX_PROT_WRITE)) {
-			host_log("gx: cannot open the veneer pool at %#lx\n",
-				 (unsigned long)img->pool);
-			return -1;
+		if (!patched) {
+			uint64_t t = host_now_ns();
+			int bad = host_protect((void *)img->pool, img->pool_end - img->pool,
+					       GX_PROT_READ | GX_PROT_WRITE);
+
+			pool_protect_ns += host_now_ns() - t;
+			pools_opened++;
+			if (bad) {
+				host_log("gx: cannot open the veneer pool at %#lx\n",
+					 (unsigned long)img->pool);
+				return -1;
+			}
 		}
 		v = (uint32_t *)img->pool_next;
 		to_veneer = (int64_t)(img->pool_next - site);
@@ -729,8 +798,12 @@ static int patch_syscalls(uint64_t addr, uint64_t len)
 		patched++;
 	}
 	if (patched) {
-		if (host_protect((void *)img->pool, img->pool_end - img->pool,
-				 GX_PROT_READ | GX_PROT_EXEC)) {
+		uint64_t t = host_now_ns();
+		int bad = host_protect((void *)img->pool, img->pool_end - img->pool,
+				       GX_PROT_READ | GX_PROT_EXEC);
+
+		pool_protect_ns += host_now_ns() - t;
+		if (bad) {
 			host_log("gx: cannot close the veneer pool at %#lx\n",
 				 (unsigned long)img->pool);
 			return -1;
@@ -761,8 +834,7 @@ static void unmap_chunk(struct chunk *c, uint64_t base)
 {
 	host_shared_unmap(c->handle, (void *)base, c->size);
 	memset(&page_state[page_of(base)], 0, c->size / GX_PAGE);
-	if (page_of(base) < search_hint)
-		search_hint = page_of(base);
+	freed_from(page_of(base));
 }
 
 /* Where a mapping of a chunk goes. On a 2 MB boundary when the chunk is that
@@ -771,7 +843,7 @@ static void unmap_chunk(struct chunk *c, uint64_t base)
  * mappings of 16 MB made of pages take them all, and the next one fails). */
 static uint64_t find_chunk_place(uint64_t size)
 {
-	return find_free_aligned(size / GX_PAGE, size >= (2UL << 20) ? 2UL << 20 : GX_PAGE);
+	return find_free_aligned(size / GX_PAGE, size >= (2UL << 20) ? 2UL << 20 : GX_PAGE, GX_ARENA_DATA);
 }
 
 /* Gets a chunk of the host's shared memory, mapped for ourselves. */
@@ -911,18 +983,28 @@ static void load_shared(const struct shared *s, int fd, const struct lkl_stat *s
 {
 	if (gmem_in_memory_fs(fd)) {
 		uint64_t last = GX_PAGE_DOWN(st->st_size - 1);
-		struct { void *base; uint64_t len; } iov = { (void *)(s->addr + last), st->st_size - last };
-		long params[6] = { fd, (long)&iov, 1, last, 0, LKL_RWF_NOWAIT };
+		struct lkl_stat after;
 
 		if (!st->st_blocks)
 			return;
-		/* That page alone, if it is in memory: nothing else is. */
+		/* That page alone: nothing else is. Every hole read is a page
+		 * the kernel gives the file for good, and read whole, the
+		 * shared memory Discord's login page makes (dozens of 2 MB,
+		 * each a page in it) filled the kernel's 192 MB: it panicked.
+		 * (Not with RWF_NOWAIT, which the memory filesystem refuses,
+		 * nor page by page: its read-ahead makes the holes pages.) If
+		 * the page was not the one there (the file has one more), the
+		 * whole file after all. */
 		if ((uint64_t)st->st_blocks * 512 <= GX_PAGE && (uint64_t)st->st_size > GX_PAGE &&
-		    lkl_syscall(__lkl__NR_preadv2, params) == (long)iov.len)
+		    lkl_sys_pread64(fd, (char *)s->addr + last, st->st_size - last, last) ==
+			    (long)(st->st_size - last) &&
+		    !lkl_sys_fstat(fd, &after) && after.st_blocks == st->st_blocks)
 			return;
 	}
 	read_file(fd, 0, (uint8_t *)s->addr, st->st_size);
 }
+
+static uint64_t kernel_free(void);
 
 /* Gives up the copy of a shared file: its contents go back to the file. */
 static void close_shared(struct shared *s)
@@ -936,9 +1018,37 @@ static void close_shared(struct shared *s)
 		if (s->written && !lkl_sys_fstat(s->fd, &st)) {
 			uint64_t len = (uint64_t)st.st_size < s->size ? (uint64_t)st.st_size : s->size;
 
-			for (uint64_t done = 0; done < len;) {
-				long n = lkl_sys_pwrite64(s->fd, (char *)s->addr + done, len - done, done);
+			if (gx_trace || getenv("GX_SHARED_LOG"))
+				host_log("gx: shared file of %lu KB back to the file (kernel free %lu MB, %d kept, chunk %d)\n",
+					 (unsigned long)(len >> 10), (unsigned long)(kernel_free() >> 20), kept_count,
+					 !!s->chunk);
 
+			/* To the memory filesystem, the pages that are not all
+			 * zeroes, and no others: each page written there is the
+			 * kernel's for good, and shared memory is mostly
+			 * zeroes. Only while the file has none but the page of
+			 * its last byte (ftruncate in gsys.c): the rest are
+			 * holes, which read as zeroes. */
+			int sparse = gmem_in_memory_fs(s->fd) && (uint64_t)st.st_blocks * 512 <= GX_PAGE;
+			uint64_t last_page = GX_PAGE_DOWN(len - 1);
+
+			for (uint64_t done = 0; done < len;) {
+				uint64_t run = len - done;
+				long n;
+
+				if (sparse) {
+					const uint64_t *w = (const uint64_t *)(s->addr + done);
+					uint64_t page = len - done < GX_PAGE ? len - done : GX_PAGE, i = 0;
+
+					while (i < page / 8 && !w[i])
+						i++;
+					if (i == page / 8 && done != last_page) {
+						done += GX_PAGE;
+						continue;
+					}
+					run = page;
+				}
+				n = lkl_sys_pwrite64(s->fd, (char *)s->addr + done, run, done);
 				if (n <= 0)
 					break;
 				done += n;
@@ -958,8 +1068,25 @@ static void discard_shared(struct shared *s)
 {
 	lkl_sys_close(s->fd);
 	kept_count--;
-	free_shared(s);
+	if (s->chunk)
+		free_shared(s);
+	else
+		release(s->addr, s->size);
 	memset(s, 0, sizeof(*s));
+}
+
+/* Shared memory of a host that has none (the Switch 2): a file of the memory
+ * filesystem without a name, whose one copy is ours (every view at its
+ * address). Given back at its last view, every page of it written there
+ * would be the kernel's for good (the memory filesystem drops none), and the
+ * kernel has 192 MB. It stays ours instead, as pooled chunks do, until it is
+ * dead or the table is nearly full. */
+static int keep_unshared(const struct shared *s)
+{
+	struct lkl_stat st;
+
+	return !s->chunk && s->own && !lkl_sys_fstat(s->fd, &st) && !st.st_nlink &&
+	       gmem_in_memory_fs(s->fd);
 }
 
 /* What the kernel has free (not counting what it could drop of its caches). */
@@ -997,6 +1124,10 @@ static void collect_shared(void)
 		if (s->written && s->chunk && s->chunk->pooled && kept_count < KEEP_MAX * 4 &&
 		    kernel_free() < s->size + KERNEL_RESERVE && gmem_in_memory_fs(s->fd))
 			continue;
+		/* Ours without the host's objects to run out of: only the table's
+		 * room limits them (see keep_unshared()). */
+		if (s->written && !s->chunk && kept_count < MAX_SHARED - 32)
+			continue;
 		close_shared(s);
 	}
 }
@@ -1007,7 +1138,7 @@ static void collect_shared(void)
  * of a picture going from one thread of Chromium to another. */
 static void retire_shared(struct shared *s)
 {
-	if (!s->chunk || !s->own) {
+	if ((!s->chunk && !keep_unshared(s)) || !s->own) {
 		close_shared(s);
 		return;
 	}
@@ -1226,7 +1357,7 @@ static long do_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd, ui
 		}
 		unmap_range(addr, size);
 	} else {
-		addr = anonymous ? find_free_anonymous(size) : new_image(size);
+		addr = anonymous ? find_free_anonymous(size, prot) : new_image(size);
 		if (!addr)
 			return -GX_ENOMEM;
 	}
@@ -1311,6 +1442,9 @@ static long do_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd, ui
 		if (n > 0)
 			fix_program(path, addr, off, len);
 		patch_ns += host_now_ns() - t0;
+		if (size >= (8UL << 20))
+			host_log("gx: %lu MB of code patched in %lu ms\n", (unsigned long)(size >> 20),
+				 (unsigned long)((host_now_ns() - t0) / 1000000));
 		host_flush_icache((void *)addr, size);
 	}
 	if (prot != (GX_PROT_READ | GX_PROT_WRITE)) {

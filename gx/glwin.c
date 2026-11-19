@@ -89,6 +89,11 @@ static struct window windows[MAX_WINDOWS];
 static struct window *current;       /* the one the guest has current to draw in */
 static const struct glwin_host *host;
 static void *screen, *context;
+/* What the guest draws in: the screen, but for a screen that cannot be as
+ * large as the window (the Switch 2 in portrait: its system shows a buffer
+ * as wide as the screen whatever is asked, so the screen stays 1920 x 1080
+ * and the window is 1080 x 1920); a buffer of ours then (make_canvas()). */
+static void *canvas;
 static void *screen_config;   /* what the screen was made with: to make it again, turned */
 static int screen_portrait;   /* how the screen is made now (wl.h) */
 static int screen_w, screen_h;   /* and its size in pixels */
@@ -101,12 +106,14 @@ static void *(*GetCurrentContext)(void);
 static void *(*GetCurrentSurface)(int32_t);
 static unsigned (*SwapBuffers)(void *, void *);
 static unsigned (*DestroySurface)(void *, void *);
+static void *(*CreatePbufferSurface)(void *, void *, const int32_t *);
 static unsigned (*QuerySurface)(void *, void *, int32_t, int32_t *);
 static int32_t (*GetError)(void);
 static unsigned (*GlError)(void);
 static void (*Viewport)(int32_t, int32_t, int32_t, int32_t);
 static void (*ClearColor)(float, float, float, float);
 static void (*Clear)(unsigned);
+static void (*Finish)(void);
 static void (*GenTextures)(int32_t, unsigned *);
 static void (*DeleteTextures)(int32_t, const unsigned *);
 static void (*BindTexture)(unsigned, unsigned);
@@ -142,9 +149,9 @@ static int find_functions(void)
 		{ "eglCreateContext", &CreateContext },
 		{ "eglMakeCurrent", &MakeCurrent }, { "eglGetCurrentContext", &GetCurrentContext },
 		{ "eglGetCurrentSurface", &GetCurrentSurface }, { "eglSwapBuffers", &SwapBuffers },
-		{ "eglDestroySurface", &DestroySurface },
+		{ "eglDestroySurface", &DestroySurface }, { "eglCreatePbufferSurface", &CreatePbufferSurface },
 		{ "eglQuerySurface", &QuerySurface }, { "eglGetError", &GetError }, { "glGetError", &GlError },
-		{ "glViewport", &Viewport }, { "glClearColor", &ClearColor }, { "glClear", &Clear },
+		{ "glViewport", &Viewport }, { "glClearColor", &ClearColor }, { "glClear", &Clear }, { "glFinish", &Finish },
 		{ "glGenTextures", &GenTextures }, { "glDeleteTextures", &DeleteTextures },
 		{ "glBindTexture", &BindTexture }, { "glTexParameteri", &TexParameteri },
 		{ "glCopyTexImage2D", &CopyTexImage2D }, { "glTexImage2D", &TexImage2D }, { "glEnable", &Enable }, { "glDisable", &Disable },
@@ -310,9 +317,11 @@ static void draw_overlay(void)
 	if (host->cursor && (picture = host->cursor(&x, &y, &width, &height)))
 		draw_picture(&cursor_texture, &cursor_serial, 0, picture, (int)(x * wl_scale), (int)(y * wl_scale),
 			     width, height, (int)(width * wl_scale), (int)(height * wl_scale));
+	/* The overlay is drawn at the screen's size already (overlay.c): its
+	 * pixels are the screen's. */
 	if (host->overlay && (picture = host->overlay(&x, &y, &width, &height, &now)))
 		draw_picture(&texture, &serial, now, picture, (int)(x * wl_scale), (int)(y * wl_scale), width, height,
-			     (int)(width * wl_scale), (int)(height * wl_scale));
+			     width, height);
 }
 
 static void draw_picture(unsigned *texture_slot, unsigned *serial_slot, unsigned now, const uint32_t *picture,
@@ -350,11 +359,43 @@ static void draw_picture(unsigned *texture_slot, unsigned *serial_slot, unsigned
  * host turning what is shown of it. On the guest's thread that draws, in
  * the middle of its eglSwapBuffers(): what the guest had current on the old
  * screen is to be the new one. */
+#ifdef __SWITCH2__
+#define CANVAS_APART 1
+#else
+#define CANVAS_APART 0
+#endif
+
+static void make_canvas(void *dpy, void *config)
+{
+	if (canvas && canvas != screen)
+		DestroySurface(dpy, canvas);
+	canvas = screen;
+	if (CANVAS_APART && screen_portrait) {
+		const int32_t size[] = { 0x3057 /* EGL_WIDTH */, screen_w, 0x3056 /* EGL_HEIGHT */, screen_h,
+					 0x3038 /* EGL_NONE */ };
+		void *made = CreatePbufferSurface(dpy, config, size);
+
+		if (made)
+			canvas = made;
+		else
+			host_log("gx: gl: no %dx%d buffer to draw a tall window in (%#x)\n", screen_w, screen_h,
+				 GetError());
+	}
+}
+
 static int turn_screen(void *dpy, void **was_draw, void **was_read)
 {
-	void *old = screen, *fresh;
+	void *old = screen, *old_canvas = canvas, *fresh;
 
+	/* All it was asked done first: the old screen's buffers are the
+	 * window's until then, and a new screen on the same window was
+	 * refused while they were (Zink: VK_ERROR_NATIVE_WINDOW_IN_USE_KHR). */
+	if (context && MakeCurrent(dpy, screen, screen, context))
+		Finish();
 	MakeCurrent(dpy, NULL, NULL, NULL);
+	if (canvas && canvas != screen)
+		DestroySurface(dpy, canvas);
+	canvas = NULL;
 	DestroySurface(dpy, old);
 	screen_portrait = wl_height > wl_width;
 	screen_w = SCREEN_W;
@@ -366,10 +407,11 @@ static int turn_screen(void *dpy, void **was_draw, void **was_read)
 		return -1;
 	}
 	screen = fresh;
-	if (*was_draw == old)
-		*was_draw = screen;
-	if (*was_read == old)
-		*was_read = screen;
+	make_canvas(dpy, screen_config);
+	if (*was_draw == old || *was_draw == old_canvas)
+		*was_draw = canvas;
+	if (*was_read == old || *was_read == old_canvas)
+		*was_read = canvas;
 	host_log("gx: gl: the screen is %s, %dx%d\n", screen_portrait ? "portrait" : "landscape",
 		 screen_w, screen_h);
 	return MakeCurrent(dpy, screen, screen, context) ? 0 : -1;
@@ -385,8 +427,14 @@ static void present(void *dpy, struct window *presented, unsigned gone)
 	int32_t x, y;
 
 	if (!prepare(dpy, NULL)) {
-		if (presented)
+		if (presented) {
+			/* What it drew is in the canvas, which may not be the screen. */
+			if (canvas && canvas != screen)
+				MakeCurrent(dpy, screen, canvas, context);
 			keep(presented);
+			if (canvas && canvas != screen)
+				MakeCurrent(dpy, screen, screen, context);
+		}
 		if (gone)
 			DeleteTextures(1, &gone);
 		/* Turned (portrait), or made larger or smaller (the dock). */
@@ -401,7 +449,12 @@ static void present(void *dpy, struct window *presented, unsigned gone)
 		 * console shows the top as it is held flat (gl_screen()); the
 		 * picture is turned there, its top to the left. A TV shows no
 		 * picture the console turns itself, and one taller than it. */
-		if (screen_portrait) {
+		if (screen_portrait && CANVAS_APART) {
+			/* The screen is as the console is held flat (1920 x 1080),
+			 * the window drawn in it turned the same way. */
+			Viewport(0, 0, screen_h, screen_w);
+			Uniform4f(turn, 0, -1, 1, 0);
+		} else if (screen_portrait) {
 			int side = screen_h > screen_w ? screen_h : screen_w;
 
 			Viewport(0, side - screen_w, screen_h, screen_w);
@@ -426,7 +479,20 @@ static void present(void *dpy, struct window *presented, unsigned gone)
 		draw_overlay();
 		if (host->presented)
 			host->presented(dpy, screen);
-		SwapBuffers(dpy, screen);
+		if (!SwapBuffers(dpy, screen)) {
+			/* The screen is gone from under us: on the Switch 2, while
+			 * a page loads, Zink at times makes its swapchain again,
+			 * OunceVK refuses it (VK_ERROR_NATIVE_WINDOW_IN_USE_KHR;
+			 * the window did not change size, with the boost or
+			 * without) and Zink kills it: every picture after was
+			 * lost, the screen black for good (after a search, it was
+			 * seen first). Made again, as for a turn. */
+			static unsigned remade;
+
+			host_log("gx: gl: the screen is lost (%#x): made again (%u)\n", GetError(), ++remade);
+			if (screen_config && turn_screen(dpy, &was_draw, &was_read))
+				host_log("gx: gl: the lost screen could not be made again\n");
+		}
 	}
 	MakeCurrent(dpy, was_draw, was_read, was_context);
 }
@@ -453,6 +519,7 @@ void *glwin_create(void *dpy, void *config, void *guest_window)
 		if (!screen)
 			return NULL;
 		screen_config = config;
+		make_canvas(dpy, config);
 		prepare(dpy, config);
 		MakeCurrent(dpy, was_draw, was_read, was_context);
 	}
@@ -460,8 +527,7 @@ void *glwin_create(void *dpy, void *config, void *guest_window)
 	w->used = 1;
 	w->guest = guest_window;
 	measure(w);
-	if (gx_trace)
-		host_log("gx: gl: a window surface for wl_surface %u, %dx%d\n", w->id, w->width, w->height);
+	host_log("gx: gl: a window surface for wl_surface %u, %dx%d\n", w->id, w->width, w->height);
 	return w;
 }
 
@@ -493,6 +559,7 @@ int glwin_destroy(void *dpy, void *surface)
 	if (!w)
 		return -1;
 	/* What it showed is taken off the screen by drawing the rest again. */
+	host_log("gx: gl: the window surface for wl_surface %u is gone\n", w->id);
 	texture = w->texture;
 	if (current == w)
 		current = NULL;
@@ -518,7 +585,7 @@ int glwin_query(void *dpy, void *surface, int32_t attribute, int32_t *value)
 
 void *glwin_surface(void *surface)
 {
-	return window_of(surface) ? screen : surface;
+	return window_of(surface) ? canvas : surface;
 }
 
 int glwin_make_current(void *dpy, void *draw, void *read, void *ctx)
@@ -531,7 +598,7 @@ int glwin_make_current(void *dpy, void *draw, void *read, void *ctx)
 		return 0;
 	/* Which of the windows it is now drawing in: they are all the same
 	 * surface underneath. */
-	if (w || !draw || glwin_surface(draw) != screen)
+	if (w || !draw || glwin_surface(draw) != canvas)
 		current = w;
 	return 1;
 }
@@ -543,5 +610,5 @@ void *glwin_current_surface(int32_t which)
 	if (find_functions())
 		return NULL;
 	real = GetCurrentSurface(which);
-	return real && real == screen && current ? (void *)current : real;
+	return real && real == canvas && current ? (void *)current : real;
 }

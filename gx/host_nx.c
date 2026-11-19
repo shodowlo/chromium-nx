@@ -31,6 +31,9 @@
  *     which keeps its contents but leaves a short window without the page.
  */
 #include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <dirent.h>
 #include <malloc.h>
 #include <stdarg.h>
@@ -134,18 +137,41 @@ extern int lkl_blk_sync;   /* gx/lkl/virtio_blk.c */
 #define POOL_MAX ((2048UL - 16) << 20)   /* see host_reserve() */
 /* Host functions called for the guest (the GL driver) run on these too. On
  * the Switch 2 the driver is Zink over NVK, whose shader compiler (NIR, NAK)
- * wants much more than Mesa for the Switch did, and an overflow there is a
- * fault, which ends the process without a word (see JS_FLAGS): 8 MB, as on
- * Linux. */
+ * wants more than Mesa for the Switch did, and an overflow there is a fault,
+ * which ends the process without a word (see JS_FLAGS). Not more: the stacks
+ * are in the stack region, of which the images take most (host_reserve()). */
 #ifdef __SWITCH2__
-#define MAIN_STACK (8UL << 20)
-#define THREAD_STACK (8UL << 20)
+#define MAIN_STACK (4UL << 20)
+#define THREAD_STACK (2UL << 20)
 #else
 #define MAIN_STACK (4UL << 20)
 #define THREAD_STACK (1UL << 20)
 #endif
 /* The only priority Horizon time-slices: guest threads may spin. */
 #define GUEST_PRIO 0x3B
+
+/* The cores our threads may run on: those the system gives the program
+ * (svcGetInfo), which on the Switch 1 are three and on the Switch 2 more;
+ * three had been written in, which left the Switch 2's others idle. */
+static u64 cores = 0x7;
+static int core_list[64] = { 0, 1, 2 }, core_count = 3;
+
+static void cores_init(void)
+{
+	u64 mask = 0;
+
+	if (R_SUCCEEDED(svcGetInfo(&mask, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0)) && mask) {
+#ifdef __SWITCH2__
+		cores = mask;
+#else
+		cores = mask & 0x7 ? mask & 0x7 : mask;
+#endif
+	}
+	core_count = 0;
+	for (int i = 0; i < 64; i++)
+		if (cores >> i & 1)
+			core_list[core_count++] = i;
+}
 
 static Mutex print_lock, mem_lock, screen_lock;
 static FILE *log_file;
@@ -199,9 +225,85 @@ static __attribute__((unused)) void console_back(void)
  * never lets go: 1 the console, 2 the log, 3 the card. */
 static volatile int print_stage;
 
+/*
+ * The log as it is written, for whoever reads it on the network (port
+ * LOG_PORT, log_server()): the last LOG_RING bytes, then what comes, as it
+ * comes. The card has it only a quarter of a second later, and only once
+ * the program is left; this is the way to watch a browser running, and to
+ * see its last lines when it dies without a word (the Switch 2's way).
+ */
+#define LOG_PORT 6100
+#define LOG_RING (512 << 10)
+static char log_ring[LOG_RING];
+static volatile u64 log_ring_end;   /* bytes ever written; under print_lock */
+
+static void log_ring_add(const void *buf, size_t len)
+{
+	const char *p = buf;
+
+	for (size_t i = 0; i < len; i++)
+		log_ring[(log_ring_end + i) % LOG_RING] = p[i];
+	__atomic_store_n(&log_ring_end, log_ring_end + len, __ATOMIC_RELEASE);
+}
+
+static void log_server(void *arg)
+{
+	int listener = socket(AF_INET, SOCK_STREAM, 0), one = 1;
+	struct sockaddr_in at = { .sin_family = AF_INET, .sin_port = htons(LOG_PORT) };
+
+	(void)arg;
+	setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+	if (listener < 0 || bind(listener, (struct sockaddr *)&at, sizeof(at)) || listen(listener, 2)) {
+		host_log("gx: no log on the network (%d)\n", errno);
+		return;
+	}
+	host_log("gx: the log is on the network too, port %d\n", LOG_PORT);
+	for (;;) {
+		int client = accept(listener, NULL, NULL);
+		u64 sent;
+
+		if (client < 0) {
+			svcSleepThread(1000000000ULL);
+			continue;
+		}
+		sent = __atomic_load_n(&log_ring_end, __ATOMIC_ACQUIRE);
+		sent = sent > LOG_RING ? sent - LOG_RING : 0;
+		for (;;) {
+			u64 end = __atomic_load_n(&log_ring_end, __ATOMIC_ACQUIRE);
+			char chunk[4096];
+			size_t n = 0;
+
+			if (end - sent > LOG_RING)
+				sent = end - LOG_RING;   /* fell behind: what is still there */
+			while (sent + n < end && n < sizeof(chunk)) {
+				chunk[n] = log_ring[(sent + n) % LOG_RING];
+				n++;
+			}
+			if (!n) {
+				svcSleepThread(50000000ULL);
+				continue;
+			}
+			if (send(client, chunk, n, 0) <= 0)
+				break;
+			sent += n;
+		}
+		close(client);
+	}
+}
+
+static void log_server_start(void)
+{
+	static Thread thread;
+
+	if (R_FAILED(threadCreate(&thread, log_server, NULL, NULL, 0x10000, 0x2C, -2)) ||
+	    R_FAILED(threadStart(&thread)))
+		host_log("gx: no thread for the log on the network\n");
+}
+
 void host_console_write(int fd, const void *buf, size_t len)
 {
 	mutexLock(&print_lock);
+	log_ring_add(buf, len);
 	print_stage = 1;
 	/* The console only under screen_lock: libnx takes a buffer of the
 	 * screen when text is drawn as well as in consoleUpdate(), and two
@@ -236,13 +338,26 @@ void host_console_write(int fd, const void *buf, size_t len)
 		 * something dies: sync_log()): a line at a time, the report
 		 * every ten seconds was eighty writes to the card in a row,
 		 * and a video stopped for a quarter of a second each time. */
+		/* At most every 50 ms while things start, not every line: each
+		 * line written and synced to the card was some milliseconds of
+		 * the thread that said it, and of all the others waiting on the
+		 * log meanwhile (1.2 s of a browser's start, a line per library
+		 * it loads). What fflush() writes is the file system's, in its
+		 * own process: a program that dies loses only what was not
+		 * written yet; fsync() is for the console switched off, every
+		 * two seconds. The network has every line at once (log_ring). */
+		static u64 committed;
+
 		if (!started)
 			started = now;
-		if (armTicksToNs(now - started) < 20000000000ULL ||
-		    armTicksToNs(now - synced) > (gx_trace ? 20000000ULL : 250000000ULL)) {
+		if (armTicksToNs(now - synced) >
+		    (gx_trace ? 20000000ULL : armTicksToNs(now - started) < 20000000000ULL ? 50000000ULL : 250000000ULL)) {
 			print_stage = 3;
 			fflush(log_file);
-			fsync(fileno(log_file));
+			if (armTicksToNs(now - committed) > 2000000000ULL) {
+				fsync(fileno(log_file));
+				committed = now;
+			}
 			synced = now;
 		}
 	}
@@ -351,26 +466,20 @@ static Handle self;
 
 /*
  * The code mapping syscalls. On the Switch 2, homebrew runs in a game's
- * process, whose policy has none of them (kaiHEN's JIT.md): kaiHEN's RO,
- * which holds this process's handle, makes them for us, through the gx
- * commands of its ldr:ro session (65100 on, in a build of kaiHEN's RO that
- * has them: github.com/ouncebrew/kaihen, branch gx-memory). The session is
- * the one hbloader hands every NRO, as its "ldr:ro" service override.
+ * process, whose policy has none of them (kaiHEN's JIT.md); kaiHEN's RO, as
+ * it is, maps code for it: read and execute, from pages of its heap, at an
+ * address it chooses (its JIT commands, which libounce's Jit API uses). The
+ * session is the one hbloader hands every NRO, as its "ldr:ro" service
+ * override. The rest of the guest's memory is made otherwise: see "the
+ * Switch 2's guest memory" below.
  */
 #ifdef __SWITCH2__
-enum {
-	RO_GX_GET_VERSION = 65100,
-	RO_GX_MAP_CODE = 65101,
-	RO_GX_UNMAP_CODE = 65102,
-	RO_GX_SET_PERMISSION = 65103,
-};
+enum { RO_MAP_JIT_CODE = 65010, RO_UNMAP_JIT_CODE = 65011 };
 static Service ro;
 
 static int ro_open(void)
 {
 	Handle session = smGetServiceOverride(smEncodeName("ldr:ro"));
-	u64 version = 0;
-	Result rc;
 
 	if (session == INVALID_HANDLE) {
 		host_log("gx: no ldr:ro session from the Homebrew loader: start Chromium NX from hbmenu\n");
@@ -378,18 +487,6 @@ static int ro_open(void)
 	}
 	serviceCreate(&ro, session);
 	ro.own_handle = 0;   /* hbloader's: never closed here */
-	{
-		const u64 pid_placeholder = 0;
-
-		rc = serviceDispatchInOut(&ro, RO_GX_GET_VERSION, pid_placeholder, version,
-					  .in_send_pid = true);
-	}
-	if (R_FAILED(rc)) {
-		host_log("gx: kaiHEN's RO cannot map memory for gx (%#x): it needs the RO of the "
-			 "gx-memory branch of kaiHEN in sdmc:/kaihen/bin/ro/exefs.nsp\n", rc);
-		return -1;
-	}
-	host_log("gx: memory mapped by kaiHEN's RO (gx commands version %lu)\n", (unsigned long)version);
 	return 0;
 }
 
@@ -400,21 +497,6 @@ static Result ro_call3(u32 cmd, u64 a, u64 b, u64 c)
 	} in = { 0, a, b, c };
 
 	return serviceDispatchIn(&ro, cmd, in, .in_send_pid = true);
-}
-
-static Result code_map(u64 dst, u64 src, u64 len)
-{
-	return ro_call3(RO_GX_MAP_CODE, dst, src, len);
-}
-
-static Result code_unmap(u64 dst, u64 src, u64 len)
-{
-	return ro_call3(RO_GX_UNMAP_CODE, dst, src, len);
-}
-
-static Result code_permission(u64 addr, u64 len, u32 perm)
-{
-	return ro_call3(RO_GX_SET_PERMISSION, addr, len, perm);
 }
 #else
 static int ro_open(void) { return 0; }
@@ -455,7 +537,7 @@ static int span_count;
 static u64 window_start, window_end;
 
 /* Lists the free runs of the address space where code memory may go. */
-static void find_spans(void)
+static __attribute__((unused)) void find_spans(void)
 {
 	enum { ALIAS, HEAP, STACK, ASLR, REGIONS };
 	static const InfoType types[REGIONS][2] = {
@@ -511,7 +593,7 @@ static void find_spans(void)
 }
 
 /* Keeps the window of at most len bytes with the most free addresses. */
-static void choose_window(u64 len)
+static __attribute__((unused)) void choose_window(u64 len)
 {
 	u64 best = 0, best_start = 0, total = 0;
 	int kept = 0;
@@ -559,6 +641,15 @@ int host_reserved_hole(int index, void **addr, size_t *len)
 	*addr = (void *)spans[index].end;
 	*len = spans[index + 1].start - spans[index].end;
 	return 1;
+}
+
+#ifndef __SWITCH2__
+/* Data and images anywhere in the window. */
+void host_arena_window(int kind, uint64_t *start, uint64_t *end)
+{
+	(void)kind;
+	*start = window_start;
+	*end = window_end;
 }
 
 void *host_reserve(size_t *len)
@@ -629,6 +720,7 @@ void *host_reserve(size_t *len)
 	}
 	return addr;
 }
+#endif
 
 static size_t page_of(void *addr) { return ((uint8_t *)addr - arena) / GX_PAGE; }
 
@@ -710,6 +802,14 @@ static size_t run_of(size_t p, size_t n)
 	return run;
 }
 
+/* The kernel's records of this process, as last counted (report_kernel_use()).
+ * Past about ten thousand, the kernel stops serving the process: it cannot
+ * even be told so, the calls to the SD card being the first to fail. Refusing
+ * memory before that at least ends in a message. */
+static volatile unsigned long kernel_blocks;
+#define KERNEL_BLOCKS_MAX 8500
+
+#ifndef __SWITCH2__
 static int unmap_pages(size_t p, size_t n)
 {
 	while (n) {
@@ -797,13 +897,6 @@ static int set_protection(size_t p, size_t n, int prot)
 	}
 	return 0;
 }
-
-/* The kernel's records of this process, as last counted (report_kernel_use()).
- * Past about ten thousand, the kernel stops serving the process: it cannot
- * even be told so, the calls to the SD card being the first to fail. Refusing
- * memory before that at least ends in a message. */
-static volatile unsigned long kernel_blocks;
-#define KERNEL_BLOCKS_MAX 8500
 
 int host_commit(void *addr, size_t len, int prot)
 {
@@ -906,6 +999,446 @@ int host_decommit(void *addr, size_t len)
 	mutexUnlock(&mem_lock);
 	return ret;
 }
+#else
+/* ---------- the Switch 2's guest memory ----------
+ *
+ * With kaiHEN as it is, without the code mapping syscalls (see above), from
+ * what a game's process may do:
+ * - Data (the guest's anonymous memory: nearly all of it) is in the alias
+ *   region, 128 GB: svcMapPhysicalMemory puts fresh memory at an address of
+ *   ours, read and write, and svcSetMemoryPermission makes it read-only or
+ *   inaccessible. The memory is what the process has not claimed: the heap
+ *   is made small for it (__libnx_initheap()).
+ * - Images (the files mapped with their code: programs and libraries, whose
+ *   code and data must be next to each other) are in part of the stack
+ *   region, 2 GB, its rest left to the threads' stacks, out of a pool of the
+ *   heap: their data by svcMapMemory (read and write; that memory takes no
+ *   other protection, and is left writable when made read-only), their code
+ *   by RO's MapJitCode (read and execute). Data becomes code by being
+ *   unmapped and mapped as code from the same pages of the pool, which keep
+ *   what was written.
+ * Code anywhere else, and memory that is writable and executable by turns,
+ * cannot be: V8 runs without its compilers (--jitless, JS_FLAGS).
+ */
+#define IMAGE_WINDOW (1280UL << 20)   /* of the stack region, at most */
+#define STACKS_LEFT (640UL << 20)     /* of it, for the threads' stacks */
+#define IMAGE_POOL (1024UL << 20)     /* of the heap, behind the images */
+#define PHYSICAL_LOW (768UL << 20)    /* memory left that is short */
+
+static u64 alias_lo, alias_hi, image_lo, image_hi;
+static int physical_dirty;   /* fresh memory came with something in it */
+
+static int in_alias(u64 addr, u64 len)
+{
+	return addr >= alias_lo && addr < alias_hi && len <= alias_hi - addr;
+}
+
+static u64 arena_addr(size_t p) { return (u64)(arena + p * GX_PAGE); }
+static u64 pool_addr(size_t src) { return (u64)(pool + (u64)src * GX_PAGE); }
+
+static u32 kernel_perm(int prot)
+{
+	return (prot & GX_PROT_WRITE) ? Perm_Rw : (prot & GX_PROT_READ) ? Perm_R : Perm_None;
+}
+
+/* What RO mapped as code for us: it unmaps a mapping only whole. At most 512
+ * (RO's own limit for a session). */
+#define MAX_JIT 512
+static struct {
+	size_t p, n, src;
+} jit[MAX_JIT];
+static int jit_count, jit_peak;
+
+static Result jit_map(size_t p, size_t n, size_t src)
+{
+	Result rc;
+
+	if (jit_count >= MAX_JIT)
+		return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+	rc = ro_call3(RO_MAP_JIT_CODE, arena_addr(p), pool_addr(src), n * GX_PAGE);
+	if (R_SUCCEEDED(rc)) {
+		jit[jit_count].p = p;
+		jit[jit_count].n = n;
+		jit[jit_count].src = src;
+		if (++jit_count > jit_peak)
+			jit_peak = jit_count;
+		armICacheInvalidate((void *)arena_addr(p), n * GX_PAGE);
+	}
+	return rc;
+}
+
+/* Unmaps the code of [p, p + n): the mappings that touch it, and what of them
+ * is outside is mapped again. */
+static Result jit_unmap(size_t p, size_t n)
+{
+	for (int i = 0; i < jit_count;) {
+		size_t ep = jit[i].p, en = jit[i].n, es = jit[i].src;
+		Result rc;
+
+		if (ep + en <= p || p + n <= ep) {
+			i++;
+			continue;
+		}
+		rc = ro_call3(RO_UNMAP_JIT_CODE, arena_addr(ep), pool_addr(es), en * GX_PAGE);
+		if (R_FAILED(rc))
+			return rc;
+		jit[i] = jit[--jit_count];
+		if (ep < p && R_FAILED(rc = jit_map(ep, p - ep, es)))
+			return rc;
+		if (ep + en > p + n && R_FAILED(rc = jit_map(p + n, ep + en - (p + n), es + (p + n - ep))))
+			return rc;
+	}
+	return 0;
+}
+
+/* ... the images: in the stack region, from the pool. */
+static int image_unmap(size_t p, size_t n)
+{
+	while (n) {
+		size_t run;
+		Result rc;
+
+		if (!(flags_at(p) & PG_MAPPED)) {
+			p++;
+			n--;
+			continue;
+		}
+		run = run_of(p, n);
+		rc = (flags_at(p) & PG_DATA) ? svcUnmapMemory((void *)arena_addr(p), (void *)pool_addr(src_at(p)),
+							      run * GX_PAGE)
+					     : jit_unmap(p, run);
+		if (R_FAILED(rc)) {
+			host_log("gx: unmap of %p failed (%#x)\n", (void *)arena_addr(p), rc);
+			return -1;
+		}
+		pool_give(src_at(p), run);
+		set_flags(p, run, 0);
+		p += run;
+		n -= run;
+	}
+	return 0;
+}
+
+static int image_protect(size_t p, size_t n, int prot)
+{
+	int exec = prot & GX_PROT_EXEC;
+
+	if (exec && (prot & GX_PROT_WRITE))
+		return -1;
+	while (n) {
+		size_t run;
+		u64 addr = arena_addr(p), len;
+		Result rc = 0;
+
+		if (!(flags_at(p) & PG_MAPPED))
+			return -1;
+		run = run_of(p, n);
+		len = run * GX_PAGE;
+		if (exec && (flags_at(p) & PG_DATA)) {
+			/* Data to code: what was written goes to memory first. */
+			armDCacheFlush((void *)addr, len);
+			rc = svcUnmapMemory((void *)addr, (void *)pool_addr(src_at(p)), len);
+			if (R_SUCCEEDED(rc))
+				rc = jit_map(p, run, src_at(p));
+			if (R_SUCCEEDED(rc))
+				set_flags(p, run, PG_MAPPED | P_RX);
+		} else if (!exec && !(flags_at(p) & PG_DATA)) {
+			/* Code to data. */
+			rc = jit_unmap(p, run);
+			if (R_SUCCEEDED(rc))
+				rc = svcMapMemory((void *)addr, (void *)pool_addr(src_at(p)), len);
+			if (R_SUCCEEDED(rc))
+				set_flags(p, run, PG_MAPPED | PG_DATA | P_RW);
+		}
+		/* Otherwise as it is: data read and write, code read and execute. */
+		if (R_FAILED(rc)) {
+			host_log("gx: protection %d of %p+%#lx failed (%#x)\n", prot, (void *)addr,
+				 (unsigned long)len, rc);
+			return -1;
+		}
+		p += run;
+		n -= run;
+	}
+	return 0;
+}
+
+static int image_commit(void *addr, size_t len, int prot)
+{
+	size_t first = page_of(addr), n = len / GX_PAGE, done = 0;
+	int exec = prot & GX_PROT_EXEC;
+
+	if (n > pool_free) {
+		ran_out = 1;
+		host_log("gx: out of memory for programs and libraries (%lu KB asked, %lu KB left)\n",
+			 (unsigned long)(len >> 10), (unsigned long)(pool_free * 4));
+		return -1;
+	}
+	if (exec && (prot & GX_PROT_WRITE))
+		return -1;
+	while (done < n) {
+		size_t src = 0, run = pool_take(n - done, &src);
+		Result rc;
+
+		if (!run)
+			break;
+		/* The pool is ordinary memory until it is mapped: zero it here. */
+		memset(pool + src * GX_PAGE, 0, run * GX_PAGE);
+		if (exec) {
+			armDCacheFlush(pool + src * GX_PAGE, run * GX_PAGE);
+			rc = jit_map(first + done, run, src);
+		} else {
+			rc = svcMapMemory((uint8_t *)addr + done * GX_PAGE, pool + src * GX_PAGE, run * GX_PAGE);
+		}
+		if (R_FAILED(rc)) {
+			host_log("gx: map of %p failed (%#x): %lu KB as %s\n", (uint8_t *)addr + done * GX_PAGE, rc,
+				 (unsigned long)(run * 4), exec ? "code" : "data");
+			pool_give(src, run);
+			break;
+		}
+		for (size_t i = 0; i < run; i++)
+			set_page(first + done + i, src + i, PG_MAPPED | (exec ? P_RX : PG_DATA | P_RW));
+		kernel_blocks += 2;
+		done += run;
+	}
+	if (done < n) {
+		image_unmap(first, done);
+		return -1;
+	}
+	return 0;
+}
+
+/* ... the data: in the alias region, fresh memory. */
+static int data_commit(void *addr, size_t len, int prot)
+{
+	Result rc;
+
+	if (prot & GX_PROT_EXEC) {
+		static int said;
+
+		if (!said++)
+			host_log("gx: code asked for among data at %p: there is none outside the images here\n", addr);
+		return -1;
+	}
+	rc = svcMapPhysicalMemory(addr, len);
+	if (R_FAILED(rc)) {
+		u64 total = 0, used = 0;
+
+		svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+		svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+		ran_out = 1;
+		host_log("gx: out of guest memory (%#x): %lu KB asked, %lu MB left\n", rc,
+			 (unsigned long)(len >> 10), (unsigned long)((total - used) >> 20));
+		return -1;
+	}
+	/* Fresh memory is cleared by the kernel; if ever not, here. */
+	if (physical_dirty || *(volatile u64 *)addr || ((volatile u64 *)((uint8_t *)addr + len))[-1]) {
+		if (!physical_dirty++)
+			host_log("gx: fresh memory is not cleared: cleared here\n");
+		memset(addr, 0, len);
+	}
+	if (kernel_perm(prot) != Perm_Rw &&
+	    R_FAILED(rc = svcSetMemoryPermission(addr, len, kernel_perm(prot)))) {
+		host_log("gx: protection %d of %p+%#lx failed (%#x)\n", prot, addr, (unsigned long)len, rc);
+		svcUnmapPhysicalMemory(addr, len);
+		return -1;
+	}
+	kernel_blocks += 1;
+	return 0;
+}
+
+void host_arena_window(int kind, uint64_t *start, uint64_t *end)
+{
+	*start = kind == GX_ARENA_IMAGES ? image_lo : alias_lo;
+	*end = kind == GX_ARENA_IMAGES ? image_hi : alias_hi;
+}
+
+/* The largest free run of [start, start + size), 2 MB aligned, less margin at
+ * each end; its length, 0 if none. */
+static u64 largest_free(u64 start, u64 size, u64 margin, u64 *out)
+{
+	u64 addr = start, end = start + size, best = 0;
+
+	while (addr < end) {
+		MemoryInfo info;
+		u32 page_info;
+
+		if (R_FAILED(svcQueryMemory(&info, &page_info, addr)) || !info.size)
+			break;
+		if (info.type == MemType_Unmapped) {
+			u64 lo = ((info.addr < start ? start : info.addr) + margin + 0x1fffff) & ~0x1fffffUL;
+			u64 hi_end = info.addr + info.size < end ? info.addr + info.size : end;
+			u64 hi = hi_end > margin ? (hi_end - margin) & ~0x1fffffUL : 0;
+
+			if (hi > lo && hi - lo > best) {
+				best = hi - lo;
+				*out = lo;
+			}
+		}
+		addr = info.addr + info.size;
+	}
+	return best;
+}
+
+/* The window of the images in the stack region, taken before any thread is
+ * made (main()): libnx puts each thread's stack anywhere in that region, and
+ * after dozens of them no run of a gigabyte was left (seen). libnx keeps
+ * clear of it after. */
+static u64 images_run;   /* the largest free run there was, for the log */
+
+static void images_reserve(void)
+{
+	u64 stack = 0, stack_size = 0, size;
+
+	if (image_hi)
+		return;
+	svcGetInfo(&stack, InfoType_StackRegionAddress, CUR_PROCESS_HANDLE, 0);
+	svcGetInfo(&stack_size, InfoType_StackRegionSize, CUR_PROCESS_HANDLE, 0);
+	images_run = largest_free(stack, stack_size, 0, &image_lo);
+	size = images_run > STACKS_LEFT ? (images_run - STACKS_LEFT) & ~0x1fffffUL : 0;
+	if (size > IMAGE_WINDOW)
+		size = IMAGE_WINDOW;
+	if (size < (256UL << 20))
+		return;
+	image_hi = image_lo + size;
+	virtmemLock();
+	virtmemAddReservation((void *)image_lo, size);
+	virtmemUnlock();
+}
+
+void *host_reserve(size_t *len)
+{
+	u64 alias = 0, alias_size = 0, run, size;
+
+	if (ro_open())
+		return NULL;
+	svcGetInfo(&alias, InfoType_AliasRegionAddress, CUR_PROCESS_HANDLE, 0);
+	svcGetInfo(&alias_size, InfoType_AliasRegionSize, CUR_PROCESS_HANDLE, 0);
+	images_reserve();
+	run = largest_free(alias, alias_size, SPAN_MARGIN, &alias_lo);
+	alias_hi = alias_lo + run;
+	if (!image_hi || run < (4UL << 30)) {
+		host_log("gx: no room for the guest: %lu MB of the stack region free in one run (%lu MB "
+			 "kept for the threads' stacks), %lu MB of the alias region\n",
+			 (unsigned long)(images_run >> 20), (unsigned long)(STACKS_LEFT >> 20),
+			 (unsigned long)(run >> 20));
+		return NULL;
+	}
+	/* The window: both, and what is between them is a hole. */
+	span_count = 2;
+	spans[image_lo < alias_lo ? 0 : 1] = (struct span){ image_lo, image_hi };
+	spans[image_lo < alias_lo ? 1 : 0] = (struct span){ alias_lo, alias_hi };
+	window_start = spans[0].start;
+	window_end = spans[1].end;
+	if (window_end - window_start > *len) {
+		host_log("gx: the stack and alias regions are %lu GB apart, more than the arena's %lu GB\n",
+			 (unsigned long)((window_end - window_start) >> 30), (unsigned long)(*len >> 30));
+		return NULL;
+	}
+	virtmemLock();
+	virtmemAddReservation((void *)alias_lo, alias_hi - alias_lo);
+	virtmemUnlock();
+	arena = (uint8_t *)window_start;
+	*len = window_end - window_start;
+	leaves = calloc(*len / GX_PAGE / LEAF_PAGES + 1, sizeof(*leaves));
+
+	/* The pool behind the images. */
+	for (size = IMAGE_POOL; size >= (256UL << 20) && !pool; size -= 64UL << 20)
+		pool = memalign(GX_PAGE, size);
+	if (pool)
+		size += 64UL << 20;   /* the loop went one step past it */
+	if (!leaves || !pool) {
+		host_log("gx: not enough memory for programs and libraries\n");
+		return NULL;
+	}
+	pool_pages = pool_free = size / GX_PAGE;
+	pool_used = calloc(pool_pages, 1);
+	if (!pool_used)
+		return NULL;
+	self = envGetOwnProcessHandle();
+	{
+		extern char *fake_heap_start, *fake_heap_end;
+		u64 total = 0, used = 0;
+
+		svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+		svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+		host_log("gx: data at %#lx, %lu GB of addresses, %lu MB of memory; programs and libraries "
+			 "at %#lx, %lu MB of addresses, %lu MB of memory; heap %lu MB\n",
+			 (unsigned long)alias_lo, (unsigned long)((alias_hi - alias_lo) >> 30),
+			 (unsigned long)((total - used) >> 20), (unsigned long)image_lo,
+			 (unsigned long)((image_hi - image_lo) >> 20), (unsigned long)(size >> 20),
+			 (unsigned long)((fake_heap_end - fake_heap_start) >> 20));
+	}
+	return arena;
+}
+
+int host_commit(void *addr, size_t len, int prot)
+{
+	int ret;
+
+	if (kernel_blocks > KERNEL_BLOCKS_MAX) {
+		static int said;
+
+		if (!said++)
+			host_log("gx: the kernel is short of memory records (%lu): no more memory "
+				 "for the guest\n", kernel_blocks);
+		return -1;
+	}
+	mutexLock(&mem_lock);
+	ret = in_alias((u64)addr, len) ? data_commit(addr, len, prot) : image_commit(addr, len, prot);
+	mutexUnlock(&mem_lock);
+	return ret;
+}
+
+int host_protect(void *addr, size_t len, int prot)
+{
+	int ret = 0;
+
+	mutexLock(&mem_lock);
+	if (in_alias((u64)addr, len)) {
+		Result rc = (prot & GX_PROT_EXEC) ? MAKERESULT(Module_Libnx, LibnxError_BadInput)
+						  : svcSetMemoryPermission(addr, len, kernel_perm(prot));
+
+		if (R_FAILED(rc)) {
+			host_log("gx: protection %d of %p+%#lx failed (%#x)\n", prot, addr, (unsigned long)len, rc);
+			ret = -1;
+		}
+	} else {
+		ret = image_protect(page_of(addr), len / GX_PAGE, prot);
+	}
+	mutexUnlock(&mem_lock);
+	return ret;
+}
+
+/* Short: little memory left that the process has not claimed, or a pool of
+ * images nearly full. */
+int host_memory_low(void)
+{
+	u64 total = 0, used = 0;
+
+	svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+	svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+	return total - used < PHYSICAL_LOW || pool_free < pool_pages / 8;
+}
+
+int host_decommit(void *addr, size_t len)
+{
+	int ret = 0;
+
+	mutexLock(&mem_lock);
+	if (in_alias((u64)addr, len)) {
+		Result rc = svcUnmapPhysicalMemory(addr, len);
+
+		if (R_FAILED(rc)) {
+			host_log("gx: unmap of %p failed (%#x)\n", addr, rc);
+			ret = -1;
+		}
+	} else {
+		ret = image_unmap(page_of(addr), len / GX_PAGE);
+	}
+	mutexUnlock(&mem_lock);
+	return ret;
+}
+#endif
 
 /*
  * Shared memory is the kernel's, the one kind of memory it maps at several
@@ -982,9 +1515,10 @@ void host_shared_free(int handle)
 #ifdef __SWITCH2__
 /* None on the Switch 2: the game's process homebrew runs in may not create
  * shared memory (no svcCreateSharedMemory in its policy, nor in RO's or
- * HEN's), so the heap keeps it all and shared files get one copy each
- * (gmem.c, alloc_shared() failing). */
+ * HEN's), so shared files get one copy each (gmem.c, alloc_shared()
+ * failing). The heap is HOST_HEAP: the rest is the guest's. */
 #define HEAP_WORTH_SHARING (~0UL)
+#define HOST_HEAP (3072UL << 20)
 #else
 #define HEAP_WORTH_SHARING (1UL << 30)
 #endif
@@ -1018,6 +1552,19 @@ void __libnx_initheap(void)
 		size = envGetHeapOverrideSize();
 		svcGetInfo(&region, InfoType_HeapRegionAddress, CUR_PROCESS_HANDLE, 0);
 		total = (u64)addr + size - region;
+#ifdef __SWITCH2__
+		/* The host keeps HOST_HEAP (its own memory, the GPU's, the pool
+		 * of the images: host_reserve()); the rest goes back, for the
+		 * guest's data, which svcMapPhysicalMemory takes from what the
+		 * process has not claimed. */
+		if (size > HOST_HEAP && region && region <= (u64)addr && !(total & 0x1fffff)) {
+			u64 out = (size - HOST_HEAP) & ~0x1fffffUL;
+			void *base;
+
+			if (R_SUCCEEDED(svcSetHeapSize(&base, total - out)))
+				size -= out;
+		}
+#else
 		/* Only when the numbers are what a heap looks like. */
 		if (size >= HEAP_WORTH_SHARING && region && region <= (u64)addr &&
 		    !(total & 0x1fffff)) {
@@ -1028,6 +1575,7 @@ void __libnx_initheap(void)
 				shared_budget = SHARED_BUDGET;
 			}
 		}
+#endif
 	} else {
 		u64 available = 0, used = 0;
 
@@ -1144,7 +1692,7 @@ static void thread_start(void *p)
 static int start_thread(void (*fn)(void *), void *arg, size_t stack)
 {
 	struct start *s = malloc(sizeof(*s));   /* lives as long as the thread */
-	int core = __atomic_fetch_add(&next_core, 1, __ATOMIC_RELAXED) % 3;
+	int core = core_list[__atomic_fetch_add(&next_core, 1, __ATOMIC_RELAXED) % core_count];
 	Result rc;
 
 	if (!s)
@@ -1158,7 +1706,7 @@ static int start_thread(void (*fn)(void *), void *arg, size_t stack)
 		 * tied to one core waits for the others tied to it, a time slice
 		 * at a time, while the other cores sit idle (Chromium ran at 28
 		 * frames a second with no thread above 40% of a processor). */
-		svcSetThreadCoreMask(s->thread.handle, core, 0x7);
+		svcSetThreadCoreMask(s->thread.handle, core, cores);
 		know_thread(s->thread.handle, "ours");
 		rc = threadStart(&s->thread);
 		if (R_FAILED(rc))
@@ -1174,25 +1722,52 @@ static int start_thread(void (*fn)(void *), void *arg, size_t stack)
 
 #ifdef __SWITCH2__
 /* Threads that libraries start with pthread_create() and no stack size
- * (the GL driver's shader compilers) get 128 KB from libounce: 4 MB here,
+ * (the GL driver's shader compilers) get 128 KB from libounce: 1 MB here,
  * for the reason of THREAD_STACK. build-nx.sh links with
  * --wrap=__syscall_thread_create. */
 struct __pthread_t;
 int __real___syscall_thread_create(struct __pthread_t **thread, void *(*func)(void *), void *arg,
 				   void *stack_addr, size_t stack_size);
 
+/* A library's thread (the GL driver's, the video decoder's) runs on any of
+ * the cores, as ours do: libnx starts it on the program's first core alone,
+ * where all of them then took turns. */
+struct library_thread {
+	void *(*func)(void *);
+	void *arg;
+};
+
+static void *library_thread_start(void *p)
+{
+	struct library_thread t = *(struct library_thread *)p;
+
+	free(p);
+	svcSetThreadCoreMask(CUR_THREAD_HANDLE, -3, cores);
+	return t.func(t.arg);
+}
+
 int __wrap___syscall_thread_create(struct __pthread_t **thread, void *(*func)(void *), void *arg,
 				   void *stack_addr, size_t stack_size)
 {
+	struct library_thread *t = malloc(sizeof(*t));
+	int ret;
+
 	if (!stack_addr && !stack_size)
-		stack_size = 4UL << 20;
+		stack_size = 1UL << 20;
 	/* Which, by the address of its function (gx.map names it from the
 	 * base the fault reports give): the driver's threads are among them. */
 	extern char _start[];
 
 	host_log("gx: a library starts a thread at %p (gx at %p), %lu KB of stack\n", (void *)func,
 		 (void *)_start, (unsigned long)(stack_size >> 10));
-	return __real___syscall_thread_create(thread, func, arg, stack_addr, stack_size);
+	if (!t)
+		return __real___syscall_thread_create(thread, func, arg, stack_addr, stack_size);
+	t->func = func;
+	t->arg = arg;
+	ret = __real___syscall_thread_create(thread, library_thread_start, t, stack_addr, stack_size);
+	if (ret)
+		free(t);
+	return ret;
 }
 #endif
 
@@ -1520,6 +2095,18 @@ static void *gl_screen(void *dpy, void *config)
 	 * screen and the pad. */
 	nwindowReleaseBuffers(win);
 	nwindowSetTransform(win, 0);
+#ifdef __SWITCH2__
+	/* The Switch 2 neither crops nor turns (it stretched any buffer to the
+	 * screen): the screen stays as the console is held flat, and glwin.c
+	 * draws the tall window in it turned (its canvas). */
+	if (portrait) {
+		nwindowSetDimensions(win, h, w);
+		nwindowSetCrop(win, 0, 0, h, w);
+	} else {
+		nwindowSetDimensions(win, w, h);
+		nwindowSetCrop(win, 0, 0, w, h);
+	}
+#else
 	if (portrait) {
 		nwindowSetDimensions(win, h, h);
 		nwindowSetCrop(win, 0, 0, h, w);
@@ -1527,7 +2114,17 @@ static void *gl_screen(void *dpy, void *config)
 		nwindowSetDimensions(win, w, h);
 		nwindowSetCrop(win, 0, 0, w, h);
 	}
+#endif
 	window_surface = eglCreateWindowSurface(dpy, config, win, NULL);
+	/* Refused while the window's buffers are not all back from the old
+	 * screen (Zink, VK_ERROR_NATIVE_WINDOW_IN_USE_KHR): then the picture
+	 * froze and the program died. A moment, and again. */
+	for (int tries = 0; window_surface == EGL_NO_SURFACE && tries < 20; tries++) {
+		host_log("gx: gl: the screen is refused (%#x), again in 50 ms\n", eglGetError());
+		svcSleepThread(50000000ULL);
+		nwindowReleaseBuffers(win);
+		window_surface = eglCreateWindowSurface(dpy, config, win, NULL);
+	}
 	if (window_surface == EGL_NO_SURFACE)
 		host_log("gx: gl: no window surface (%#x)\n", eglGetError());
 	else
@@ -1682,6 +2279,36 @@ static EGLContext gl_create_context(EGLDisplay dpy, EGLConfig config, EGLContext
 {
 	EGLContext ret = eglCreateContext(dpy, config, share, attribs);
 
+	/* EGL 1.5's robustness attributes (what ANGLE asks with), which a driver
+	 * of EGL 1.4 refuses (OunceVK): the same in EGL_EXT_create_context_robustness's
+	 * words. Without them ANGLE settled for less than OpenGL ES 3, and
+	 * Chromium, which wants that, went without its GPU features. */
+	if (ret == EGL_NO_CONTEXT && attribs) {
+		EGLint fixed[64];
+		int n = 0, changed = 0;
+
+		for (int i = 0; attribs[i] != EGL_NONE && n + 3 < 64; i += 2) {
+			EGLint name = attribs[i];
+
+			if (name == 0x31BD) {          /* EGL_CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY */
+				name = 0x3138;         /* ..._EXT */
+				changed = 1;
+			} else if (name == 0x31B2) {   /* EGL_CONTEXT_OPENGL_ROBUST_ACCESS */
+				name = 0x30BF;         /* EGL_CONTEXT_OPENGL_ROBUST_ACCESS_EXT */
+				changed = 1;
+			}
+			fixed[n++] = name;
+			fixed[n++] = attribs[i + 1];
+		}
+		fixed[n] = EGL_NONE;
+		if (changed) {
+			ret = eglCreateContext(dpy, config, share, fixed);
+			host_log("gx: gl: eglCreateContext again with EGL_EXT_create_context_robustness: %s\n",
+				 ret == EGL_NO_CONTEXT ? "refused too" : "made");
+		}
+	}
+	if (ret != EGL_NO_CONTEXT)
+		host_log("gx: gl: context %p made (shares %p)\n", ret, share);
 	if (ret == EGL_NO_CONTEXT) {
 		host_log("gx: gl: eglCreateContext failed (%#x) for", eglGetError());
 		for (int i = 0; attribs && attribs[i] != EGL_NONE && i < 40; i += 2)
@@ -1689,6 +2316,12 @@ static EGLContext gl_create_context(EGLDisplay dpy, EGLConfig config, EGLContext
 		host_log("\n");
 	}
 	return ret;
+}
+
+static EGLBoolean gl_destroy_context(EGLDisplay dpy, EGLContext context)
+{
+	host_log("gx: gl: context %p destroyed\n", context);
+	return eglDestroyContext(dpy, context);
 }
 
 static EGLSurface gl_create_pbuffer_surface(EGLDisplay dpy, EGLConfig config, const EGLint *attribs)
@@ -1741,13 +2374,19 @@ static void gl_get_internalformativ(GLenum target, GLenum internalformat, GLenum
 	void (*real)(GLenum, GLenum, GLenum, GLsizei, GLint *) =
 		(void (*)(GLenum, GLenum, GLenum, GLsizei, GLint *))eglGetProcAddress("glGetInternalformativ");
 
+	/* One count, 4: what OpenGL ES 3 asks at least (GL_MAX_SAMPLES), and
+	 * the GPU has. With none, ANGLE offered only OpenGL ES 2, which
+	 * Chromium refused ("eglCreateContext ES 3.0 failed"). */
 	if (pname == GX_GL_NUM_SAMPLE_COUNTS) {
 		if (count > 0 && params)
-			params[0] = 0;
+			params[0] = 1;
 		return;
 	}
-	if (pname == GX_GL_SAMPLES)
-		return;   /* none to write */
+	if (pname == GX_GL_SAMPLES) {
+		if (count > 0 && params)
+			params[0] = 4;
+		return;
+	}
 	if (gx_hostcall_tracing)
 		host_log("gx: gl: glGetInternalformativ(%#x, %#x, %#x, %d)\n", target, internalformat,
 			 pname, count);
@@ -1785,6 +2424,60 @@ static void gl_tex_image_2d(GLenum target, GLint level, GLint internal, GLsizei 
 	glTexImage2D(target, level, internal, w, h, border, format, type, pixels);
 }
 
+/* ---------- the processor's speed ---------- */
+
+/*
+ * The console's processor goes about twice as fast in its boost mode (the
+ * system's "fast load"), which throttles the GPU meanwhile: while the browser
+ * starts (STARTUP_BOOST_NS at most) and while a page loads (PAGE_BOOST_NS at
+ * most a page), which is mostly work for the processor, and not otherwise.
+ */
+#define STARTUP_BOOST_NS 40000000000ULL
+#define PAGE_BOOST_NS 20000000000ULL
+
+static volatile u64 startup_until, page_until;   /* host_now_ns() */
+
+/* A page loaded ends the start's boost too: the browser has started. */
+void host_busy(int on)
+{
+	page_until = on ? host_now_ns() + PAGE_BOOST_NS : 0;
+	if (!on)
+		startup_until = 0;
+}
+
+static void booster(void *arg)
+{
+	int boosted = 0;
+
+	(void)arg;
+	for (;;) {
+		u64 now = host_now_ns();
+		int want = now < startup_until || now < page_until;
+
+		if (want != boosted) {
+			Result rc = appletSetCpuBoostMode(want ? ApmCpuBoostMode_FastLoad : ApmCpuBoostMode_Normal);
+
+			if (R_FAILED(rc)) {
+				host_log("gx: no boost for the processor (%#x)\n", rc);
+				return;
+			}
+			boosted = want;
+			host_log("gx: processor %s\n", want ? "boosted" : "at its usual speed");
+		}
+		svcSleepThread(200000000ULL);
+	}
+}
+
+static void booster_start(void)
+{
+	static Thread thread;
+
+	startup_until = host_now_ns() + STARTUP_BOOST_NS;
+	if (R_FAILED(threadCreate(&thread, booster, NULL, NULL, 0x4000, 0x2C, -2)) ||
+	    R_FAILED(threadStart(&thread)))
+		host_log("gx: no thread for the processor's boost\n");
+}
+
 /* ---------- host functions for the guest: sound ---------- */
 
 /*
@@ -1794,20 +2487,56 @@ static void gl_tex_image_2d(GLenum target, GLint level, GLint internal, GLsizei 
  * ring; a thread of ours hands them to the system a chunk at a time, keeping
  * a couple of chunks ahead of what is being played.
  */
-#define AUDIO_RING 16384                /* frames: a third of a second */
+#define AUDIO_RING 16384                /* frames: a third of a second, each stream */
 #define AUDIO_CHUNK 1024                /* frames: a page of memory, as the system wants */
 #define AUDIO_CHUNKS 4
 #define AUDIO_AHEAD 3
+/*
+ * Streams played at once, mixed here: a browser opens one for a page's
+ * WebAudio and others for its <audio> and <video>, each its own. With one
+ * only, the second was refused, and Chromium played nothing of it (a voice
+ * message on Discord, whose page holds an AudioContext).
+ */
+#define AUDIO_STREAMS 8
 
 static Mutex audio_lock;
-static s16 audio_ring[AUDIO_RING * 2];
-static u64 audio_written, audio_taken;  /* frames into the ring, and out of it */
+static struct audio_stream {
+	int used;
+	u64 written, taken;             /* frames into the ring, and out of it */
+	s16 ring[AUDIO_RING * 2];
+} audio_streams[AUDIO_STREAMS];
 static volatile int audio_pending;      /* chunks the system has and has not played */
 static int audio_started;
+
+/*
+ * While sound is heard (a video, music), the system is told media is
+ * playing: it then neither dims the screen nor goes to sleep for want of
+ * buttons pressed, as it did in the middle of a video. Ten seconds of
+ * silence and it may again.
+ */
+#define MEDIA_QUIET_NS 10000000000ULL
+
+static void media_playing(int heard)
+{
+	static u64 last_heard;
+	static int said;
+	u64 now = armTicksToNs(armGetSystemTick());
+
+	if (heard)
+		last_heard = now;
+	int playing = last_heard && now - last_heard < MEDIA_QUIET_NS;
+
+	if (playing != said) {
+		said = playing;
+		appletSetMediaPlaybackState(playing);
+		host_log("gx: sound: %s\n", playing ? "media playing, no sleep" : "quiet, sleep allowed");
+	}
+}
 
 static void audio_feed(void *arg)
 {
 	static AudioOutBuffer buffers[AUDIO_CHUNKS];
+	static s32 mix[AUDIO_CHUNK * 2];
 	AudioOutBuffer *released;
 	u32 count;
 	int next = 0;
@@ -1815,14 +2544,17 @@ static void audio_feed(void *arg)
 	for (int i = 0; i < AUDIO_CHUNKS; i++)
 		buffers[i].buffer = aligned_alloc(0x1000, AUDIO_CHUNK * 4);
 	for (;;) {
-		u64 have;
+		u64 have = 0;
 		s16 *out = buffers[next].buffer;
 
 		count = 0;
+		media_playing(0);
 		if (audio_pending && R_SUCCEEDED(audoutGetReleasedAudioOutBuffer(&released, &count)))
 			audio_pending -= count;
 		mutexLock(&audio_lock);
-		have = audio_written - audio_taken;
+		for (int s = 0; s < AUDIO_STREAMS; s++)
+			if (audio_streams[s].used && audio_streams[s].written - audio_streams[s].taken > have)
+				have = audio_streams[s].written - audio_streams[s].taken;
 		/* A whole chunk, or what there is when nothing else is left to
 		 * play (the end of a sound). */
 		if (!out || !(have >= AUDIO_CHUNK || (have && !audio_pending))) {
@@ -1832,11 +2564,36 @@ static void audio_feed(void *arg)
 		}
 		if (have > AUDIO_CHUNK)
 			have = AUDIO_CHUNK;
-		for (u64 i = 0; i < have; i++)
-			memcpy(out + i * 2, audio_ring + (audio_taken + i) % AUDIO_RING * 2, 4);
-		memset(out + have * 2, 0, (AUDIO_CHUNK - have) * 4);
-		audio_taken += have;
+		/* Every stream's frames added up; one with fewer than the others
+		 * gives what it has (it is late, or ending). */
+		memset(mix, 0, have * 8);
+		for (int s = 0; s < AUDIO_STREAMS; s++) {
+			struct audio_stream *st = &audio_streams[s];
+			u64 n = st->used ? st->written - st->taken : 0;
+
+			if (n > have)
+				n = have;
+			for (u64 i = 0; i < n; i++) {
+				const s16 *f = st->ring + (st->taken + i) % AUDIO_RING * 2;
+
+				mix[i * 2] += f[0];
+				mix[i * 2 + 1] += f[1];
+			}
+			st->taken += n;
+		}
 		mutexUnlock(&audio_lock);
+		for (u64 i = 0; i < have * 2; i++)
+			out[i] = mix[i] > 32767 ? 32767 : mix[i] < -32768 ? -32768 : (s16)mix[i];
+		memset(out + have * 2, 0, (AUDIO_CHUNK - have) * 4);
+		{
+			/* Heard: not all but silence (a stream kept open plays zeros). */
+			int heard = 0;
+
+			for (u64 i = 0; i < have * 2 && !heard; i += 16)
+				heard = out[i] > 64 || out[i] < -64;
+			if (heard)
+				media_playing(1);
+		}
 
 		buffers[next].next = NULL;
 		buffers[next].buffer_size = AUDIO_CHUNK * 4;
@@ -1857,10 +2614,12 @@ static void audio_feed(void *arg)
 	}
 }
 
-static long gx_audio_open(long rate, long channels)
+/* A stream, by its number (gx_audio_stream_open()'s), or -1. */
+static long gx_audio_stream_open(long rate, long channels)
 {
 	static Thread thread;
 	Result rc = 0;
+	long id = -1;
 
 	if (rate != 48000 || channels != 2) {
 		host_log("gx: audio: %ld Hz on %ld channels is not what the console plays\n", rate, channels);
@@ -1874,57 +2633,111 @@ static long gx_audio_open(long rate, long channels)
 		if (R_SUCCEEDED(rc))
 			rc = threadCreate(&thread, audio_feed, NULL, NULL, 0x8000, 0x2B, -2);
 		if (R_SUCCEEDED(rc)) {
-			svcSetThreadCoreMask(thread.handle, -3, 0x7);
+			svcSetThreadCoreMask(thread.handle, -3, cores);
 			know_thread(thread.handle, "audio");
 			rc = threadStart(&thread);
 		}
 		audio_started = R_SUCCEEDED(rc);
 	}
+	for (int s = 0; s < AUDIO_STREAMS && audio_started && id < 0; s++)
+		if (!audio_streams[s].used) {
+			audio_streams[s].used = 1;
+			audio_streams[s].written = audio_streams[s].taken = 0;
+			id = s;
+		}
 	mutexUnlock(&audio_lock);
 	if (R_FAILED(rc))
 		host_log("gx: audio: no output (%#x)\n", rc);
+	else if (id < 0)
+		host_log("gx: audio: no stream left (%d playing)\n", AUDIO_STREAMS);
 	else
-		host_log("gx: audio: playing\n");
-	return audio_started ? 0 : -1;
+		host_log("gx: audio: stream %ld playing\n", id);
+	return id;
 }
 
-static long gx_audio_write(const s16 *frames, long count)
+static long gx_audio_stream_write(long id, const s16 *frames, long count)
 {
+	struct audio_stream *st;
 	u64 room;
 
+	if (id < 0 || id >= AUDIO_STREAMS)
+		return -1;
+	st = &audio_streams[id];
 	mutexLock(&audio_lock);
-	room = AUDIO_RING - (audio_written - audio_taken);
+	room = AUDIO_RING - (st->written - st->taken);
 	if ((u64)count > room)
 		count = room;
 	for (long i = 0; i < count; i++)
-		memcpy(audio_ring + (audio_written + i) % AUDIO_RING * 2, frames + i * 2, 4);
-	audio_written += count;
+		memcpy(st->ring + (st->written + i) % AUDIO_RING * 2, frames + i * 2, 4);
+	st->written += count;
 	mutexUnlock(&audio_lock);
 	return count;
 }
 
-static long gx_audio_queued(void)
+static long gx_audio_stream_queued(long id)
 {
 	long queued;
 
+	if (id < 0 || id >= AUDIO_STREAMS)
+		return 0;
 	mutexLock(&audio_lock);
-	queued = (long)(audio_written - audio_taken) + (long)audio_pending * AUDIO_CHUNK;
+	queued = (long)(audio_streams[id].written - audio_streams[id].taken) + (long)audio_pending * AUDIO_CHUNK;
 	mutexUnlock(&audio_lock);
 	return queued;
 }
 
 /* What is not played yet is not to be: the ring is emptied, the chunks the
  * system has are short enough to let them go. */
+static void gx_audio_stream_drop(long id)
+{
+	if (id < 0 || id >= AUDIO_STREAMS)
+		return;
+	mutexLock(&audio_lock);
+	audio_streams[id].taken = audio_streams[id].written;
+	mutexUnlock(&audio_lock);
+}
+
+static void gx_audio_stream_close(long id)
+{
+	if (id < 0 || id >= AUDIO_STREAMS)
+		return;
+	mutexLock(&audio_lock);
+	audio_streams[id].taken = audio_streams[id].written;
+	audio_streams[id].used = 0;
+	mutexUnlock(&audio_lock);
+	host_log("gx: audio: stream %ld closed\n", id);
+}
+
+/* The one stream of a guest libasound from before there were several. */
+static long audio_legacy = -1;
+
+static long gx_audio_open(long rate, long channels)
+{
+	if (audio_legacy < 0)
+		audio_legacy = gx_audio_stream_open(rate, channels);
+	return audio_legacy < 0 ? -1 : 0;
+}
+
+static long gx_audio_write(const s16 *frames, long count)
+{
+	return gx_audio_stream_write(audio_legacy, frames, count);
+}
+
+static long gx_audio_queued(void)
+{
+	return gx_audio_stream_queued(audio_legacy);
+}
+
 static void gx_audio_drop(void)
 {
-	mutexLock(&audio_lock);
-	audio_taken = audio_written;
-	mutexUnlock(&audio_lock);
+	gx_audio_stream_drop(audio_legacy);
 }
 
 static void gx_audio_close(void)
 {
-	gx_audio_drop();
+	/* The old libasound closes at each snd_pcm_close() and opens again
+	 * with its next stream: the stream stays, emptied. */
+	gx_audio_stream_drop(audio_legacy);
 }
 
 static void *host_symbol_find(const char *name)
@@ -1953,6 +2766,7 @@ static void *host_symbol_find(const char *name)
 		{ "eglInitialize", gl_initialize },
 		{ "eglChooseConfig", gl_choose_config },
 		{ "eglCreateContext", gl_create_context },
+		{ "eglDestroyContext", gl_destroy_context },
 		{ "eglCreatePbufferSurface", gl_create_pbuffer_surface },
 		{ "eglMakeCurrent", gl_make_current },
 		{ "glDebugMessageCallback", gl_debug_message_callback },
@@ -1964,6 +2778,16 @@ static void *host_symbol_find(const char *name)
 #endif
 	};
 
+	if (!strcmp(name, "gx_audio_stream_open"))
+		return gx_audio_stream_open;
+	if (!strcmp(name, "gx_audio_stream_write"))
+		return gx_audio_stream_write;
+	if (!strcmp(name, "gx_audio_stream_queued"))
+		return gx_audio_stream_queued;
+	if (!strcmp(name, "gx_audio_stream_drop"))
+		return gx_audio_stream_drop;
+	if (!strcmp(name, "gx_audio_stream_close"))
+		return gx_audio_stream_close;
 	if (!strcmp(name, "gx_audio_open"))
 		return gx_audio_open;
 	if (!strcmp(name, "gx_audio_write"))
@@ -2100,6 +2924,7 @@ static int net_add(void)
 	id = nd ? lkl_netdev_add(nd, &args) : -1;
 	host_log("gx: network device %d, resolver %s", id, inet_ntoa((struct in_addr){ dns }));
 	host_log(" and %s\n", dns2 ? inet_ntoa((struct in_addr){ dns2 }) : "no other");
+	log_server_start();
 	return id;
 }
 
@@ -2648,7 +3473,15 @@ static int screen_open(void)
 	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, corners);
 	glEnableVertexAttribArray(0);
-	glViewport(0, 0, 1280, 720);
+	{
+		/* All of the window, whatever its size: 1280 x 720 on the
+		 * Switch, 1920 x 1080 on the Switch 2. */
+		EGLint w = 1280, h = 720;
+
+		eglQuerySurface(screen_display, screen_surface, EGL_WIDTH, &w);
+		eglQuerySurface(screen_display, screen_surface, EGL_HEIGHT, &h);
+		glViewport(0, 0, w > 0 ? w : 1280, h > 0 ? h : 720);
+	}
 	return 0;
 }
 
@@ -2812,21 +3645,31 @@ static int start_full_screen;   /* -F */
 static int stay_720p;           /* -l */
 
 /* 1920 x 1080 in the dock, 1280 x 720 out of it (wl.h); said to wl.c when
- * it changes. */
+ * it changes. On the Switch 2, whose own screen is 1920 x 1080, that in both:
+ * pages are laid out the same, and drawn as sharp as each screen is. */
 static u64 screen_changed;   /* when tv_screen() last changed it */
+
+#ifdef __SWITCH2__
+#define HANDHELD_WIDTH 1920
+#define HANDHELD_HEIGHT 1080
+#else
+#define HANDHELD_WIDTH 1280
+#define HANDHELD_HEIGHT 720
+#endif
 
 static void tv_screen(void)
 {
 	static int was = -1;
 	int docked = appletGetOperationMode() == AppletOperationMode_Console;
+	int width = docked ? 1920 : HANDHELD_WIDTH, height = docked ? 1080 : HANDHELD_HEIGHT;
 
 	if (docked == was)
 		return;
 	if (was >= 0)
 		screen_changed = armGetSystemTick();
 	was = docked;
-	wl_set_screen(docked ? 1920 : 1280, docked ? 1080 : 720);
-	host_log("gx: %s: %s\n", docked ? "on a TV" : "handheld", docked ? "1920 x 1080" : "1280 x 720");
+	wl_set_screen(width, height);
+	host_log("gx: %s: %d x %d\n", docked ? "on a TV" : "handheld", width, height);
 }
 #define TV_USER_AGENT "Mozilla/5.0 (Nintendo Switch; WebApplet) AppleWebKit/609.4 (KHTML, like Gecko) " \
 	"NF/6.0.2.20.5 NintendoBrowser/5.1.0.22023 Dalvik/2.1.0 (Linux; U; Android 5.1.1; AEOBC Build/LVY48f)"
@@ -2909,6 +3752,66 @@ static void game_key(int key, int down)
 	} else {
 		push(down ? CDP_KEY_DOWN : CDP_KEY_UP, key, 0);
 	}
+}
+
+/*
+ * A keyboard on the console (USB, or one a tool says is there): its keys go
+ * to the window as they are, by their Linux numbers, the modifiers with them
+ * (wl.c tells the client which are held). HID usage to Linux key: the table
+ * of Linux's hid-input.c, up to the keypad, then the modifiers.
+ */
+static const unsigned char hid_keys[0x70] = {
+	  0,  0,  0,  0, 30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38,
+	 50, 49, 24, 25, 16, 19, 31, 20, 22, 47, 17, 45, 21, 44,  2,  3,
+	  4,  5,  6,  7,  8,  9, 10, 11, 28,  1, 14, 15, 57, 12, 13, 26,
+	 27, 43, 43, 39, 40, 41, 51, 52, 53, 58, 59, 60, 61, 62, 63, 64,
+	 65, 66, 67, 68, 87, 88, 99, 70,119,110,102,104,111,107,109,106,
+	105,108,103, 69, 98, 55, 74, 78, 96, 79, 80, 81, 75, 76, 77, 71,
+	 72, 73, 82, 83, 86,127,116,117,183,184,185,186,187,188,189,190,
+};
+static const unsigned char hid_modifier_keys[8] = { 29, 42, 56, 125, 97, 54, 100, 126 };
+
+static void keyboard_poll(void)
+{
+	static u64 was[4];
+	static int ready;
+	HidKeyboardState state;
+	u64 keys[4];
+
+	if (!ready) {
+		hidInitializeKeyboard();
+		ready = 1;
+	}
+	if (!hidGetKeyboardStates(&state, 1))
+		return;
+	memcpy(keys, state.keys, sizeof(keys));
+	/* The modifiers held, also when only said apart from the keys. */
+	if (state.modifiers & HidKeyboardModifier_Control)
+		keys[3] |= 1ULL << (0xe0 - 0xc0);
+	if (state.modifiers & HidKeyboardModifier_Shift)
+		keys[3] |= 1ULL << (0xe1 - 0xc0);
+	if (state.modifiers & HidKeyboardModifier_LeftAlt)
+		keys[3] |= 1ULL << (0xe2 - 0xc0);
+	if (state.modifiers & HidKeyboardModifier_Gui)
+		keys[3] |= 1ULL << (0xe3 - 0xc0);
+	if (state.modifiers & HidKeyboardModifier_RightAlt)
+		keys[3] |= 1ULL << (0xe6 - 0xc0);
+	/* Modifiers down first and up last, so that they are held around the
+	 * keys that came with them. */
+	for (int pass = 0; pass < 3; pass++)
+		for (int usage = 4; usage < 256; usage++) {
+			int modifier = usage >= 0xe0 && usage <= 0xe7;
+			int now = (int)(keys[usage / 64] >> (usage % 64)) & 1;
+			int before = (int)(was[usage / 64] >> (usage % 64)) & 1;
+			int key = modifier ? hid_modifier_keys[usage - 0xe0] : usage < 0x70 ? hid_keys[usage] : 0;
+			/* 0: modifiers down, 1: the other keys, 2: modifiers up */
+			int its_pass = !modifier ? 1 : now ? 0 : 2;
+
+			if (now == before || !key || pass != its_pass)
+				continue;
+			push(now ? CDP_KEY_DOWN : CDP_KEY_UP, key, 0);
+		}
+	memcpy(was, keys, sizeof(was));
 }
 
 /* Everything held is let go: when the overlay opens, or the mode changes. */
@@ -3341,6 +4244,25 @@ static int poll_input(struct cdp_input *in)
 		for (int i = 0; i < count; i++) {
 			xs[i] = touch.touches[i].x;
 			ys[i] = touch.touches[i].y;
+#ifdef __SWITCH2__
+			/* The Switch 2's screen is 1920 x 1080. Whether its touch
+			 * screen comes in those pixels or in the Switch's 1280 x 720
+			 * is not known for every program: a touch past 1280 or 720
+			 * says, and from then on it is brought to the window's
+			 * 1280 x 720 units. */
+			{
+				static int touch_1080p;
+
+				if (!touch_1080p && (xs[i] >= WL_SCREEN_WIDTH || ys[i] >= WL_SCREEN_HEIGHT)) {
+					touch_1080p = 1;
+					host_log("gx: the touch screen is in 1920 x 1080 pixels\n");
+				}
+				if (touch_1080p) {
+					xs[i] = xs[i] * WL_SCREEN_WIDTH / 1920;
+					ys[i] = ys[i] * WL_SCREEN_HEIGHT / 1080;
+				}
+			}
+#endif
 			/* Portrait: the picture's top is on the screen's left (gl_screen()). */
 			if (wayland && wl_portrait()) {
 				int t = xs[i];
@@ -3404,6 +4326,8 @@ static int poll_input(struct cdp_input *in)
 			return 0;
 	}
 
+	if (wayland && !overlay_is_open())
+		keyboard_poll();
 	padUpdate(&pad);
 	down = padGetButtonsDown(&pad);
 	/* + opens the overlay (overlay.c), which has the pad until it closes;
@@ -3747,7 +4671,7 @@ static void kernel_print(const char *str, int len)
  * core. */
 static void free_cores(Handle thread)
 {
-	svcSetThreadCoreMask(thread, -3, 0x7);
+	svcSetThreadCoreMask(thread, -3, cores);
 }
 
 static lkl_thread_t (*kernel_thread_create)(void (*)(void *), void *);
@@ -4420,11 +5344,16 @@ int main(int argc, char **argv)
 	PadState pad;
 	int choice;
 
+	cores_init();
 	if (!browser_mode) {
 		extern int launcher_main(int argc, char **argv);
 
 		return launcher_main(argc, argv);
 	}
+#ifdef __SWITCH2__
+	/* Before any thread: their stacks go anywhere in the stack region. */
+	images_reserve();
+#endif
 	consoleInit(NULL);
 	/* Any number of players, so that Joy-Con taken off, put back or paired
 	 * while we run are let in (with one, only the HOME menu takes them);
@@ -4449,6 +5378,8 @@ int main(int argc, char **argv)
 	/* Written in large pieces once things run: see host_console_write(). */
 	if (log_file)
 		setvbuf(log_file, NULL, _IOFBF, 64 << 10);
+	booster_start();   /* its thread logs: once there is a log */
+	host_log("gx: %d cores (mask %#lx)\n", core_count, (unsigned long)cores);
 #ifdef __SWITCH2__
 	/* What the GL driver (OunceVK, Mesa) says goes to stderr: into the log,
 	 * with its EGL messages in full, while EGL on the Switch 2 is new. */
@@ -4516,8 +5447,14 @@ int main(int argc, char **argv)
 			if (sscanf(word + 2, "%d,%d,%d,%d", &l, &t, &r, &b) == 4)
 				wl_address_bar(l, t, r, b);
 		}
-		else if (!guest_argc && !strncmp(word, "-c", 2) && word[2])
+		else if (!guest_argc && !strncmp(word, "-c", 2) && word[2]) {
 			cpu_count = atoi(word + 2);
+#ifdef __SWITCH2__
+			/* -c3 is the Switch 1's three cores: as many as there are. */
+			if (cpu_count == 3 && core_count > 3)
+				cpu_count = core_count;
+#endif
+		}
 		else if (!guest_argc && word[0] == '@')
 			root_image_name = word + 1;
 		else if (!guest_argc && word[0] == '=')
@@ -4562,7 +5499,11 @@ int main(int argc, char **argv)
 				guest_argv[i] = features;
 			}
 		guest_argv[guest_argc++] = "--user-agent=" TV_USER_AGENT;
-		guest_argv[guest_argc++] = "--start-fullscreen";
+		/* Full screen without the bubble that says how to leave it: since
+		 * Chromium 151 a full screen whose bubble is not seen presented
+		 * within 1.5 s is undone, and on the Switch 2 (and on the PC) it is
+		 * not seen. There is nothing to leave it for here. */
+		guest_argv[guest_argc++] = "--kiosk";
 		wl_address_bar(0, 0, 0, 0);   /* none on the screen */
 	}
 
@@ -4656,7 +5597,11 @@ int main(int argc, char **argv)
 		fclose(profile_image.file);
 	/* Back to the launcher: the program started again, as its title does
 	 * it (no --browser, no launch.txt: the launcher). Only a title can; from
-	 * the album, Quit. */
+	 * the album, Quit. Not on the Switch 2, where the title is the game the
+	 * Homebrew loader was started from (kaiHEN): the game would start. */
+#ifdef __SWITCH2__
+	to_launcher = 0;
+#endif
 	if (to_launcher && (appletGetAppletType() == AppletType_Application ||
 			    appletGetAppletType() == AppletType_SystemApplication) &&
 	    R_SUCCEEDED(appletRestartProgram(NULL, 0)))

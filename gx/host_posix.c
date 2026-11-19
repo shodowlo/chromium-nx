@@ -52,6 +52,7 @@ static const char *export_spec;
 /* ---------- memory ---------- */
 
 static char *reserved;
+static size_t reserved_len;
 
 /* None here, unless GX_HOLES asks for the kind the Switch has, to try them:
  * 4 GB taken out at 6 GB, and 30 GB at 40 GB. */
@@ -77,7 +78,16 @@ void *host_reserve(size_t *len)
 		*len = (size_t)atol(limit) << 30;
 	p = mmap(NULL, *len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
 	reserved = p == MAP_FAILED ? NULL : p;
+	reserved_len = reserved ? *len : 0;
 	return reserved;
+}
+
+/* Data and images anywhere. */
+void host_arena_window(int kind, uint64_t *start, uint64_t *end)
+{
+	(void)kind;
+	*start = (uint64_t)reserved;
+	*end = (uint64_t)reserved + reserved_len;
 }
 
 /* Linux would allow it, Horizon does not: refusing it here too keeps what
@@ -294,6 +304,11 @@ void host_log(const char *fmt, ...)
 	if (n > (int)sizeof(buf) - 1)
 		n = sizeof(buf) - 1;
 	host_console_write(2, buf, n);
+}
+
+void host_busy(int on)
+{
+	(void)on;   /* a PC goes as fast as it can anyway */
 }
 
 void host_random(void *buf, size_t len)
@@ -600,6 +615,55 @@ static void gx_audio_close(void)
 		(unsigned long)audio_written, (unsigned long)audio_loud);
 }
 
+/* Several streams (the console mixes them, host_nx.c): here they are all the
+ * one above, counted together, which is enough for there being nothing to
+ * hear. A number for each, as the console gives. */
+#define AUDIO_STREAMS 8
+static int audio_streams_used[AUDIO_STREAMS];
+
+static long gx_audio_stream_open(long rate, long channels)
+{
+	long id = -1;
+
+	if (gx_audio_open(rate, channels))
+		return -1;
+	pthread_mutex_lock(&audio_lock);
+	for (int s = 0; s < AUDIO_STREAMS && id < 0; s++)
+		if (!audio_streams_used[s]) {
+			audio_streams_used[s] = 1;
+			id = s;
+		}
+	pthread_mutex_unlock(&audio_lock);
+	return id;
+}
+
+static long gx_audio_stream_write(long id, const int16_t *frames, long count)
+{
+	return id < 0 || id >= AUDIO_STREAMS ? -1 : gx_audio_write(frames, count);
+}
+
+static long gx_audio_stream_queued(long id)
+{
+	(void)id;
+	return gx_audio_queued();
+}
+
+static void gx_audio_stream_drop(long id)
+{
+	(void)id;
+	gx_audio_drop();
+}
+
+static void gx_audio_stream_close(long id)
+{
+	if (id < 0 || id >= AUDIO_STREAMS)
+		return;
+	pthread_mutex_lock(&audio_lock);
+	audio_streams_used[id] = 0;
+	pthread_mutex_unlock(&audio_lock);
+	gx_audio_close();
+}
+
 static void *audio_symbol(const char *name)
 {
 	static const struct {
@@ -609,6 +673,9 @@ static void *audio_symbol(const char *name)
 		{ "gx_audio_open", gx_audio_open },   { "gx_audio_write", gx_audio_write },
 		{ "gx_audio_queued", gx_audio_queued }, { "gx_audio_drop", gx_audio_drop },
 		{ "gx_audio_close", gx_audio_close },
+		{ "gx_audio_stream_open", gx_audio_stream_open }, { "gx_audio_stream_write", gx_audio_stream_write },
+		{ "gx_audio_stream_queued", gx_audio_stream_queued }, { "gx_audio_stream_drop", gx_audio_stream_drop },
+		{ "gx_audio_stream_close", gx_audio_stream_close },
 	};
 
 	for (size_t i = 0; i < sizeof(ours) / sizeof(ours[0]); i++)
@@ -1069,6 +1136,102 @@ static void populate_root(void)
 		lkl_sys_mknod(nodes[i].path, LKL_S_IFCHR | 0666, 1 << 8 | nodes[i].minor);
 }
 
+/* GX_RAMFS_WATCH=1: every 5 s, the files of the kernel's memory filesystem
+ * that hold more than a megabyte, named or only open (/proc/N/fd): what
+ * fills the kernel, which panics when its memory is all theirs. */
+static void ramfs_report(const char *path, long *total)
+{
+	struct lkl_stat st;
+	struct lkl_statfs fs;
+	char link[256];
+	long n;
+
+	if (lkl_sys_stat(path, &st) || (st.st_mode & LKL_S_IFMT) != LKL_S_IFREG)
+		return;
+	{
+		long params[6] = { (long)path, (long)&fs };
+
+		if (lkl_syscall(__lkl__NR_statfs, params) || fs.f_type != 0x858458f6 /* RAMFS_MAGIC */)
+			return;
+	}
+	*total += st.st_blocks * 512;
+	if (st.st_blocks * 512 < (1 << 20))
+		return;
+	n = lkl_sys_readlink(path, link, sizeof(link) - 1);
+	link[n > 0 ? n : 0] = 0;
+	fprintf(stderr, "gx: ramfs: %s %s ino %lu: %lu KB of %lu KB\n", path, link, (unsigned long)st.st_ino,
+		(unsigned long)(st.st_blocks / 2), (unsigned long)(st.st_size >> 10));
+}
+
+static void ramfs_walk(const char *dir, int depth, long *total)
+{
+	struct lkl_dir *d;
+	struct lkl_linux_dirent64 *e;
+	int err;
+	char path[512];
+
+	if (depth > 4 || !(d = lkl_opendir(dir, &err)))
+		return;
+	while ((e = lkl_readdir(d))) {
+		if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
+			continue;
+		snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+		if (e->d_type == 4 /* DT_DIR */)
+			ramfs_walk(path, depth + 1, total);
+		else
+			ramfs_report(path, total);
+	}
+	lkl_closedir(d);
+}
+
+static void *ramfs_watch(void *arg)
+{
+	(void)arg;
+	for (;;) {
+		struct lkl_dir *d;
+		struct lkl_linux_dirent64 *e;
+		int err;
+		long named = 0, open = 0;
+
+		sleep(5);
+		ramfs_walk("/tmp", 0, &named);
+		ramfs_walk("/dev", 0, &named);
+		ramfs_walk("/run", 0, &named);
+		/* Open ones, named or not: one task's table is everyone's (threads). */
+		if ((d = lkl_opendir("/proc", &err))) {
+			while ((e = lkl_readdir(d))) {
+				char fds[64];
+
+				if (e->d_name[0] < '1' || e->d_name[0] > '9')
+					continue;
+				snprintf(fds, sizeof(fds), "/proc/%s/fd", e->d_name);
+				ramfs_walk(fds, 4, &open);   /* threads share theirs: counted again */
+			}
+			lkl_closedir(d);
+		}
+		fprintf(stderr, "gx: ramfs: %ld MB named, %ld MB open\n", named >> 20, open >> 20);
+		{
+			char buf[2048];
+			int fd = lkl_sys_open("/proc/meminfo", LKL_O_RDONLY, 0);
+			long n = fd >= 0 ? lkl_sys_read(fd, buf, sizeof(buf) - 1) : -1;
+
+			if (fd >= 0)
+				lkl_sys_close(fd);
+			if (n > 0) {
+				buf[n] = 0;
+				for (char *line = strtok(buf, "\n"); line; line = strtok(NULL, "\n"))
+					if (!strncmp(line, "MemFree", 7) || !strncmp(line, "Cached", 6) ||
+					    !strncmp(line, "Unevict", 7) || !strncmp(line, "Slab", 4) ||
+					    !strncmp(line, "Shmem:", 6) || !strncmp(line, "Buffers", 7) ||
+					    !strncmp(line, "Active(file)", 12) || !strncmp(line, "Inactive(file)", 14) ||
+					    !strncmp(line, "Mlocked", 7) || !strncmp(line, "KernelStack", 11))
+						fprintf(stderr, "gx: meminfo: %s\n", line);
+			}
+		}
+	}
+	return NULL;
+}
+
 int main(int argc, char **argv)
 {
 	static char *guest_env[32] = {
@@ -1133,10 +1296,15 @@ int main(int argc, char **argv)
 			fprintf(stderr, "gx: cannot use %s as a disk: nothing will be kept\n", profile_path);
 	}
 	if (!ret)
-		ret = lkl_start_kernel("mem=512M loglevel=0");
+		ret = lkl_start_kernel(getenv("GX_KERNEL_ARGS") ? getenv("GX_KERNEL_ARGS") : "mem=512M loglevel=0");
 	if (ret) {
 		fprintf(stderr, "gx: the kernel did not start (%d)\n", ret);
 		return 1;
+	}
+	if (getenv("GX_RAMFS_WATCH")) {
+		pthread_t t;
+
+		pthread_create(&t, NULL, ramfs_watch, NULL);
 	}
 	/* The kernel has no clock to read the date from and starts in 1970,
 	 * which no TLS certificate survives. */
@@ -1204,6 +1372,10 @@ int main(int argc, char **argv)
 		fprintf(stderr, "gx: cannot reserve the guest address space\n");
 		return 1;
 	}
+	/* GX_START_URL: a page the first tab is taken to (as -N on the Switch):
+	 * chrome:// pages, which Chromium will not open from its command line. */
+	if (getenv("GX_START_URL"))
+		cdp_start_url(getenv("GX_START_URL"));
 	/* The pipe first: it wants the descriptors Chromium knows it by. */
 	if (browser && cdp_start(wayland)) {
 		fprintf(stderr, "gx: cannot set up the pipe to Chromium\n");

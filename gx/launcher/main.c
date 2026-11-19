@@ -45,6 +45,25 @@ extern const unsigned int icon_jpg_len;
 static u32 *fbuf;
 static u32 fstride;   /* in pixels */
 
+/*
+ * Everything is laid out in units of a 1280 x 720 screen (W x H). On the
+ * Switch 2, whose screen is 1920 x 1080, it is drawn one and a half times as
+ * large: the shapes and the text at that size (sharp, the text made at that
+ * size by FreeType), and what is drawn a unit at a time (blend()) in blocks.
+ * SCALE_NUM / SCALE_DEN is that factor; 1 on the Switch.
+ */
+#ifdef __SWITCH2__
+#define SCALE_NUM 3
+#define SCALE_DEN 2
+#else
+#define SCALE_NUM 1
+#define SCALE_DEN 1
+#endif
+#define PX(v) ((v) * SCALE_NUM / SCALE_DEN)   /* units to pixels */
+#define PW PX(W)
+#define PH PX(H)
+static const float scale = (float)SCALE_NUM / SCALE_DEN;
+
 /* RGBA8888 in memory: R first. */
 #define RGB(r, g, b) (0xFF000000u | ((u32)(b) << 16) | ((u32)(g) << 8) | (u32)(r))
 #define C_R(c) ((c) & 0xFF)
@@ -56,11 +75,12 @@ static const u32 SURFACE = RGB(0x24, 0x28, 0x33), SURFACE_HI = RGB(0x2E, 0x33, 0
 static const u32 TEXT = RGB(0xE8, 0xEA, 0xF0), TEXT_DIM = RGB(0x9A, 0xA0, 0xAE);
 static const u32 ACCENT = RGB(0x8A, 0xB4, 0xF8), ACCENT_DARK = RGB(0x1F, 0x3B, 0x63);
 
-static inline void blend(int x, int y, u32 c, int a)
+/* A pixel of the screen. */
+static inline void blend_px(int x, int y, u32 c, int a)
 {
 	u32 *d;
 
-	if (x < 0 || y < 0 || x >= W || y >= H || a <= 0)
+	if (x < 0 || y < 0 || x >= PW || y >= PH || a <= 0)
 		return;
 	d = &fbuf[y * fstride + x];
 	if (a >= 255) {
@@ -71,16 +91,24 @@ static inline void blend(int x, int y, u32 c, int a)
 		 (C_B(c) * a + C_B(*d) * (255 - a)) / 255);
 }
 
+/* A unit: the pixels it covers. */
+static inline void blend(int x, int y, u32 c, int a)
+{
+	for (int py = PX(y); py < PX(y + 1); py++)
+		for (int px = PX(x); px < PX(x + 1); px++)
+			blend_px(px, py, c, a);
+}
+
 static void background_band(int y0, int y1)
 {
-	for (int y = y0; y < y1; y++) {
-		int t = y * 255 / (H - 1);
+	for (int y = PX(y0); y < PX(y1); y++) {
+		int t = y * 255 / (PH - 1);
 		u32 c = RGB((C_R(BG_TOP) * (255 - t) + C_R(BG_BOTTOM) * t) / 255,
 			    (C_G(BG_TOP) * (255 - t) + C_G(BG_BOTTOM) * t) / 255,
 			    (C_B(BG_TOP) * (255 - t) + C_B(BG_BOTTOM) * t) / 255);
 		u32 *row = &fbuf[y * fstride];
 
-		for (int x = 0; x < W; x++)
+		for (int x = 0; x < PW; x++)
 			row[x] = c;
 	}
 }
@@ -90,9 +118,15 @@ static void background(void)
 	background_band(0, H);
 }
 
-/* A rectangle with round corners, edges smoothed. */
+/* A rectangle with round corners, edges smoothed. In units; drawn in pixels. */
 static void rrect(int x, int y, int w, int h, int r, u32 c)
 {
+	/* The pixels it covers, its corners as much larger. */
+	w = PX(x + w) - PX(x);
+	h = PX(y + h) - PX(y);
+	x = PX(x);
+	y = PX(y);
+	r = PX(r);
 	if (r * 2 > h)
 		r = h / 2;
 	if (r * 2 > w)
@@ -111,25 +145,35 @@ static void rrect(int x, int y, int w, int h, int r, u32 c)
 				if (d > r - 1)
 					a = (int)((r - d) * 255);
 			}
-			blend(x + i, y + j, c, a);
+			blend_px(x + i, y + j, c, a);
 		}
 	}
 }
 
+/* In units; drawn in pixels. */
 static void circle(float cx, float cy, float r, u32 c)
 {
+	cx *= scale;
+	cy *= scale;
+	r *= scale;
 	for (int y = (int)(cy - r - 1); y <= (int)(cy + r + 1); y++)
 		for (int x = (int)(cx - r - 1); x <= (int)(cx + r + 1); x++) {
 			float d = sqrtf((x + 0.5f - cx) * (x + 0.5f - cx) + (y + 0.5f - cy) * (y + 0.5f - cy));
 
 			if (d < r + 0.5f)
-				blend(x, y, c, d < r - 0.5f ? 255 : (int)((r + 0.5f - d) * 255));
+				blend_px(x, y, c, d < r - 0.5f ? 255 : (int)((r + 0.5f - d) * 255));
 		}
 }
 
-/* A stroke from (x0,y0) to (x1,y1), t thick, round ends. */
+/* A stroke from (x0,y0) to (x1,y1), t thick, round ends. In units; drawn in
+ * pixels. */
 static void line(float x0, float y0, float x1, float y1, float t, u32 c)
 {
+	x0 *= scale;
+	y0 *= scale;
+	x1 *= scale;
+	y1 *= scale;
+	t *= scale;
 	float minx = fminf(x0, x1) - t, maxx = fmaxf(x0, x1) + t;
 	float miny = fminf(y0, y1) - t, maxy = fmaxf(y0, y1) + t;
 	float vx = x1 - x0, vy = y1 - y0, len2 = vx * vx + vy * vy;
@@ -141,7 +185,7 @@ static void line(float x0, float y0, float x1, float y1, float t, u32 c)
 			float dx = px - k * vx, dy = py - k * vy, d = sqrtf(dx * dx + dy * dy);
 
 			if (d < t / 2 + 0.5f)
-				blend(x, y, c, d < t / 2 - 0.5f ? 255 : (int)((t / 2 + 0.5f - d) * 255));
+				blend_px(x, y, c, d < t / 2 - 0.5f ? 255 : (int)((t / 2 + 0.5f - d) * 255));
 		}
 }
 
@@ -208,10 +252,32 @@ static u32 next_cp(const char **s)
 	return cp;
 }
 
-static int text_width(const char *s, int size)
+/* The touch screen, in units. The Switch 2's may come in its 1920 x 1080
+ * pixels rather than the Switch's 1280 x 720: a touch past 1280 or 720 says,
+ * and from then on it is brought to units (as gx does, host_nx.c). */
+static int read_touch(HidTouchScreenState *touch)
+{
+	static int in_1080p;
+
+	if (!hidGetTouchScreenStates(touch, 1))
+		return 0;
+	for (int i = 0; i < (int)touch->count && i < 16; i++) {
+		if (touch->touches[i].x >= W || touch->touches[i].y >= H)
+			in_1080p = 1;
+		if (in_1080p) {
+			touch->touches[i].x = touch->touches[i].x * W / 1920;
+			touch->touches[i].y = touch->touches[i].y * H / 1080;
+		}
+	}
+	return 1;
+}
+
+/* In pixels, the text made at size in units. */
+static int text_width_px(const char *s, int size)
 {
 	int w = 0;
 
+	size = PX(size);
 	while (*s) {
 		struct glyph *g = glyph(next_cp(&s), size);
 
@@ -221,13 +287,23 @@ static int text_width(const char *s, int size)
 	return w;
 }
 
+/* In units. */
+static int text_width(const char *s, int size)
+{
+	return (text_width_px(s, size) * SCALE_DEN + SCALE_NUM - 1) / SCALE_NUM;
+}
+
 enum { LEFT, CENTER, RIGHT };
 
-/* y is the baseline. */
+/* y is the baseline; in units, the text made in pixels at its size. Returns
+ * its width in units. */
 static int text(int x, int y, int size, u32 c, int align, const char *s)
 {
-	int w = text_width(s, size);
+	int w = text_width_px(s, size);
 
+	x = PX(x);
+	y = PX(y);
+	size = PX(size);
 	if (align == CENTER)
 		x -= w / 2;
 	else if (align == RIGHT)
@@ -239,16 +315,17 @@ static int text(int x, int y, int size, u32 c, int align, const char *s)
 			continue;
 		for (int j = 0; j < g->h; j++)
 			for (int i = 0; i < g->w; i++)
-				blend(x + g->left + i, y - g->top + j, c, g->bits[j * g->w + i]);
+				blend_px(x + g->left + i, y - g->top + j, c, g->bits[j * g->w + i]);
 		x += g->adv;
 	}
-	return w;
+	return (w * SCALE_DEN + SCALE_NUM - 1) / SCALE_NUM;
 }
 
 /* ---------- the app's icon ---------- */
 
 #define ICON 112
-static u32 icon[ICON * ICON];
+#define ICON_PX PX(ICON)   /* in pixels: made at the size it is shown */
+static u32 icon[ICON_PX * ICON_PX];
 static int have_icon;
 
 static void load_icon(void)
@@ -262,11 +339,11 @@ static void load_icon(void)
 	if (!tjDecompressHeader3(tj, icon_jpg, icon_jpg_len, &w, &h, &sub, &cs) &&
 	    (rgb = malloc(w * h * 3)) != NULL) {
 		if (!tjDecompress2(tj, icon_jpg, icon_jpg_len, rgb, w, 0, h, TJPF_RGB, 0)) {
-			/* Shrunk to ICON by averaging the pixels that fall in each. */
-			for (int y = 0; y < ICON; y++)
-				for (int x = 0; x < ICON; x++) {
-					int x0 = x * w / ICON, x1 = (x + 1) * w / ICON;
-					int y0 = y * h / ICON, y1 = (y + 1) * h / ICON;
+			/* Shrunk to ICON_PX by averaging the pixels that fall in each. */
+			for (int y = 0; y < ICON_PX; y++)
+				for (int x = 0; x < ICON_PX; x++) {
+					int x0 = x * w / ICON_PX, x1 = (x + 1) * w / ICON_PX;
+					int y0 = y * h / ICON_PX, y1 = (y + 1) * h / ICON_PX;
 					unsigned r = 0, g = 0, b = 0, n = 0;
 
 					for (int yy = y0; yy < y1; yy++)
@@ -279,7 +356,7 @@ static void load_icon(void)
 						}
 					if (!n)
 						n = 1;
-					icon[y * ICON + x] = RGB(r / n, g / n, b / n);
+					icon[y * ICON_PX + x] = RGB(r / n, g / n, b / n);
 				}
 			have_icon = 1;
 		}
@@ -615,11 +692,12 @@ static void draw_app_icon(int i, int cx, int cy)
 		for (int k = 0; k < 10; k++) {
 			float a = -(float)M_PI / 2 + k * (float)M_PI / 5, r = k % 2 ? 11.5f : 27;
 
-			px[k] = cx + cosf(a) * r;
-			py[k] = cy + 3 + sinf(a) * r;
+			/* In pixels. */
+			px[k] = (cx + cosf(a) * r) * scale;
+			py[k] = (cy + 3 + sinf(a) * r) * scale;
 		}
-		for (int y = cy - 28; y <= cy + 30; y++)
-			for (int x = cx - 28; x <= cx + 28; x++) {
+		for (int y = PX(cy - 28); y <= PX(cy + 30); y++)
+			for (int x = PX(cx - 28); x <= PX(cx + 28); x++) {
 				int in = 0;
 
 				for (int k = 0, j = 9; k < 10; j = k++)
@@ -627,7 +705,7 @@ static void draw_app_icon(int i, int cx, int cy)
 					    x + 0.5f < px[k] + (y + 0.5f - py[k]) * (px[j] - px[k]) / (py[j] - py[k]))
 						in = !in;
 				if (in)
-					blend(x, y, TEXT, 255);
+					blend_px(x, y, TEXT, 255);
 			}
 		break;
 	}
@@ -663,15 +741,18 @@ static void draw_app_icon(int i, int cx, int cy)
 		break;
 	case 0:   /* Chromium: the app's own icon, round */
 		if (have_icon) {
-			for (int y = 0; y < ICON; y++)
-				for (int x = 0; x < ICON; x++) {
-					float d = sqrtf((x - ICON / 2 + 0.5f) * (x - ICON / 2 + 0.5f) +
-							(y - ICON / 2 + 0.5f) * (y - ICON / 2 + 0.5f));
-					float r = 50;
+			/* In pixels, round, its edge smoothed. */
+			float r = 50 * scale;
+
+			for (int y = 0; y < ICON_PX; y++)
+				for (int x = 0; x < ICON_PX; x++) {
+					float d = sqrtf((x - ICON_PX / 2 + 0.5f) * (x - ICON_PX / 2 + 0.5f) +
+							(y - ICON_PX / 2 + 0.5f) * (y - ICON_PX / 2 + 0.5f));
 
 					if (d < r + 0.5f)
-						blend(cx - ICON / 2 + x, cy - ICON / 2 + y, icon[y * ICON + x],
-						      d < r - 0.5f ? 255 : (int)((r + 0.5f - d) * 255));
+						blend_px(PX(cx) - ICON_PX / 2 + x, PX(cy) - ICON_PX / 2 + y,
+							 icon[y * ICON_PX + x],
+							 d < r - 0.5f ? 255 : (int)((r + 0.5f - d) * 255));
 				}
 		} else {
 			circle(cx, cy, 50, ACCENT);
@@ -679,11 +760,11 @@ static void draw_app_icon(int i, int cx, int cy)
 		break;
 	case 1:   /* YouTube: red, a white triangle */
 		circle(cx, cy, 50, RGB(0xFF, 0x00, 0x00));
-		/* The triangle, 32 wide and 36 high, pointing right. */
-		for (int y = -18; y <= 18; y++)
-			for (int x = -12; x <= 20; x++)
-				if (fabsf((float)y) <= 18 * (1 - (x + 12) / 32.0f))
-					blend(cx + x, cy + y, RGB(0xFF, 0xFF, 0xFF), 255);
+		/* The triangle, 32 wide and 36 high, pointing right; in pixels. */
+		for (int y = (int)(-18 * scale); y <= (int)(18 * scale); y++)
+			for (int x = (int)(-12 * scale); x <= (int)(20 * scale); x++)
+				if (fabsf((float)y) <= 18 * scale * (1 - (x + 12 * scale) / (32 * scale)))
+					blend_px(PX(cx) + x, PX(cy) + y, RGB(0xFF, 0xFF, 0xFF), 255);
 		break;
 	case APP_SETTINGS:   /* Settings: a gear */
 		circle(cx, cy, 50, RGB(0x5F, 0x63, 0x68));
@@ -1887,7 +1968,11 @@ static int activate(void)
 			}
 			return NONE;
 		case APP_CHROMIUM:
-			go_url[0] = 0;
+			/* Chromium's own new tab page, with its shortcuts: what a new
+			 * tab is when Google is the search engine. Left to itself, this
+			 * build's new tab was its default search engine's page
+			 * (DuckDuckGo). */
+			snprintf(go_url, sizeof(go_url), "chrome://new-tab-page/");
 			return GO;
 		case APP_YOUTUBE:
 			snprintf(go_url, sizeof(go_url), "https://www.youtube.com/tv");
@@ -2218,7 +2303,7 @@ int launcher_main(int argc, char **argv)
 		goto out;
 	}
 	load_icon();
-	framebufferCreate(&fb, nwindowGetDefault(), W, H, PIXEL_FORMAT_RGBA_8888, 2);
+	framebufferCreate(&fb, nwindowGetDefault(), PW, PH, PIXEL_FORMAT_RGBA_8888, 2);
 	framebufferMakeLinear(&fb);
 	if (settings.check_updates)
 		update_check();
@@ -2254,7 +2339,7 @@ int launcher_main(int argc, char **argv)
 				upd_choose(upd_focus);
 			else if (down & HidNpadButton_B)
 				upd_choose(0);
-			if (hidGetTouchScreenStates(&touch, 1) && touch.count > 0) {
+			if (read_touch(&touch) && touch.count > 0) {
 				for (int i = 0; i < 2 && !touching; i++)
 					if (inside(upd_spot(i), touch.touches[0].x, touch.touches[0].y))
 						upd_choose(i);
@@ -2293,7 +2378,7 @@ int launcher_main(int argc, char **argv)
 		 * tap is a finger put down. */
 		if (job.active) {
 			touching = 0;
-		} else if (!upd && hidGetTouchScreenStates(&touch, 1) && touch.count > 0) {
+		} else if (!upd && read_touch(&touch) && touch.count > 0) {
 			int x = touch.touches[0].x, y = touch.touches[0].y;
 
 			if (!touching) {

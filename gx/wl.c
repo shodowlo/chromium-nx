@@ -1156,8 +1156,15 @@ void wl_set_screen(int width, int height)
  * than the GPU has room for beside a browser full screen at 1080 x 1920. */
 static int scale_now(void)
 {
+#ifdef __SWITCH2__
+	/* The Switch 2 has the room; and its screen is 1080 pixels high, which
+	 * a picture made for 720 would fill only a part of (the system does not
+	 * stretch it). */
+	return __atomic_load_n(&scale_wanted, __ATOMIC_SEQ_CST);
+#else
 	return __atomic_load_n(&portrait_wanted, __ATOMIC_SEQ_CST) ? 120 :
 	       __atomic_load_n(&scale_wanted, __ATOMIC_SEQ_CST);
+#endif
 }
 
 /* The console went into its dock or out of it, or the screen turned: the
@@ -1321,8 +1328,19 @@ static void input(const struct cdp_input *in, uint32_t ms)
 		break;
 	case CDP_KEY_DOWN:
 	case CDP_KEY_UP:
-		if (keyboard_id && keyboard_inside && has_keymap)
-			event(keyboard_id, 3, "uuuu", serial++, ms, in->x, in->type == CDP_KEY_DOWN);
+		if (keyboard_id && keyboard_inside && has_keymap) {
+			/* Shift, Control, Alt and the logo key: the client is
+			 * told which are held (the masks of the US key map). */
+			static uint32_t held;
+			uint32_t key = (uint32_t)in->x, mask = key == 42 || key == 54 ? 1 : key == 29 || key == 97 ? 4 :
+				key == 56 || key == 100 ? 8 : key == 125 || key == 126 ? 64 : 0;
+
+			event(keyboard_id, 3, "uuuu", serial++, ms, key, in->type == CDP_KEY_DOWN);
+			if (mask) {
+				held = in->type == CDP_KEY_DOWN ? held | mask : held & ~mask;
+				event(keyboard_id, 4, "uuuuu", serial++, held, 0, 0, 0);
+			}
+		}
 		break;
 	case CDP_BUTTON:
 		if (pointer_id) {

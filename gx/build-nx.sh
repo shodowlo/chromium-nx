@@ -157,6 +157,9 @@ if [ -n "$SWITCH2" ]; then
 	# The ends on purpose (abort, assert, diagAbortWithResult, exit) say who
 	# called them in the log first (host_nx.c, say_who_ends()).
 	NX_LINK="$NX_LINK -Wl,--wrap=abort -Wl,--wrap=__assert_func -Wl,--wrap=diagAbortWithResult -Wl,--wrap=exit"
+	# The arena spans the stack and alias regions, wherever they are in
+	# the 512 GB of addresses (host_nx.c, host_reserve()).
+	ARENA="(512UL<<30)"
 else
 	LIBNX=$DEVKITPRO/libnx
 	GLLIBS=$PORTLIBS
@@ -165,6 +168,7 @@ else
 	GL_LINK="-lEGL -lGLESv2 -lglapi -ldrm_nouveau"
 	GL_NM="$GLLIBS/lib/libEGL.a $GLLIBS/lib/libGLESv2.a"
 	NX_LINK="-lnx"
+	ARENA="(256UL<<30)"
 fi
 {
 	echo "/* Made by build-nx.sh. */"
@@ -200,7 +204,7 @@ ARCH="$CPU -mtp=soft -fPIE"
 # -iquote: LKL's host sources find their own headers, and nothing else does.
 # The arena is as large as on the PC (Chromium fills 120 GB of addresses) if
 # the console has that much to reserve.
-CFLAGS="-g -O2 -Wall -ffunction-sections $ARCH $PLATFORM -DGX_ARENA_SIZE=(256UL<<30) \
+CFLAGS="-g -O2 -Wall -ffunction-sections $ARCH $PLATFORM -DGX_ARENA_SIZE=$ARENA \
 	-I$LIBNX/include -I$PORTLIBS/include -I$PORTLIBS/include/freetype2 -I$OUT/include -I$SRC/nx -I$SRC \
 	-iquote $OUT/lkl"
 objs=

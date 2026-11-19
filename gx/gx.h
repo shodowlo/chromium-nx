@@ -145,6 +145,12 @@ void gx_set_cpus(int count);
  * 0 when index is past the last. */
 void *host_reserve(size_t *len);
 int host_reserved_hole(int index, void **addr, size_t *len);
+/* Where in the arena each kind of memory may go, for a host that can only map
+ * some kinds in some places: data (anonymous memory, GX_ARENA_DATA) and
+ * images (files mapped with their code, and code, GX_ARENA_IMAGES). Each is a
+ * range of the arena; a host without such limits gives all of it for both. */
+enum { GX_ARENA_DATA, GX_ARENA_IMAGES };
+void host_arena_window(int kind, uint64_t *start, uint64_t *end);
 int host_commit(void *addr, size_t len, int prot);   /* zero-filled */
 int host_protect(void *addr, size_t len, int prot);
 int host_decommit(void *addr, size_t len);
@@ -193,6 +199,9 @@ void host_random(void *buf, size_t len);
 /* A host function the guest may call through gx_hostcall (EGL, GLES), or NULL. */
 void *host_symbol(const char *name);
 void host_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+/* A page is loading (1) or done (0): a host that can make the processor go
+ * faster for a while does, then. */
+void host_busy(int on);
 
 struct host_lock;
 struct host_cond;

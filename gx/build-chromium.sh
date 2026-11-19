@@ -80,8 +80,8 @@ if [ ! -e "$IMAGE" ] || [ "$0" -nt "$IMAGE" ] || [ $CHROMIUM -nt "$IMAGE" ]; the
 	for bin in $CHROMIUM $SHELL_BIN $FULL_BIN; do
 		aarch64-linux-gnu-readelf --dyn-syms -W "$bin"
 	done | awk '$7 == "UND" && $8 ~ /^snd_/ { sub(/ \([0-9]+\)$/, ""); print $8 }' | sort -u >"$A/imports"
-	echo 'GX_THUNK(gx_audio_open) GX_THUNK(gx_audio_write) GX_THUNK(gx_audio_queued)
-GX_THUNK(gx_audio_drop) GX_THUNK(gx_audio_close)' | tr ' ' '\n' >"$A/host.list"
+	echo 'GX_THUNK(gx_audio_stream_open) GX_THUNK(gx_audio_stream_write) GX_THUNK(gx_audio_stream_queued)
+GX_THUNK(gx_audio_stream_drop) GX_THUNK(gx_audio_stream_close)' | tr ' ' '\n' >"$A/host.list"
 	$CC -O2 -g -Wall -fPIC -c "$SRC/guest/asound.c" -o "$A/asound.o" || exit 1
 	$CC -O2 -g -Wall -fPIC -DGX_LIST="\"$A/host.list\"" -c "$SRC/guest/hostlib.c" -o "$A/host.o" || exit 1
 	aarch64-linux-gnu-nm --defined-only "$A/asound.o" | awk '{ print $3 }' >"$A/have"

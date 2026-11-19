@@ -138,6 +138,12 @@ long gx_video_open(const uint8_t *extradata, long size)
 		}
 	}
 	d->ctx->pkt_timebase = (AVRational){ 1, 1000000 };
+	/* On the processor, a picture of 1080p took 26 to 30 ms on one core
+	 * while a page's scripts ran beside it: a 30 frames a second video
+	 * fell behind. Pictures decoded on several at once (a few pictures'
+	 * delay, which the queue of waiting pictures takes up). */
+	d->ctx->thread_count = 4;
+	d->ctx->thread_type = FF_THREAD_FRAME;
 #ifdef __SWITCH__
 	{
 		AVBufferRef *device = NULL;
