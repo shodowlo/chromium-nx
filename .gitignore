@@ -31,4 +31,5 @@ gx/dist-nx2/
 gx/dist-hbl/
 # what scripts/release.py publishes (regenerated)
 gx/dist-release/
+gx/dist-release2/
 /chromium-nx.nro

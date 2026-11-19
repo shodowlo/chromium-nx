@@ -1194,6 +1194,29 @@ static void *ramfs_watch(void *arg)
 		long named = 0, open = 0;
 
 		sleep(5);
+		{
+			/* Once: the kernel's tasks by name, each a host thread. */
+			static int listed;
+
+			if (!listed++ && (d = lkl_opendir("/proc", &err))) {
+				while ((e = lkl_readdir(d))) {
+					char path[64], comm[64];
+					int fd;
+					long n;
+
+					if (e->d_name[0] < '1' || e->d_name[0] > '9')
+						continue;
+					snprintf(path, sizeof(path), "/proc/%s/comm", e->d_name);
+					fd = lkl_sys_open(path, LKL_O_RDONLY, 0);
+					n = fd >= 0 ? lkl_sys_read(fd, comm, sizeof(comm) - 1) : 0;
+					if (fd >= 0)
+						lkl_sys_close(fd);
+					comm[n > 0 ? n : 0] = 0;
+					fprintf(stderr, "gx: task %s %s", e->d_name, comm);
+				}
+				lkl_closedir(d);
+			}
+		}
 		ramfs_walk("/tmp", 0, &named);
 		ramfs_walk("/dev", 0, &named);
 		ramfs_walk("/run", 0, &named);
