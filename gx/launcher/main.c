@@ -1275,7 +1275,7 @@ static const struct {
 	{ 1, "In the browser", NULL },
 	{ 0, "Touch", "Tap, drag to scroll, two fingers to zoom" },
 	{ 0, "Right edge", "A finger there drags the scroll bar" },
-	{ 0, "Left stick", "A mouse pointer: A clicks where it is" },
+	{ 0, "Left stick", "A mouse pointer: A clicks where it is, ZR right-clicks" },
 	{ 0, "Right stick", "Scrolls the page" },
 	{ 0, "D-pad", "Moves from link to link" },
 	{ 0, "A", "Opens the link, or the keyboard on a text field" },

@@ -4157,7 +4157,7 @@ static int overlay_chose(int what, struct cdp_input *in)
  * mouse pointer, which A clicks with while it is shown; the right stick
  * scrolls, both ways. The pointer is drawn over the screen by glwin.c
  * (gl_cursor()); it goes when a finger or the d-pad is used. */
-static int cursor_shown, a_is_click;
+static int cursor_shown, a_is_click, zr_is_click;
 static u64 cursor_moved;   /* when it last moved or went: the page is drawn meanwhile */
 
 static void cursor_hide(u64 now)
@@ -4593,6 +4593,17 @@ static int poll_input(struct cdp_input *in)
 		if (a_is_click && (up & HidNpadButton_A)) {
 			push(CDP_BUTTON, 0x110, 0);
 			a_is_click = 0;
+		}
+		/* And ZR its right button (the page's menu), which the browser
+		 * has no other use for. */
+		if (cursor_shown && (down & HidNpadButton_ZR)) {
+			push(CDP_BUTTON, 0x111, 1);
+			zr_is_click = 1;
+			cursor_moved = now;
+		}
+		if (zr_is_click && (up & HidNpadButton_ZR)) {
+			push(CDP_BUTTON, 0x111, 0);
+			zr_is_click = 0;
 		}
 		if (down & (HidNpadButton_Up | HidNpadButton_Down | HidNpadButton_Left | HidNpadButton_Right))
 			cursor_hide(now);
