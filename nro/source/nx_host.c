@@ -218,6 +218,15 @@ static lkl_thread_t nx_thread_create(void (*f)(void *), void *arg)
 		return 0;
 	rc = threadCreate(t, f, arg, NULL, NX_THREAD_STACK, NX_THREAD_PRIO,
 			  NX_THREAD_CORE);
+	/* gx: Horizon's 96 threads for the process may all be taken (a
+	 * browser of many tabs): a kernel thread refused so failed its
+	 * creation, whose way back then crashed (nx_thread_join()). One is
+	 * waited for, a while, as for the guest's (host_nx.c, start_thread()). */
+	for (int tries = 0; rc == 0x10801 /* LimitReached */ && tries < 100; tries++) {
+		svcSleepThread(100000000ULL);
+		rc = threadCreate(t, f, arg, NULL, NX_THREAD_STACK, NX_THREAD_PRIO,
+				  NX_THREAD_CORE);
+	}
 	if (R_FAILED(rc)) {
 		oplog("thread_create FAIL rc", (void *)(uintptr_t)rc);
 		free(t);
@@ -251,6 +260,11 @@ static int nx_thread_join(lkl_thread_t tid)
 {
 	Thread *t = (Thread *)tid;
 
+	/* gx: a thread that could not be made (nx_thread_create() gave 0):
+	 * the kernel's way back from a failed creation joins it, and waiting
+	 * on no handle crashed. */
+	if (!t)
+		return -1;
 	oplog("thread_join>", t);
 	if (R_FAILED(threadWaitForExit(t)))
 		return -1;

@@ -138,12 +138,6 @@ long gx_video_open(const uint8_t *extradata, long size)
 		}
 	}
 	d->ctx->pkt_timebase = (AVRational){ 1, 1000000 };
-	/* On the processor, a picture of 1080p took 26 to 30 ms on one core
-	 * while a page's scripts ran beside it: a 30 frames a second video
-	 * fell behind. Pictures decoded on several at once (a few pictures'
-	 * delay, which the queue of waiting pictures takes up). */
-	d->ctx->thread_count = 4;
-	d->ctx->thread_type = FF_THREAD_FRAME;
 #ifdef __SWITCH__
 	{
 		AVBufferRef *device = NULL;
@@ -157,6 +151,17 @@ long gx_video_open(const uint8_t *extradata, long size)
 		}
 	}
 #endif
+	/* On the processor, a picture of 1080p took 26 to 30 ms on one core
+	 * while a page's scripts ran beside it: a 30 frames a second video
+	 * fell behind. Pictures decoded on several at once (a few pictures'
+	 * delay, which the queue of waiting pictures takes up). Not with the
+	 * hardware (the Switch 1's): it needs none, they are four threads of
+	 * the 96 the process has, and its pictures went wrong with them (a
+	 * crash in av_buffer_ref()). */
+	if (!d->hardware) {
+		d->ctx->thread_count = 4;
+		d->ctx->thread_type = FF_THREAD_FRAME;
+	}
 	d->packet = av_packet_alloc();
 	d->plain = av_frame_alloc();
 	if (!d->packet || !d->plain || avcodec_open2(d->ctx, codec, NULL) < 0) {
