@@ -105,6 +105,7 @@ static unsigned (*MakeCurrent)(void *, void *, void *, void *);
 static void *(*GetCurrentContext)(void);
 static void *(*GetCurrentSurface)(int32_t);
 static unsigned (*SwapBuffers)(void *, void *);
+static unsigned (*SwapInterval)(void *, int32_t);   /* may be missing */
 static unsigned (*DestroySurface)(void *, void *);
 static void *(*CreatePbufferSurface)(void *, void *, const int32_t *);
 static unsigned (*QuerySurface)(void *, void *, int32_t, int32_t *);
@@ -137,6 +138,7 @@ static void (*VertexAttribPointer)(unsigned, int32_t, unsigned, unsigned char, i
 static void (*EnableVertexAttribArray)(unsigned);
 static void (*DrawArrays)(unsigned, int32_t, int32_t);
 
+static unsigned program;   /* what draws a picture in a rectangle (prepare()) */
 static int32_t where;   /* the uniform: the rectangle a picture is drawn in */
 static int32_t turn;    /* and how the whole is turned: a 2 x 2 matrix (present()) */
 
@@ -174,6 +176,11 @@ static int find_functions(void)
 			return -1;
 		}
 		memcpy(wanted[i].slot, &fn, sizeof(fn));
+	}
+	if (host) {
+		void *fn = host->symbol("eglSwapInterval");
+
+		memcpy(&SwapInterval, &fn, sizeof(fn));
 	}
 	return 0;
 }
@@ -219,7 +226,7 @@ static int prepare(void *dpy, void *config)
 		"precision mediump float; uniform sampler2D s; varying vec2 t;\n"
 		"void main() { gl_FragColor = texture2D(s, t); }\n";
 	static const float corners[] = { 0, 0, 1, 0, 0, 1, 1, 1 };
-	unsigned program, shader;
+	unsigned shader;
 
 	if (failed || !screen)
 		return -1;
@@ -314,9 +321,11 @@ static void draw_overlay(void)
 
 	/* Both are made for the console's 1280 x 720: larger on a larger
 	 * screen (wl_scale). The pointer's tip is where the pointer is. */
+	/* The pointer's picture is at the screen's scale already, shown pixel
+	 * for pixel (sharp); made again when the scale changes. */
 	if (host->cursor && (picture = host->cursor(&x, &y, &width, &height)))
-		draw_picture(&cursor_texture, &cursor_serial, 0, picture, (int)(x * wl_scale), (int)(y * wl_scale),
-			     width, height, (int)(width * wl_scale), (int)(height * wl_scale));
+		draw_picture(&cursor_texture, &cursor_serial, (unsigned)(width * 1000 + height), picture,
+			     (int)(x * wl_scale + 0.5f), (int)(y * wl_scale + 0.5f), width, height, width, height);
 	/* The overlay is drawn at the screen's size already (overlay.c): its
 	 * pixels are the screen's. */
 	if (host->overlay && (picture = host->overlay(&x, &y, &width, &height, &now)))
@@ -370,7 +379,9 @@ static void make_canvas(void *dpy, void *config)
 	if (canvas && canvas != screen)
 		DestroySurface(dpy, canvas);
 	canvas = screen;
-	if (CANVAS_APART && screen_portrait) {
+	/* Landscape too: with the screen only ours, glwin_repaint() can show
+	 * it again (the pointer moving) while the guest is drawing. */
+	if (CANVAS_APART) {
 		const int32_t size[] = { 0x3057 /* EGL_WIDTH */, screen_w, 0x3056 /* EGL_HEIGHT */, screen_h,
 					 0x3038 /* EGL_NONE */ };
 		void *made = CreatePbufferSurface(dpy, config, size);
@@ -378,7 +389,7 @@ static void make_canvas(void *dpy, void *config)
 		if (made)
 			canvas = made;
 		else
-			host_log("gx: gl: no %dx%d buffer to draw a tall window in (%#x)\n", screen_w, screen_h,
+			host_log("gx: gl: no %dx%d buffer to draw the window in (%#x)\n", screen_w, screen_h,
 				 GetError());
 	}
 }
@@ -417,6 +428,55 @@ static int turn_screen(void *dpy, void **was_draw, void **was_read)
 	return MakeCurrent(dpy, screen, screen, context) ? 0 : -1;
 }
 
+/* The screen drawn from the windows' pictures, the host's over them: in the
+ * context current on the screen. */
+static void compose(void)
+{
+	int32_t x, y;
+
+	/* Portrait: the screen is a square, as long as its long side (the
+	 * client draws its tall window in it), of which the console shows the
+	 * top as it is held flat (gl_screen()); the picture is turned there,
+	 * its top to the left. A TV shows no picture the console turns
+	 * itself, and one taller than it. */
+	if (screen_portrait && CANVAS_APART) {
+		/* The screen is as the console is held flat (1920 x 1080), the
+		 * window drawn in it turned the same way. */
+		Viewport(0, 0, screen_h, screen_w);
+		Uniform4f(turn, 0, -1, 1, 0);
+	} else if (screen_portrait) {
+		int side = screen_h > screen_w ? screen_h : screen_w;
+
+		Viewport(0, side - screen_w, screen_h, screen_w);
+		Uniform4f(turn, 0, -1, 1, 0);
+	} else {
+		Viewport(0, 0, screen_w, screen_h);
+		Uniform4f(turn, 1, 0, 0, 1);
+	}
+	ClearColor(0, 0, 0, 1);
+	Clear(GL_COLOR_BUFFER_BIT);
+	/* The window, then the popups in the order wl.c has them, which is the
+	 * order they came in. */
+	for (int i = 0; i < MAX_WINDOWS; i++)
+		if (windows[i].used && windows[i].drawn &&
+		    (!windows[i].guest || wl_surface_place(windows[i].id, &x, &y) == 1))
+			draw(&windows[i], 0, 0, 0);
+	for (int order = 0; order < MAX_WINDOWS; order++)
+		for (int i = 0; i < MAX_WINDOWS; i++)
+			if (windows[i].used && windows[i].drawn && windows[i].guest &&
+			    wl_surface_place(windows[i].id, &x, &y) == 2 + order)
+				draw(&windows[i], x, y, 1);
+	draw_overlay();
+}
+
+static void lock(int on)
+{
+	if (host && host->lock)
+		host->lock(on);
+}
+
+static void *last_dpy;   /* for glwin_repaint() */
+
 /* The screen, from all the windows there are; keeping first what was just
  * drawn for one of them, if any. In our context, and what the guest had
  * current is put back. */
@@ -424,8 +484,9 @@ static void present(void *dpy, struct window *presented, unsigned gone)
 {
 	void *was_context = GetCurrentContext();
 	void *was_draw = GetCurrentSurface(EGL_DRAW), *was_read = GetCurrentSurface(EGL_READ);
-	int32_t x, y;
 
+	lock(1);
+	last_dpy = dpy;
 	if (!prepare(dpy, NULL)) {
 		if (presented) {
 			/* What it drew is in the canvas, which may not be the screen. */
@@ -442,41 +503,25 @@ static void present(void *dpy, struct window *presented, unsigned gone)
 		     SCREEN_H != screen_h) && screen_config &&
 		    turn_screen(dpy, &was_draw, &was_read)) {
 			MakeCurrent(dpy, was_draw, was_read, was_context);
+			lock(0);
 			return;
 		}
-		/* Portrait: the screen is a square, as long as its long side
-		 * (the client draws its tall window in it), of which the
-		 * console shows the top as it is held flat (gl_screen()); the
-		 * picture is turned there, its top to the left. A TV shows no
-		 * picture the console turns itself, and one taller than it. */
-		if (screen_portrait && CANVAS_APART) {
-			/* The screen is as the console is held flat (1920 x 1080),
-			 * the window drawn in it turned the same way. */
-			Viewport(0, 0, screen_h, screen_w);
-			Uniform4f(turn, 0, -1, 1, 0);
-		} else if (screen_portrait) {
-			int side = screen_h > screen_w ? screen_h : screen_w;
+		compose();
+#if CANVAS_APART
+		{
+			/* A picture shown at the next refresh, the newer one in
+			 * place of one still waiting (OunceVK's MAILBOX), not
+			 * behind it in a queue of two (FIFO): the pointer was
+			 * that much late. The guest's pace is wl.c's frames. */
+			static void *interval_of;
 
-			Viewport(0, side - screen_w, screen_h, screen_w);
-			Uniform4f(turn, 0, -1, 1, 0);
-		} else {
-			Viewport(0, 0, SCREEN_W, SCREEN_H);
-			Uniform4f(turn, 1, 0, 0, 1);
+			if (SwapInterval && interval_of != screen) {
+				interval_of = screen;
+				host_log("gx: gl: pictures shown without a queue: %s\n",
+					 SwapInterval(dpy, 0) ? "yes" : "refused");
+			}
 		}
-		ClearColor(0, 0, 0, 1);
-		Clear(GL_COLOR_BUFFER_BIT);
-		/* The window, then the popups in the order wl.c has them, which
-		 * is the order they came in. */
-		for (int i = 0; i < MAX_WINDOWS; i++)
-			if (windows[i].used && windows[i].drawn &&
-			    (!windows[i].guest || wl_surface_place(windows[i].id, &x, &y) == 1))
-				draw(&windows[i], 0, 0, 0);
-		for (int order = 0; order < MAX_WINDOWS; order++)
-			for (int i = 0; i < MAX_WINDOWS; i++)
-				if (windows[i].used && windows[i].drawn && windows[i].guest &&
-				    wl_surface_place(windows[i].id, &x, &y) == 2 + order)
-						draw(&windows[i], x, y, 1);
-		draw_overlay();
+#endif
 		if (host->presented)
 			host->presented(dpy, screen);
 		if (!SwapBuffers(dpy, screen)) {
@@ -495,6 +540,51 @@ static void present(void *dpy, struct window *presented, unsigned gone)
 		}
 	}
 	MakeCurrent(dpy, was_draw, was_read, was_context);
+	lock(0);
+}
+
+/* The screen shown again as it is, for what is ours over the page (the
+ * pointer moving, the overlay) when the guest has not drawn for a while: a
+ * page that is busy did not move the pointer either. On a thread of the
+ * host's, in a context of its own that shares the windows' pictures, while
+ * the guest draws in its canvas: only when that is not the screen. */
+int glwin_repaint(void)
+{
+	static const int32_t version[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+	static const float corners[] = { 0, 0, 1, 0, 0, 1, 1, 1 };
+	static void *own;
+	static int set_up, broken;
+	int done = 0;
+
+	if (broken || !ready || failed || !last_dpy || !screen_config)
+		return 0;
+	lock(1);
+	if (canvas && canvas != screen && screen && context) {
+		if (!own && !(own = CreateContext(last_dpy, screen_config, context, version))) {
+			host_log("gx: gl: no context to show the pointer apart (%#x)\n", GetError());
+			broken = 1;
+		} else if (!MakeCurrent(last_dpy, screen, screen, own)) {
+			host_log("gx: gl: the pointer cannot be shown apart (%#x)\n", GetError());
+			broken = 1;
+		} else {
+			if (!set_up) {
+				/* What prepare() set in our other context: the
+				 * program is shared, the rest is the context's. */
+				UseProgram(program);
+				VertexAttribPointer(0, 2, GL_FLOAT, 0, 0, corners);
+				EnableVertexAttribArray(0);
+				BlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+				set_up = 1;
+			}
+			compose();
+			/* A screen lost here is the guest's to make again: its
+			 * next picture finds it so (present()). */
+			done = SwapBuffers(last_dpy, screen) ? 1 : 0;
+			MakeCurrent(last_dpy, NULL, NULL, NULL);
+		}
+	}
+	lock(0);
+	return done;
 }
 
 void *glwin_create(void *dpy, void *config, void *guest_window)

@@ -796,18 +796,28 @@ int overlay_touch(int x, int y)
 #define CURSOR_W 20
 #define CURSOR_H 30
 
+/* Drawn at the screen's scale (wl_scale pixels to the unit), to be shown
+ * pixel for pixel: made at 1280 x 720's size and shown larger, it was
+ * blurred. */
 const uint32_t *overlay_cursor(int *width, int *height)
 {
-	static uint32_t arrow[CURSOR_W * CURSOR_H];
-	static int made;
+	/* Room for MAX_SCALE (1.5). */
+	static uint32_t arrow[(CURSOR_W * 3 / 2 + 1) * (CURSOR_H * 3 / 2 + 1)];
+	static float made;
+	static int w, h;
 	static const float pts[][2] = { { 1, 1 }, { 1, 24 }, { 6.5f, 19 }, { 10.5f, 28 }, { 14, 26.5f },
 					{ 10, 17.5f }, { 17, 17.5f } };
 	const int n = sizeof(pts) / sizeof(pts[0]);
+	float s = wl_scale > MAX_SCALE ? MAX_SCALE : wl_scale < 1 ? 1 : wl_scale;
 
-	if (!made) {
-		for (int y = 0; y < CURSOR_H; y++)
-			for (int x = 0; x < CURSOR_W; x++) {
-				float px = x + 0.5f, py = y + 0.5f, d = 1e9f;
+	if (made != s) {
+		w = (int)(CURSOR_W * s + 0.5f);
+		h = (int)(CURSOR_H * s + 0.5f);
+		memset(arrow, 0, sizeof(arrow));
+		for (int y = 0; y < h; y++)
+			for (int x = 0; x < w; x++) {
+				/* In the unit's coordinates, distances in pixels. */
+				float px = (x + 0.5f) / s, py = (y + 0.5f) / s, d = 1e9f;
 				int in = 0;
 
 				for (int i = 0, j = n - 1; i < n; j = i++) {
@@ -816,19 +826,26 @@ const uint32_t *overlay_cursor(int *width, int *height)
 					float k = fmaxf(0, fminf(1, ((px - ax) * vx + (py - ay) * vy) / len2));
 					float dx = px - ax - k * vx, dy = py - ay - k * vy;
 
-					d = fminf(d, sqrtf(dx * dx + dy * dy));
+					d = fminf(d, sqrtf(dx * dx + dy * dy) * s);
 					if ((ay > py) != (by > py) && px < ax + (py - ay) * vx / vy)
 						in = !in;
 				}
-				if (in)
-					arrow[y * CURSOR_W + x] = d < 1.3f ? 0xFF000000u : 0xFFFFFFFFu;
-				else if (d < 1.0f)
-					arrow[y * CURSOR_W + x] = (uint32_t)((1.0f - d) * 255) << 24;
+				/* A black edge of 1.3 units, the edge's last pixel
+				 * blended into the white (and outside, into the page). */
+				if (in) {
+					float e = 1.3f * s;
+					float k = d >= e ? 1 : d <= e - 1 ? 0 : d - (e - 1);
+					uint32_t v = (uint32_t)(k * 255);
+
+					arrow[y * w + x] = 0xFF000000u | v << 16 | v << 8 | v;
+				} else if (d < 1.0f) {
+					arrow[y * w + x] = (uint32_t)((1.0f - d) * 255) << 24;
+				}
 			}
-		made = 1;
+		made = s;
 	}
-	*width = CURSOR_W;
-	*height = CURSOR_H;
+	*width = w;
+	*height = h;
 	return arrow;
 }
 

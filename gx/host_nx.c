@@ -32,6 +32,7 @@
  */
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <dirent.h>
@@ -246,58 +247,69 @@ static void log_ring_add(const void *buf, size_t len)
 	__atomic_store_n(&log_ring_end, log_ring_end + len, __ATOMIC_RELEASE);
 }
 
-static void log_server(void *arg)
+/* Without a thread of its own (log_tick(), from host_input()): the process
+ * may have so many, and the Switch's limit (0x10801) had a browser of four
+ * tabs refused one, and end. */
+static int log_listener = -1, log_client = -1;
+static u64 log_sent;
+
+static void log_server_start(void)
 {
 	int listener = socket(AF_INET, SOCK_STREAM, 0), one = 1;
 	struct sockaddr_in at = { .sin_family = AF_INET, .sin_port = htons(LOG_PORT) };
 
-	(void)arg;
 	setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-	if (listener < 0 || bind(listener, (struct sockaddr *)&at, sizeof(at)) || listen(listener, 2)) {
+	if (listener < 0 || bind(listener, (struct sockaddr *)&at, sizeof(at)) || listen(listener, 2) ||
+	    fcntl(listener, F_SETFL, fcntl(listener, F_GETFL, 0) | O_NONBLOCK) < 0) {
 		host_log("gx: no log on the network (%d)\n", errno);
+		if (listener >= 0)
+			close(listener);
 		return;
 	}
+	log_listener = listener;
 	host_log("gx: the log is on the network too, port %d\n", LOG_PORT);
-	for (;;) {
-		int client = accept(listener, NULL, NULL);
-		u64 sent;
-
-		if (client < 0) {
-			svcSleepThread(1000000000ULL);
-			continue;
-		}
-		sent = __atomic_load_n(&log_ring_end, __ATOMIC_ACQUIRE);
-		sent = sent > LOG_RING ? sent - LOG_RING : 0;
-		for (;;) {
-			u64 end = __atomic_load_n(&log_ring_end, __ATOMIC_ACQUIRE);
-			char chunk[4096];
-			size_t n = 0;
-
-			if (end - sent > LOG_RING)
-				sent = end - LOG_RING;   /* fell behind: what is still there */
-			while (sent + n < end && n < sizeof(chunk)) {
-				chunk[n] = log_ring[(sent + n) % LOG_RING];
-				n++;
-			}
-			if (!n) {
-				svcSleepThread(50000000ULL);
-				continue;
-			}
-			if (send(client, chunk, n, 0) <= 0)
-				break;
-			sent += n;
-		}
-		close(client);
-	}
 }
 
-static void log_server_start(void)
+/* What the reader has not had yet, as much as goes without waiting. */
+static void log_tick(void)
 {
-	static Thread thread;
+	if (log_listener < 0)
+		return;
+	if (log_client < 0) {
+		int client = accept(log_listener, NULL, NULL);
+		u64 end;
 
-	if (R_FAILED(threadCreate(&thread, log_server, NULL, NULL, 0x10000, 0x2C, -2)) ||
-	    R_FAILED(threadStart(&thread)))
-		host_log("gx: no thread for the log on the network\n");
+		if (client < 0)
+			return;
+		fcntl(client, F_SETFL, fcntl(client, F_GETFL, 0) | O_NONBLOCK);
+		log_client = client;
+		end = __atomic_load_n(&log_ring_end, __ATOMIC_ACQUIRE);
+		log_sent = end > LOG_RING ? end - LOG_RING : 0;
+	}
+	for (int i = 0; i < 16; i++) {
+		u64 end = __atomic_load_n(&log_ring_end, __ATOMIC_ACQUIRE);
+		char chunk[4096];
+		size_t n = 0;
+		ssize_t r;
+
+		if (end - log_sent > LOG_RING)
+			log_sent = end - LOG_RING;   /* fell behind: what is still there */
+		while (log_sent + n < end && n < sizeof(chunk)) {
+			chunk[n] = log_ring[(log_sent + n) % LOG_RING];
+			n++;
+		}
+		if (!n)
+			return;
+		r = send(log_client, chunk, n, 0);
+		if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+			return;
+		if (r <= 0) {
+			close(log_client);
+			log_client = -1;
+			return;
+		}
+		log_sent += (u64)r;
+	}
 }
 
 void host_console_write(int fd, const void *buf, size_t len)
@@ -2158,7 +2170,19 @@ static void gl_presented(void *dpy, void *screen)
 }
 
 static const uint32_t *gl_cursor(int *x, int *y, int *width, int *height);
-static const struct glwin_host gl_host = { gl_raw, gl_screen, gl_presented, overlay_picture, gl_cursor };
+/* The screen, between the guest's thread that draws and the one that shows
+ * the pointer moving (pointer_painter()). */
+static Mutex gl_screen_lock;
+
+static void gl_lock(int on)
+{
+	if (on)
+		mutexLock(&gl_screen_lock);
+	else
+		mutexUnlock(&gl_screen_lock);
+}
+
+static const struct glwin_host gl_host = { gl_raw, gl_screen, gl_presented, overlay_picture, gl_cursor, gl_lock };
 
 /* The guest's windows are glwin.c's: it puts them together on the screen. */
 static EGLSurface gl_create_window_surface(EGLDisplay dpy, EGLConfig config, void *window,
@@ -2445,37 +2469,48 @@ void host_busy(int on)
 		startup_until = 0;
 }
 
-static void booster(void *arg)
+/* The boost as it should be now: from host_tick(), without a thread of its
+ * own (the process's threads run out, see log_tick()). */
+static void boost_tick(void)
 {
-	int boosted = 0;
+	static int boosted, broken;
+	u64 now = host_now_ns();
+	int want = now < startup_until || now < page_until;
 
-	(void)arg;
-	for (;;) {
-		u64 now = host_now_ns();
-		int want = now < startup_until || now < page_until;
+	if (broken || want == boosted)
+		return;
+	Result rc = appletSetCpuBoostMode(want ? ApmCpuBoostMode_FastLoad : ApmCpuBoostMode_Normal);
 
-		if (want != boosted) {
-			Result rc = appletSetCpuBoostMode(want ? ApmCpuBoostMode_FastLoad : ApmCpuBoostMode_Normal);
-
-			if (R_FAILED(rc)) {
-				host_log("gx: no boost for the processor (%#x)\n", rc);
-				return;
-			}
-			boosted = want;
-			host_log("gx: processor %s\n", want ? "boosted" : "at its usual speed");
-		}
-		svcSleepThread(200000000ULL);
+	if (R_FAILED(rc)) {
+		host_log("gx: no boost for the processor (%#x)\n", rc);
+		broken = 1;
+		return;
 	}
+	boosted = want;
+	host_log("gx: processor %s\n", want ? "boosted" : "at its usual speed");
 }
 
 static void booster_start(void)
 {
-	static Thread thread;
-
 	startup_until = host_now_ns() + STARTUP_BOOST_NS;
-	if (R_FAILED(threadCreate(&thread, booster, NULL, NULL, 0x4000, 0x2C, -2)) ||
-	    R_FAILED(threadStart(&thread)))
-		host_log("gx: no thread for the processor's boost\n");
+	boost_tick();
+}
+
+/* What runs now and then without a thread of its own: from host_input(),
+ * which the browser's loop calls every few milliseconds. */
+static void host_tick(void)
+{
+	static u64 last_log, last_boost;
+	u64 now = host_now_ns();
+
+	if (now - last_log > 20000000ULL) {
+		last_log = now;
+		log_tick();
+	}
+	if (now - last_boost > 200000000ULL) {
+		last_boost = now;
+		boost_tick();
+	}
 }
 
 /* ---------- host functions for the guest: sound ---------- */
@@ -4120,6 +4155,99 @@ static void cursor_hide(u64 now)
 	}
 }
 
+#ifdef __SWITCH2__
+/*
+ * The Joy-Con 2 as a mouse (libounce's PadPointer): slid on a table, its
+ * sensor moves the pointer, its L/ZL or R/ZR click (left, and right or
+ * middle if the system says so) and its stick is the wheel. The system
+ * reports a Joy-Con as a pointer even in the hand, so the mouse is in use
+ * once it has really moved (MOUSE_START units), and until it has done
+ * nothing for MOUSE_IDLE_NS; meanwhile L, R, ZL and ZR are its buttons and
+ * not the browser's keys. Positions are in the window's units (wl.h).
+ */
+#define MOUSE_START 6
+#define MOUSE_IDLE_NS 3000000000ULL
+
+static PadPointer joycon;
+static int joycon_state;      /* 0 not yet, 1 ready, -1 none */
+static u64 joycon_last;       /* when it last moved or clicked, in use */
+static u32 joycon_held;       /* the buttons the page was told are down */
+
+static int joycon_mouse(PadState *pad, u64 now)
+{
+	static int travel;
+	static u64 travel_since;
+	static int said;
+	static const struct { u32 bit; int code; } buttons[] = {
+		{ HidMouseButton_Left, 0x110 }, { HidMouseButton_Right, 0x111 }, { HidMouseButton_Middle, 0x112 },
+	};
+	int moved, in_use;
+
+	if (!joycon_state) {
+		Result rc = padPointerInitialize(&joycon, wl_width, wl_height);
+
+		joycon_state = R_SUCCEEDED(rc) ? 1 : -1;
+		host_log("gx: Joy-Con mouse: %s (%#x)\n", joycon_state > 0 ? "ready" : "none", rc);
+	}
+	if (joycon_state < 0)
+		return 0;
+	padPointerUpdate(&joycon, pad);
+	if (!joycon.active)
+		return 0;
+	moved = abs(joycon.delta_x) + abs(joycon.delta_y);
+	in_use = joycon_last && armTicksToNs(now - joycon_last) < MOUSE_IDLE_NS;
+	if (!in_use && moved) {
+		/* Out of use: enough of a slide, and not a tremble in the hand. */
+		if (armTicksToNs(now - travel_since) > 300000000ULL)
+			travel = 0;
+		if (!travel)
+			travel_since = now;
+		travel += moved;
+		if (travel >= MOUSE_START) {
+			in_use = 1;
+			travel = 0;
+			if (said < 3 && ++said)
+				host_log("gx: Joy-Con mouse in use (%s)\n",
+					 joycon.side == PadPointerSide_Left ? "left" : "right");
+		}
+	}
+	if (!in_use) {
+		/* Out of use, what it held is let go. */
+		for (unsigned i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++)
+			if (joycon_held & buttons[i].bit)
+				push(CDP_BUTTON, buttons[i].code, 0);
+		joycon_held = 0;
+		return 0;
+	}
+	if (moved || joycon.wheel_delta_y || joycon.buttons_cur != joycon_held)
+		joycon_last = now;
+	if (moved) {
+		cursor_shown = 1;
+		cursor_moved = now;
+		push(CDP_MOTION, joycon.delta_x, joycon.delta_y);
+	}
+	if (joycon.wheel_delta_y) {
+		/* A step of the stick is a notch of a wheel (53 pixels, as
+		 * keys.h's wheel); the system may count in 120ths of one. */
+		int w = joycon.wheel_delta_y, notches = abs(w) >= 120 ? w / 120 : w;
+		static int wheel_said;
+
+		if (wheel_said < 4 && ++wheel_said)
+			host_log("gx: Joy-Con mouse: wheel %d\n", w);
+		if (notches)
+			push(CDP_SCROLL, 0, -notches * 53);
+	}
+	for (unsigned i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++)
+		if ((joycon.buttons_cur ^ joycon_held) & buttons[i].bit) {
+			cursor_shown = 1;
+			cursor_moved = now;
+			push(CDP_BUTTON, buttons[i].code, !!(joycon.buttons_cur & buttons[i].bit));
+		}
+	joycon_held = joycon.buttons_cur;
+	return 1;
+}
+#endif
+
 static void browser_sticks(PadState *pad, u64 now)
 {
 	static u64 last, last_scroll;
@@ -4182,12 +4310,92 @@ static void browser_sticks(PadState *pad, u64 now)
  * the overlay, or the pointer moving (cdp_repaint()); and for a while after
  * the console went into its dock or out of it, when the screen is made
  * again and shows nothing until it is drawn on (tv_screen()). */
+#ifdef __SWITCH2__
+/*
+ * The pointer shown at the pace it moves whatever the page does: drawn over
+ * the page's last picture by a thread of ours (glwin_repaint()) when the
+ * guest has drawn nothing for POINTER_LATE_NS. Over the guest's pictures
+ * only, it went at the pace of the page, which was a slow one while a page
+ * loaded or ran a lot of script. The overlay the same way.
+ */
+/* Looked at every 4 ms; a picture when nothing was shown for 10 (ours or
+ * the guest's): at 60 a second the guest's carry the pointer, slower and
+ * ours go between them. Waiting 20 ms after the guest's, it was late. */
+#define POINTER_TICK_NS 4000000ULL
+#define POINTER_LATE_NS 10000000ULL
+
+static volatile int painter_works;   /* glwin_repaint() has shown the screen */
+
+static void pointer_painter(void *arg)
+{
+	u64 shown = 0, report = 0, ours = 0;
+	int failures = 0;
+	unsigned pictures = 0;
+
+	(void)arg;
+	for (;;) {
+		u64 now_ns = host_now_ns();
+		u64 moved = cursor_moved;
+		int open = overlay_is_open();
+
+		if (now_ns - report > 10000000000ULL) {
+			if (pictures)
+				host_log("gx: gl: %u pictures of ours in 10 s (the pointer, the overlay)\n", pictures);
+			pictures = 0;
+			report = now_ns;
+		}
+		svcSleepThread(POINTER_TICK_NS);
+		if ((moved == shown && !open) || now_ns - gl_last_ns < POINTER_LATE_NS ||
+		    now_ns - ours < POINTER_LATE_NS)
+			continue;
+		if (glwin_repaint()) {
+			shown = moved;
+			ours = host_now_ns();
+			failures = 0;
+			pictures++;
+			if (!painter_works) {
+				painter_works = 1;
+				host_log("gx: gl: the pointer is shown apart from the page\n");
+			}
+		} else if (++failures == 50 && painter_works) {
+			/* Back to the page's pictures (update_repaint()). */
+			painter_works = 0;
+			host_log("gx: gl: the pointer is no longer shown apart\n");
+		}
+	}
+}
+
+static void pointer_painter_start(void)
+{
+	static Thread thread;
+	static int started;
+
+	if (started)
+		return;
+	started = 1;
+	if (R_FAILED(threadCreate(&thread, pointer_painter, NULL, NULL, 0x100000, 0x2C, -2))) {
+		host_log("gx: no thread for the pointer\n");
+		return;
+	}
+	svcSetThreadCoreMask(thread.handle, -3, cores);
+	know_thread(thread.handle, "pointer");
+	threadStart(&thread);
+}
+#endif
+
 static void update_repaint(u64 now)
 {
 	static int on;
-	int want = overlay_is_open() || (cursor_moved && armTicksToNs(now - cursor_moved) < 500000000ULL) ||
-		   (screen_changed && armTicksToNs(now - screen_changed) < 2000000000ULL);
+	int ours = overlay_is_open() || (cursor_moved && armTicksToNs(now - cursor_moved) < 500000000ULL);
+	int want = (screen_changed && armTicksToNs(now - screen_changed) < 2000000000ULL);
 
+#ifdef __SWITCH2__
+	pointer_painter_start();
+	/* Shown by our thread: the page need not be drawn for it. */
+	if (painter_works)
+		ours = 0;
+#endif
+	want |= ours;
 	if (want != on) {
 		cdp_repaint(want);
 		on = want;
@@ -4343,6 +4551,11 @@ static int poll_input(struct cdp_input *in)
 		overlay_full_screen(wl_full_screen());
 		return overlay_chose(overlay_pad(down), in);
 	}
+#ifdef __SWITCH2__
+	/* A Joy-Con slid as a mouse: its triggers are its buttons. */
+	if (wayland && overlay_mode() != OVERLAY_CONTROLLER && joycon_mouse(&pad, now))
+		down &= ~(HidNpadButton_L | HidNpadButton_R | HidNpadButton_ZL | HidNpadButton_ZR);
+#endif
 	if (wayland && overlay_mode() == OVERLAY_KEYBOARD_MOUSE) {
 		game_input(&pad);
 		return 0;
@@ -4429,6 +4642,7 @@ static int poll_input(struct cdp_input *in)
 
 int host_input(struct cdp_input *in)
 {
+	host_tick();
 	if (!queue_count && poll_input(in))
 		return 1;
 	if (!queue_count)

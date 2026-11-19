@@ -25,6 +25,10 @@ struct glwin_host {
 	/* The mouse pointer to draw, if it is to be: its picture (as the
 	 * overlay's, never changing), and where its tip is. May be NULL. */
 	const uint32_t *(*cursor)(int *x, int *y, int *width, int *height);
+	/* Takes (1) and gives back (0) the screen, which glwin_repaint() shows
+	 * from another thread than the guest's. May be NULL: then the host
+	 * does not call glwin_repaint(). */
+	void (*lock)(int on);
 };
 
 /* To be called before anything else here. */
@@ -49,5 +53,10 @@ void *glwin_current_surface(int32_t which);
 /* The host's surface behind one the guest knows, for any other EGL function
  * that takes a surface: the same if it is not a window's. */
 void *glwin_surface(void *surface);
+
+/* Shows the screen again with what the host lays over it as it is now (the
+ * pointer, the overlay), from the windows' last pictures: for a host thread,
+ * while the guest has not drawn. 1 if it was shown. */
+int glwin_repaint(void);
 
 #endif
